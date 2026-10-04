@@ -1031,6 +1031,30 @@ async def test_websocket_connection_failure_maps_to_connection_lost(tmp_path, mo
 
 
 @pytest.mark.asyncio
+async def test_default_budget_connection_refused_returns_in_seconds(tmp_path, monkeypatch):
+    """#67：默认预算下连接拒绝必须秒级返回 connection_lost，不得挂到自动预算（120s）。
+
+    这是与上一条用例互补的锁：显式 deadline_total 从不触发 deadline_changed.set()，
+    走不到 deadline_watch 的默认预算重锚定，因此上一条用例结构上锁不住 #67。
+    断言入口是公共 API transcribe_file，不传 deadline_total。
+    """
+    audio_path = make_audio(tmp_path / "source.wav")
+
+    def refuse_connection(_url, **_kwargs):
+        raise OSError("connection refused")
+
+    async with fake_v2_server(accept_and_finish) as (url, _):
+        monkeypatch.setattr(sdk_client.websockets, "connect", refuse_connection)
+        started = time.monotonic()
+        with pytest.raises(AsrError) as caught:
+            await transcribe_file(audio_path, url)
+        elapsed = time.monotonic() - started
+
+    assert caught.value.code == "connection_lost"
+    assert elapsed < 5, f"连接拒绝耗时 {elapsed:.3f}s，超过 5s 说明挂到了自动预算"
+
+
+@pytest.mark.asyncio
 async def test_transcode_failure_uses_decode_failed(monkeypatch, tmp_path):
     monkeypatch.setattr(sdk_client.shutil, "which", lambda _name: None)
     with pytest.raises(AsrError) as caught:
