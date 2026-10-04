@@ -56,6 +56,25 @@
 
 5. CLI 导入旧 `_baseline_asr.py` 的归一化代码，隔离运行时需显式安装它已有的 `rich` 与 `colorama`；本命令还需 `numpy`、`soundfile`、`websockets` 和 `httpx`。每协议完成后检查私有 JSON 的 `status=ok`、server/tool SHA、SDK 与 ffmpeg 版本、DONE/final 状态、token/timestamp 数量、单调性、覆盖范围、耗时和 producer payload 摘要：`token_count` 应与 `timestamp_count` 一起看，并核对完整 `is_final`、覆盖和时长区间字段。空时间戳没有质量证据；单调性对空列表按 Python 规则为真，也不表示质量通过。参考稿未核实的 CER 只表示相对该稿的差异，不是识别正确率。失败项和未量项如实保留；工具当前不测 CPU/RSS，也不推算 TCP/TLS 开销。
 
+## 超时后的人工检查
+
+HTTP 请求超时并不能证明服务端没有接收上传或开始任务。私有目录中的 `<fixture-id>.http-recovery.json` 保留 SDK 恢复凭据；它可能包含访问令牌，继续限制为仅本人可读，不要打印文件内容。相同 fixture ID 和私有目录再次运行会因 `recovery_exists` 失败退出，不会恢复、取消或重发原任务。
+
+需要确认原任务状态时，可在隔离环境中只调用 SDK 状态查询接口；它只查一次，不轮询，也不取回转录正文：
+
+```python
+from pathlib import Path
+from capswriter_asr.http_client import get_file_job_http_sync
+
+status = get_file_job_http_sync(
+    "http://127.0.0.1:49152",  # 换成本轮的 HTTP_PORT
+    resume_path=Path("/absolute/private/results/wav-private-01.http-recovery.json"),
+)
+print(status.state, status.result_available, status.source_available, status.error_code)
+```
+
+不要自动删除 recovery 或结果文件，也不要自动重试、恢复或取消任务。只有用户明确开始一次新测量时才使用新的匿名 fixture ID；这会创建可能重复计算的新上传/任务，不是对原任务的恢复。已有结果文件以独占创建方式写入，不会覆盖。此处的权限要求针对 Linux `0700` 目录和 `0600` 文件；Windows ACL 未在本指南的实测范围内。
+
 ## 回归验证
 
 卡面全套验证命令：
