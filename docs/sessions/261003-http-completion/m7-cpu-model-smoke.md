@@ -58,9 +58,20 @@ python model_smoke_probe.py
 | Mac Apple Silicon | 3.12.15 | 1.254 s | 1021.14 MiB | 同上 | 同上 | rc=0，超时=false，已退出 |
 | Windows | 3.12.12 | 2.891 s | 331.71 MiB | 同上 | 同上 | rc=0，超时=false，已退出 |
 
-Linux 和 Mac 的峰值来自探针进程自身 `ru_maxrss`；Windows 的峰值来自同一任务 runner 按探针真实 PID 采样的 `WorkingSet64`。三者均低于本轮 2 GiB 目标；加载与推理总预算为每台 180 秒，均未接近超时。ASR 文本内容、标点内容和音频字节均没有打印到报告或标准输出。
+Linux 和 Mac 的峰值来自探针进程自身 `ru_maxrss`。Windows 表中 **331.71 MiB 是原 runner 每 1 秒读一次 `WorkingSet64` 得到的该轮抽样观测最大值**，不是操作系统全时峰值，也不能与 Linux/Mac 的 `ru_maxrss` 横向当作同一资源基线。原卡 2 GiB 仍是目标，不是本轮新加的硬限制。ASR 文本内容、标点内容和音频字节均没有打印到报告或标准输出。
 
-Windows 新任务根的 ACL 复核为 owner 类别 1、admin/system 类别 2、`otherCount=0`、Deny 0；Linux/Mac 新任务根为目录 0700、文件 0600。所有自有探针 PID 均确认退出；未杀任何父派发组或原服务进程。
+Windows 新任务根的 ACL 复核为 owner 类别 1、admin/system 类别 2、`otherCount=0`、Deny 0；Linux/Mac 新任务根为目录 0700、文件 0600。原三台模型正例未改写。后续 Windows runner 续交另证：超时必须停掉**可归属的真实 probe PID 与 launcher**，PID 缺失/不可归属记 unknown 且不得把 unknown 写成 gone。
+
+## Windows runner 续交（PID 退出契约，非质量重测）
+
+原 runner 超时只 `Stop-Process` launcher；venv launcher 与 `os.getpid()` 写出的 probe 可以不是同一 PID。旧逻辑即使记下 `process_gone=false` 也不把它当失败条件，PID 文件读不到时默认 `probeGone=true`，会把 unknown 变成 gone。
+
+| 夹具 | 超时窗 | launcher/probe | 结果 |
+| --- | --- | --- | --- |
+| 旧 runner（只杀 launcher） | 3 s | 18912 / 21584 | timeout=true，`process_gone=false`，`probe_alive_after=true`，且 `process_gone_was_fail_condition=false`（漏活，判红） |
+| 修正 runner | 3 s | 11228 / 16340 | returncode=124，phase=`timeout-gone`，pid=`attributed`，二者均 observed-gone |
+
+修正后真实模型再跑一次（不覆盖原 JSON）：probe/launcher=11904/27828 均 gone，native returncode=0，phase=`complete`。该轮 1 秒抽样 `WorkingSet64` 最大为 330.30 MiB；另外读到 `PeakWorkingSet64`=333.56 MiB（新字段，不覆盖原 331.71）。Start-Process 在已退出对象上 `ExitCode` 为 null 时 runner 以 `exit-code-unknown` 非零失败，已改用 `Process.Start` 记录真实退出码。原服务未动。
 
 ## 判据与已知坏输入
 
