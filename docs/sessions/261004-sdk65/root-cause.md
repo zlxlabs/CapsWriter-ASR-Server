@@ -107,7 +107,26 @@ python=3.12
 
 两者都**未改**，也不在报告里断言它们无害。
 
-## 7. 卡面 Narrow-Verify 命令退出码 2 的实际原因（继承问题，非本卡引入）
+## 7. 「同拍完成」不可确定性构造（一个被扬弃的测试构造）
+
+曾构造「upload 与 receive 在同一个事件循环批次里收尾」用来验证裁决顺序：服务端一发出 final，
+客户端卡在最后一帧上的 `send` 就立刻失败。**实测该构造不可靠**——upload 是否恰好停在最后一帧的
+`ws.send()` 上取决于真实 socket 时序：
+
+| 运行 | 被测代码 | 结果 |
+| --- | --- | --- |
+| 3.12 修前 | sha `ff476ad7` | 红：`Failed: DID NOT RAISE AsrError`（返回了 Transcript，上传失败被吐掉） |
+| 3.11 修前 | sha `ff476ad7` | 红：同上 |
+| 3.12 修后 | sha `eccec1a6` | 绿 |
+| 3.11 修后 | sha `eccec1a6` | **红**：`Failed: DID NOT RAISE AsrError`——同一场景两种结果 |
+
+因此该用例**不能当断言**，已换成顺序完全确定的 `test_upload_failure_is_not_masked_by_final`
+（`send` 一律失败、`recv` 始终挂起），锁的仍是「上传失败不被改判成成功转录」这条契约。
+原始日志：`/tmp/sdk65_py311_PREFIX_red.log`、`/tmp/sdk65_py311_POSTFIX_green.log`。
+从 3.11 修后那一格能看出：final 先到、upload 仍挂在真实 send 上时，返回 Transcript 是**正确**行为
+（此时上传不是失败，是我们自己取消的），不能拿来当缺陷证据。
+
+## 8. 卡面 Narrow-Verify 命令退出码 2 的实际原因（继承问题，非本卡引入）
 
 卡面 Narrow-Verify：
 
@@ -136,7 +155,7 @@ ERROR tests/test_sdk_client.py
 第 20 行同样是 `import soundfile as sf`）再跑同一条命令，仍是 `EXIT=2`。所以这是**卡面命令本身的缺陷**，
 不是本卡引入。补上 `soundfile`（并与 Verify-Command 的依赖对齐）后窄测 `EXIT=0`。
 
-## 8. 生产版本取证（只读，4 次 `gh` 请求）
+## 9. 生产版本取证（只读，4 次 `gh` 请求）
 
 | 证据 | 来源 | 能证明什么 |
 | --- | --- | --- |
@@ -147,7 +166,7 @@ ERROR tests/test_sdk_client.py
 **不能证明的**：生产容器内 `python --version` 的具体小版本。本报告出现的 3.11.15 / 3.11.16 都是
 本机 uv 解析结果，不得当作生产精确版本。未取证项：生产容器内 `websockets` 的实际小版本。
 
-## 9. 尚未验证的边界
+## 10. 尚未验证的边界
 
 - 生产**尚未**升级到本修复；本卡不接触生产、不部署、不重启、不改配置。
 - 未做下游 `VideoTranscriptAPI` 的端到端验收（不在本卡授权范围）。

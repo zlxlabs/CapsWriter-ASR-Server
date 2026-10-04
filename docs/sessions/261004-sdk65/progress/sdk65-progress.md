@@ -65,31 +65,50 @@
   - 手工伪造一个「假 wait_for」：改用逐行复刻 stdlib 真实实现，避免自造语义偏差。
 - 下一步唯一动作：跑 3.10 / 3.11 / 3.12 对照 + 全量 Verify-Command，随后开 draft PR。
 
-## 里程碑 4：跨版本验证与交付
+## 里程碑 4：复核纠偏（本轮）
 
-- 阶段：verifying → delivered（draft PR #66，未标 ready、未合并、未关 issue）
-- 本段结论（验证矩阵）：
+- 阶段：reviewing → fixing
+- 本段结论：
+  - 撤回上一轮的「final 优先」裁决：它会把同轮的上传失败一起吞掉，与原卡「不丢上传失败」相悖。
+    改为「按 upload → receive → idle 固定顺序先上抛任一已完成子任务的异常，全部无异常才返回」，
+    只把 `set` 遍历顺序的不确定性变成确定的，不改语义。
+  - 上一轮写进 design 的「upload/deadline_watch 吞取消后会自终止」**不成立且自相矛盾**（取消已被
+    消费，下一轮没有待投递的取消）。真实解释器三形态有界测量推翻该断言：3.10/3.11 全部挂死，
+    3.12 全部正常。已删除该断言，后两者改记为「可达性未证、存量另作追踪」。
+  - getter 只 cancel 不 await：注入实验（只删那一行）证明无收益，两侧退出码与 stderr 完全一致、
+    destroyed-pending 均为 0，不加那次 await；测试里收进 `Queue.get` 的断言转不红（恒真），撤掉。
+  - 纠正两处曲解：生产版本只写「3.11 大次版本构建线索」，不把本机小版本当生产精确版本；
+    「删除 idle_watch」写明是把计时归回 `_receive`、保留上传后 idle 语义，不是删掉超时能力。
+  - 定位并归档卡面 Narrow-Verify 退出码 2：命令依赖清单漏了 `soundfile`，`tests/test_sdk_client.py`
+    顶层 import 它 → 收集期报错 → `Interrupted: 1 error during collection` → 退出 2。
+    用 base commit 的测试文件复现同样退出 2，判定为**继承问题**。
+  - 修掉自己新加的两处会飘的测试：「同拍完成」构造换成顺序确定的版本；同步入口子进程的
+    handler 补上 30s 上界（原先无上限，外层取消时 `Server.__aexit__` 会把它等穿，子进程的
+    20s 上界形同虚设），形成 30/45/90 三层硬截止。
+- 关键决策：
+  - 模拟旧 stdlib 的 fixture 保留（让 3.12 CI 守住生产才有的边界），但**不再拿它当唯一证据**：
+    真实 3.11 的修前修后对照才是主证据。
+  - 未修 3.10 的 `TimeoutError` 别名缺陷、未修 `upload`/`deadline_watch` 同形态隐患，按卡面另作追踪。
+- 否决方案：
+  - 保留「同拍」测试并标 xfail：会飘的用例即使标了也会污染信号，不如换成确定性的。
+  - 给 getter 补 await：注入实验已证无收益。
+- 下一步唯一动作：push、开/更新 draft PR、写完整回执。
+
+## 里程碑 5：最终验证与交付
+
+- 阶段：verifying → delivered
+- 本段结论（全部为实际退出码）：
 
   | 运行 | 解释器 | 结果 |
   | --- | --- | --- |
-  | 全量 Verify-Command（`tests/`） | 3.12 | `453 passed, 3 skipped` |
-  | Narrow-Verify 连续 5 次 | 3.12 | 每次 `34 passed` |
-  | 既有 SDK 套件（修前基线） | 3.11 | `4 failed, 23 passed`（挂满 120s 预算） |
-  | 既有 SDK 套件 + 新回归（修后） | 3.11 | `34 passed` |
-  | 旧码 + `legacy_wait_for_semantics` | 3.12 | `3 failed, 4 passed`（红） |
-  | 新码 + `legacy_wait_for_semantics` | 3.12 | `7 passed`（绿） |
-  | SDK 套件（修前基线） | 3.10 | `11 failed, 16 passed, 1 error`（继承红） |
-  | SDK 套件 + 新回归（修后） | 3.10 | **待补**（运行中，完成后填入实际输出） |
+  | 修前 A/B（真实解释器 + 真实 websockets + 真实 ffmpeg） | 3.10 / 3.11 / 3.12 | 3.10 exit=4（裸 `asyncio.TimeoutError`）、3.11 exit=3（`AsrError(timeout)`）、3.12 exit=0 |
+  | 修后 A/B（同脚本同输入） | 3.10 / 3.11 / 3.12 | 全部 exit=0（`OK`，耗时 0.098/0.101/0.100s） |
+  | 修前 pytest（真实 3.11，新回归） | 3.11 | `4 failed, 24 deselected`，全部是断言失败 |
+  | 修后 pytest 竞态窄测 ×5 | 3.11 | 5 次全部 `7 passed` |
+  | 修后 pytest 竞态窄测 ×5（与全量并发） | 3.12 | 5 次全部 `7 passed` |
+  | 窄测整文件（补齐 soundfile 依赖后） | 3.12 | `34 passed`，EXIT=0 |
+  | 全量 Verify-Command | 3.12 | `453 passed, 3 skipped`，EXIT=0 |
+  | 卡面 Narrow-Verify 原文 | 3.12 | `EXIT=2`（缺 soundfile，继承问题，见 root-cause.md 第 8 节） |
 
-- 关键决策：
-  - 不在本卡修 3.10 的 `except TimeoutError` / `asyncio.TimeoutError` 别名缺陷（属继承红，
-    且与本卡根因不同），只实证、归档、上报，另开单。
-  - PR 保持 draft，不标 ready、不合并、不关 issue，验收权留给主脑。
-- 否决方案：
-  - 为了让 3.10 变绿而在本卡顺手改 `except (TimeoutError, asyncio.TimeoutError)`：越出本卡根因，
-    会把两个缺陷混在一个 diff 里，反而让主脑难判。
-- 下一步唯一动作：等主脑验收 PR #66。
-
-### 里程碑 4 补记：Python 3.10 修后
-
-**待补**：修后 3.10 的实测输出尚未产生，此处不预填结论。
+- 关键决策 / 否决方案：见里程碑 4；本轮无新增否决。
+- 下一步唯一动作：交主脑验收 PR #66（保持 draft）。

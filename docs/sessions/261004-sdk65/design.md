@@ -126,7 +126,12 @@ tasks.difference_update(done)
 
 原实现 `for task in done: task.result()` 遍历 `set`，同时完成多个任务时上抛哪一个取决于哈希顺序。
 新实现只做一件事：**把这个不确定性变成确定的**，且保持原契约——**任何一个已完成子任务的异常都优先
-上抛**（上传失败不能因为同轮收到了 final 就被改判成成功）。只有全部无异常时才返回 `Transcript`。
+上抛**（上传失败不能因为之后收到了 final 就被改判成成功）。只有全部无异常时才返回 `Transcript`。
+
+**同拍场景不可确定性构造**：曾尝试构造「upload 与 receive 在同一事件循环批次里收尾」，实测该构造
+依赖 upload 是否恰好停在最后一帧的 `ws.send()` 上（取决于真实 socket 时序）——同一场景在 3.12 修前
+红、3.11 修后绿。因此**没有**把它写成断言，只保留顺序确定的 I5 用例；观察到的现象记录在
+`root-cause.md`。
 
 ### 已否决方案
 
@@ -147,9 +152,9 @@ tasks.difference_update(done)
 | I2 | `_transcribe_connected` 收尾不无限等待 | 同上（10s 硬上界，超时即断言失败） |
 | I3 | 上传结束后真的没有消息，仍按 `idle_timeout` 抛 `AsrError(code="timeout")` | `test_idle_timeout_still_fires_after_upload` |
 | I4 | 服务端 `error`、发送失败、总预算超时、调用方取消仍按原契约上抛并回收 | 既有 `test_server_error_code_and_retryable_are_preserved` / `test_blocked_send_uses_idle_timeout` / `test_total_deadline_expires_despite_continuous_progress` / `test_close_without_error_frame_maps_to_connection_lost` + 新增 `test_caller_cancellation_propagates_and_reclaims` |
-| I5 | **上传失败不被同轮的 final 盖掉**；裁决顺序固定 | `test_upload_failure_is_not_masked_by_concurrent_final` |
+| I5 | **上传失败不被改判成成功的转录** | `test_upload_failure_is_not_masked_by_final` |
 | I6 | 发送与接收并行：上传期间不被接收 idle 预算截断，上传完成后 idle 才生效 | `test_receive_idle_budget_does_not_fire_during_upload` |
-| I7 | 跨序列化契约：fake server 只按**实际收到的帧**回 final（同 `task_id`、帧顺序、`is_final`、`samples_total`） | I1/I5/I6 三例内的 `frames` 断言 |
+| I7 | 跨序列化契约：fake server 只按**实际收到的帧**回 final（同 `task_id`、帧顺序、`is_final`、`samples_total`） | I1/I6 两例内的 `frames` 断言 |
 | I8 | `transcribe_file_sync` 走独立进程时同样及时返回 | `test_sync_entrypoint_returns_transcript_in_subprocess` |
 
 ## 5. 非目标
