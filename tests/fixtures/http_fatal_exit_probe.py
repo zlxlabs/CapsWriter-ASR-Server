@@ -15,7 +15,8 @@
                              释放 runner 引用 → 对**该具体源**注入 unlink
                              PermissionError，等待 listener 监督链 fatal。
   * ``sigterm``             正常启动后向自己发 SIGTERM，回归主动 stop 的 0 退出。
-  * ``http_init_failure``   HTTP 显式启用但数据目录无法初始化，回归启动失败路径。
+  * ``http_init_failure``   HTTP 显式启用但数据目录无法初始化，回归启动失败路径；
+                             在真实装配点记录已建好的共享 Manager 的 PID 与 /proc 事实。
   * ``ws_only``             不提供 CW_HTTP_PORT，回归默认 WS 与 HTTP disabled。
 
 无论哪种模式，进程退出码就是被测行为本身：脚本不吞异常、不代替被测代码退出。
@@ -395,6 +396,44 @@ def _redirect_output() -> None:
     sys.stderr = sys.stdout
 
 
+def _observe_manager_before_http_assembly(app) -> None:
+    """在真实 HTTP 装配点记录共享 Manager 的真实 PID 与 /proc 事实。
+
+    启动失败模式下 Manager 是在 ProcessManager.start() 里先建好的，装配失败发生在
+    之后的 HttpServer.prepare()——那正是「Manager 已经活着」的最后一个观测点。
+    这里只包一层记录，prepare() 本体照旧执行并照旧抛真实异常：不改 factory 去不建
+    Manager，也不吞错。
+    """
+    from core.server import http_server as server_module
+
+    real_prepare = server_module.HttpServer.prepare
+
+    def observed_prepare(self):
+        manager = app.process_manager._manager
+        process = getattr(manager, "_process", None)
+        pid = process.pid if process is not None else None
+        emit({
+            "phase": "pre_http_assembly",
+            "mode": "http_init_failure",
+            "app_pid": os.getpid(),
+            "manager_pid": pid,
+            # 「确实建过」与「确实活过」分开记录：只有 pid 非空还不够，
+            # 还要有同一时刻从 /proc 读出的真实痕迹，消费方才不会拿到 None 恒真。
+            "manager_process_created": process is not None,
+            "manager_process_alive": bool(process is not None and process.is_alive()),
+            "manager_argv": _proc_cmdline(pid) if pid else [],
+            "manager_cgroup": _cgroup_path(pid) if pid else "",
+            "worker_pid": app.state.recognize_process.pid,
+            "app_cgroup": _cgroup_path(os.getpid()),
+            "http_data_dir": os.environ.get("CW_HTTP_DATA_DIR", ""),
+            "http_port": int(os.environ.get("CW_HTTP_PORT", "0")),
+            "ws_port": int(os.environ["CW_PORT"]),
+        })
+        return real_prepare(self)
+
+    server_module.HttpServer.prepare = observed_prepare
+
+
 def main() -> int:
     mode = os.environ.get("CW_PROBE_MODE", "fatal")
     _redirect_output()
@@ -413,6 +452,7 @@ def main() -> int:
             "http_port": int(os.environ.get("CW_HTTP_PORT", "0")),
             "ws_port": int(os.environ["CW_PORT"]),
         })
+        _observe_manager_before_http_assembly(app)
         # 装配失败必须让 start() 抛错：这里不吞异常、不代替被测代码退出
         app.start()
         return 0

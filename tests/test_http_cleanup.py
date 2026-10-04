@@ -1058,6 +1058,9 @@ class ProbeRun:
                         ["systemctl", "--user", verb, self._unit],
                         capture_output=True, timeout=30,
                     )
+                # `systemd-run --wait` 是本进程起的子进程：unit 停掉后它会自己返回，
+                # 但必须显式回收，否则 pytest 会攒下一串 run-to-run 的干扰源。
+                await asyncio.to_thread(self._process.wait, 10)
             elif self._process is not None:
                 try:
                     os.killpg(self._process.pid, signal.SIGKILL)
@@ -1289,13 +1292,31 @@ def test_http_startup_failure_exits_nonzero_without_hanging_worker(tmp_path, lau
     workdir = tmp_path / "startup"
     workdir.mkdir()
     run = ProbeRun(workdir, "http_init_failure", launcher)
-    _report, code = _probe_session(run, None)
+    assembly, code = _probe_session(run, "pre_http_assembly")
 
     assert code != 0, f"HTTP 初始化失败必须非零退出，实际 {code}：{run.log_tail()}"
     startup_log = asyncio.run(run.wait_log("HTTP 存储初始化失败"))
     assert "HTTP 存储初始化失败" in startup_log, (
         f"日志里没有真实装配失败记录：{startup_log}"
     )
+    # Manager 回收契约：必须是「真实建过、活过、然后消失」，不能用 None 恒真蒙混。
+    manager_pid = assembly["manager_pid"]
+    assert isinstance(manager_pid, int) and manager_pid > 1, (
+        f"装配点没拿到共享 Manager 的真实 PID：{assembly}"
+    )
+    assert manager_pid not in {assembly["app_pid"], assembly["worker_pid"]}, (
+        f"Manager PID 与 app/worker 撞号，说明没记到独立进程：{assembly}"
+    )
+    assert assembly["manager_process_created"] is True, assembly
+    assert assembly["manager_process_alive"] is True, (
+        f"装配点 Manager 并没有活着：{assembly}"
+    )
+    assert assembly["manager_argv"], f"装配点 /proc 没读出 Manager 的 argv：{assembly}"
+    assert assembly["manager_cgroup"], (
+        f"装配点 /proc 没读出 Manager 的 cgroup：{assembly}"
+    )
+    leftover = asyncio.run(_wait_gone([manager_pid, assembly["worker_pid"]]))
+    assert leftover == [], f"启动失败收尾后这些子进程仍然存活：{leftover}"
     assert run.cgroup_pids() == [], (
         f"unit cgroup 里仍残留进程：{run.cgroup_pids()}"
     )
