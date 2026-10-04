@@ -21,7 +21,7 @@ failure-visibility: p2-only
 
 ### P2：fatal 收尾在信号 stop 已结束后可能再次启动事件循环
 
-- 位置：[core/server/app.py](/home/zlx/projects/oss/CapsWriter-Offline-with-AI-worktrees/http-m4-c2-fixed-review1-261004/core/server/app.py:181)。_drain_after_fatal() 调用 stop() 后，只要 HTTP 已启用就无条件执行 loop.run_forever()；stop() 在 is_alive=False 时会立即返回，不再安排停止回调。
+- 位置：core/server/app.py:181。_drain_after_fatal() 调用 stop() 后，只要 HTTP 已启用就无条件执行 loop.run_forever()；stop() 在 is_alive=False 时会立即返回，不再安排停止回调。
 - 对应不变式：运行期 fatal 必须回收资源并以非零退出；正常 SIGTERM 必须保持零退出；未知运行期 RuntimeError 不应被吞掉（design §7）。
 - OCR 标注：high / confirmed。人工判定：条件性 P2，未达到 P1。
 - 真实运行测量：六轮 systemd fatal 重启、五轮裸 shell fatal 退出，以及一轮 SIGTERM 与清理 I/O fatal 交错，没有观察到 OCR 所说的精确排列——信号 stop 完成回调已经运行，之后同一次 run_until_complete() 又抛出非 RuntimeError 并进入 _drain_after_fatal()。额外的启动期 RuntimeError 探针在 HTTP 装配前运行，is_alive 仍为 true，成功排空后以状态 1 退出；它不覆盖该窄时序。
@@ -29,7 +29,7 @@ failure-visibility: p2-only
 
 ### P2：并发 HttpServer.stop() 的第二个调用跳过在途 cleanup drain
 
-- 位置：[core/server/http_server.py](/home/zlx/projects/oss/CapsWriter-Offline-with-AI-worktrees/http-m4-c2-fixed-review1-261004/core/server/http_server.py:303)。第一个调用先将 _source_cleanup_task 置空再等待；并发调用会看到空引用，跳过 gather()，提前调用 file_runner.stop()。两个调用点分别为 app.py:82 与 http_server.py:279。
+- 位置：core/server/http_server.py:303。第一个调用先将 _source_cleanup_task 置空再等待；并发调用会看到空引用，跳过 gather()，提前调用 file_runner.stop()。两个调用点分别为 app.py:82 与 http_server.py:279。
 - 对应不变式：设计要求清理只删 terminal_at 超过七天、状态为 DONE/FAILED 且无活跃 runner 引用的登记源；所有写入/删除共用单 I/O worker；shutdown 必须等在途 I/O 完成（design §7、M4 plan §5 T6–T8）。
 - OCR 标注：medium / confirmed。人工判定：P2。
 - 真实触发：隔离裸 shell 中运行真实 App、HTTP listener、Manager/识别子进程及 SQLite；真实 TCP DONE 上传完成后将该任务老化，阻塞单 I/O worker 的具体源清理，再发送真实 SIGTERM。第 1 次 stop 看到 cleanup task 存在且 I/O in-flight；serve() 的 finally 进入第 2 次 stop，看到 task 已为空、I/O 仍在途；file_runner.stop() 在 I/O 完成前开始并结束，I/O worker 的 close 则排在清理 I/O 完成后。
