@@ -180,7 +180,12 @@ def sdk_queue_getter_tasks(monkeypatch):
 
     def tracked_ensure_future(coro, *args, **kwargs):
         task = original_ensure_future(coro, *args, **kwargs)
-        if inspect.iscoroutine(coro) and coro.cr_code is queue_get_code:
+        caller = inspect.currentframe().f_back
+        if (
+            inspect.iscoroutine(coro)
+            and coro.cr_code is queue_get_code
+            and caller.f_code.co_filename == sdk_client.__file__
+        ):
             tasks.append(task)
             created.set()
         return task
@@ -652,9 +657,9 @@ async def test_receive_idle_budget_does_not_fire_during_slow_upload(
             transcribe_file(audio_path, url, idle_timeout=idle_timeout, deadline_total=15)
         )
         final_gate_waiter = asyncio.create_task(final_send_entered.wait())
-        final_gate_done, _ = await asyncio.wait({final_gate_waiter}, timeout=10)
+        final_gate_done, _ = await asyncio.wait({final_gate_waiter}, timeout=5)
         four_frames_waiter = asyncio.create_task(four_frames_received.wait())
-        four_frames_done, _ = await asyncio.wait({four_frames_waiter}, timeout=5)
+        four_frames_done, _ = await asyncio.wait({four_frames_waiter}, timeout=3)
         upload_elapsed_at_gate = time.monotonic() - first_send_at if first_send_at else 0
         caller_alive_during_upload = not caller.done()
         no_receive_during_upload = received_messages == []
