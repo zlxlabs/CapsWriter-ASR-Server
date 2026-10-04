@@ -158,9 +158,8 @@ def legacy_wait_for_semantics(monkeypatch):
 def _pending_sdk_tasks() -> list[str]:
     """列出仍未结束的 SDK 内部任务；假服务端的任务不在此列。
 
-    只收 SDK 自己的协程名：idle_watch 每轮新建的 Queue.get getter 实测在
-    transcribe_file 返回前一定会被事件循环收尾（见 root-cause.md 第 4 节的注入实验），
-    把它写进断言并不能在“取消后不 await”时转红，属于恒真断言，故不收。
+    idle_watch 的 Queue.get getter 由 sdk_queue_getter_tasks 直接保留 Task 身份，
+    不在这里按协程名猜测；这个列表只用于 SDK 外层协程的现有收尾断言。
     """
     pending = []
     for task in asyncio.all_tasks():
@@ -169,6 +168,25 @@ def _pending_sdk_tasks() -> list[str]:
             if not task.done():
                 pending.append(qualname)
     return pending
+
+
+@pytest.fixture
+def sdk_queue_getter_tasks(monkeypatch):
+    """按 asyncio.Queue.get 的代码对象追踪 ensure_future 返回的真实 Task。"""
+    tasks = []
+    created = asyncio.Event()
+    original_ensure_future = asyncio.ensure_future
+    queue_get_code = asyncio.Queue.get.__code__
+
+    def tracked_ensure_future(coro, *args, **kwargs):
+        task = original_ensure_future(coro, *args, **kwargs)
+        if inspect.iscoroutine(coro) and coro.cr_code is queue_get_code:
+            tasks.append(task)
+            created.set()
+        return task
+
+    monkeypatch.setattr(asyncio, "ensure_future", tracked_ensure_future)
+    return tasks, created
 
 
 @asynccontextmanager
@@ -336,7 +354,7 @@ async def test_progress_is_received_before_upload_finishes(tmp_path, monkeypatch
 
 @pytest.mark.asyncio
 async def test_final_result_returns_without_server_close(
-    tmp_path, fake_media_tools, legacy_wait_for_semantics
+    tmp_path, fake_media_tools, legacy_wait_for_semantics, sdk_queue_getter_tasks
 ):
     """issue #65 回归：final 已到达就必须返回，不等服务端关连接、不留悬挂任务。
 
@@ -347,6 +365,8 @@ async def test_final_result_returns_without_server_close(
     """
     audio_path = make_audio(tmp_path / "source.wav")
     release = asyncio.Event()
+    allow_final = asyncio.Event()
+    getter_tasks, getter_created = sdk_queue_getter_tasks
 
     async def final_then_hold(ws, state):
         async for message in ws:
@@ -354,6 +374,7 @@ async def test_final_result_returns_without_server_close(
             state["frames"].append(frame)
             if frame["is_final"]:
                 state["final_received"] = True
+                await allow_final.wait()
                 await ws.send(json.dumps(final_result(
                     task_id=frame["task_id"], text="保持连接的 final。",
                 )))
@@ -370,14 +391,23 @@ async def test_final_result_returns_without_server_close(
 
     async with fake_v2_server(final_then_hold) as (url, state):
         caller = asyncio.create_task(call())
+        getter_waiter = asyncio.create_task(getter_created.wait())
+        getter_done, _ = await asyncio.wait({getter_waiter}, timeout=5)
+        getter_observed = getter_waiter in getter_done
+        allow_final.set()
         done, _ = await asyncio.wait({caller}, timeout=10)
         release.set()
         returned = caller in done
+        if not getter_waiter.done():
+            getter_waiter.cancel()
+            await asyncio.gather(getter_waiter, return_exceptions=True)
         leaked = _pending_sdk_tasks()
 
     assert returned, (
         f"final 已到达服务端但 transcribe_file 10 秒内没有返回（issue #65）；outcome={outcome}"
     )
+    assert getter_observed, "final 返回路径没有观察到 SDK 创建的 Queue.get Task"
+    assert getter_tasks and all(task.done() for task in getter_tasks), getter_tasks
     assert "error" not in outcome, outcome.get("error")
     assert leaked == [], f"SDK 内部任务未被回收：{leaked}"
     transcript = outcome["transcript"]
@@ -430,18 +460,20 @@ async def test_final_result_returns_without_server_close_no_shim(
 
 
 @pytest.mark.asyncio
-async def test_upload_failure_is_not_masked_by_final(
+async def test_upload_failure_is_not_masked_by_final_when_both_tasks_done(
     tmp_path, fake_media_tools, monkeypatch
 ):
-    """上传失败不能被改判成成功的转录：必须上抛 AsrError，而不是返回 Transcript。
-
-    注意：这里**故意不复现「同拍完成」**——upload 是否恰好停在最后一帧的 send 上取决于
-    真实 socket 时序，实测在 3.12 修前红、3.11 修后绿，同一个场景两种结果，无法确定性构造。
-    因此只锁「失败不被 final 盖掉」这条契约本身（顺序确定即可），同拍的不确定性另在
-    root-cause.md 记录，不写成会飘的断言。
-    """
+    """真实 wire final 与 send 异常进入同一 done 集合时，异常仍按契约优先上抛。"""
     audio_path = make_audio(tmp_path / "source.wav")
     original_connect = websockets.connect
+    original_receive = sdk_client._receive
+    original_wait = asyncio.wait
+    receive_ready = asyncio.Event()
+    release_receive = asyncio.Event()
+    release_server = asyncio.Event()
+    upload_task = {}
+    receive_task = {}
+    observed_same_done = []
 
     class FailingSendConnection:
         def __init__(self, context_manager):
@@ -455,7 +487,12 @@ async def test_upload_failure_is_not_masked_by_final(
         async def __aexit__(self, *args):
             return await self.context_manager.__aexit__(*args)
 
-        async def send(self, _message):
+        async def send(self, message):
+            upload_task["task"] = asyncio.current_task()
+            await self.ws.send(message)
+            await receive_ready.wait()
+            release_receive.set()
+            await asyncio.sleep(0)
             raise OSError("connection reset by peer")
 
         async def recv(self):
@@ -468,19 +505,54 @@ async def test_upload_failure_is_not_masked_by_final(
     failing_connect.__signature__ = inspect.signature(original_connect)
     monkeypatch.setattr(sdk_client.websockets, "connect", failing_connect)
 
-    async def silent(ws, state):
-        async for message in ws:
-            state["frames"].append(json.loads(message))
+    async def tracked_receive(ws, *, on_progress, idle_messages):
+        receive_task["task"] = asyncio.current_task()
+        result = await original_receive(
+            ws, on_progress=on_progress, idle_messages=idle_messages
+        )
+        receive_ready.set()
+        await release_receive.wait()
+        return result
 
-    async with fake_v2_server(silent) as (url, state):
-        with pytest.raises(AsrError) as caught:
-            await transcribe_file(audio_path, url, deadline_total=20)
+    async def tracked_wait(tasks, *args, **kwargs):
+        done, pending = await original_wait(tasks, *args, **kwargs)
+        upload = upload_task.get("task")
+        receive = receive_task.get("task")
+        if upload is not None and receive is not None and upload in tasks and receive in tasks:
+            observed_same_done.append(upload in done and receive in done)
+        return done, pending
+
+    monkeypatch.setattr(sdk_client, "_receive", tracked_receive)
+    monkeypatch.setattr(asyncio, "wait", tracked_wait)
+
+    async def final_then_hold(ws, state):
+        async for message in ws:
+            frame = json.loads(message)
+            state["frames"].append(frame)
+            if frame["is_final"]:
+                state["final_received"] = True
+                state["response_task_id"] = frame["task_id"]
+                await ws.send(json.dumps(final_result(task_id=frame["task_id"])))
+                await release_server.wait()
+                return
+
+    async with fake_v2_server(final_then_hold) as (url, state):
+        try:
+            with pytest.raises(AsrError) as caught:
+                await transcribe_file(audio_path, url, deadline_total=20)
+        finally:
+            release_receive.set()
+            release_server.set()
 
     assert caught.value.code == "connection_lost"
     assert "connection reset by peer" in caught.value.message
-    # 失败发生在上传阶段：连接已建立，但服务端没收到任何帧。
     assert state["connections"] == 1
-    assert state["frames"] == []
+    assert state["final_received"]
+    assert len(state["frames"]) == 1
+    frame = state["frames"][0]
+    assert frame["is_final"] is True
+    assert state["response_task_id"] == frame["task_id"]
+    assert observed_same_done == [True], "send 异常与合法 final 未同轮进入 asyncio.wait done"
     assert _pending_sdk_tasks() == []
 
 
@@ -504,12 +576,24 @@ async def test_idle_timeout_still_fires_after_upload(tmp_path, fake_media_tools)
 
 
 @pytest.mark.asyncio
-async def test_receive_idle_budget_does_not_fire_during_upload(tmp_path, monkeypatch):
-    """发送与接收并行：上传期间不被接收 idle 预算提前终止，上传完成后 idle 才生效。"""
+async def test_receive_idle_budget_does_not_fire_during_slow_upload(
+    tmp_path, monkeypatch, sdk_queue_getter_tasks
+):
+    """上传耗时超过 idle 预算仍活着；上传结束后才开始 idle 计时。"""
     audio_path = make_audio(tmp_path / "source.wav")
-    pcm = b"\0" * (3 * 256 * 1024)
+    pcm = b"\0" * (5 * 256 * 1024)
     monkeypatch.setattr(sdk_client, "_transcode", lambda *_: asyncio.sleep(0, result=pcm))
     original_connect = websockets.connect
+    idle_timeout = 1.0
+    send_delay = 0.5
+    final_send_entered = asyncio.Event()
+    release_final_send = asyncio.Event()
+    four_frames_received = asyncio.Event()
+    getter_tasks, getter_created = sdk_queue_getter_tasks
+    received_messages = []
+    send_durations = []
+    first_send_at = None
+    final_send_returned_at = None
 
     class SlowSendConnection:
         def __init__(self, context_manager):
@@ -524,11 +608,24 @@ async def test_receive_idle_budget_does_not_fire_during_upload(tmp_path, monkeyp
             return await self.context_manager.__aexit__(*args)
 
         async def send(self, message):
-            await asyncio.sleep(0.3)  # 每帧 0.3s，总上传 ~0.9s > idle_timeout/3
+            nonlocal first_send_at, final_send_returned_at
+            frame = json.loads(message)
+            started = time.monotonic()
+            if first_send_at is None:
+                first_send_at = started
+            await asyncio.sleep(send_delay)
+            if frame["is_final"]:
+                final_send_entered.set()
+                await release_final_send.wait()
             await self.ws.send(message)
+            send_durations.append(time.monotonic() - started)
+            if frame["is_final"]:
+                final_send_returned_at = time.monotonic()
 
         async def recv(self):
-            return await self.ws.recv()
+            message = await self.ws.recv()
+            received_messages.append(message)
+            return message
 
     def slow_connect(url, **kwargs):
         options = {k: v for k, v in kwargs.items() if v is not None or k == "proxy"}
@@ -537,29 +634,70 @@ async def test_receive_idle_budget_does_not_fire_during_upload(tmp_path, monkeyp
     slow_connect.__signature__ = inspect.signature(original_connect)
     monkeypatch.setattr(sdk_client.websockets, "connect", slow_connect)
 
-    async def reply_final(ws, state):
+    async def swallow_everything(ws, state):
         async for message in ws:
             frame = json.loads(message)
             state["frames"].append(frame)
-            if frame["is_final"]:
-                state["final_received"] = True
-                await ws.send(json.dumps(final_result(task_id=frame["task_id"])))
+            if len(state["frames"]) == 4:
+                four_frames_received.set()
 
-    async with fake_v2_server(reply_final) as (url, state):
-        started = time.monotonic()
-        transcript = await transcribe_file(audio_path, url, idle_timeout=1, deadline_total=30)
-        elapsed = time.monotonic() - started
+    async with fake_v2_server(swallow_everything) as (url, state):
+        caller = asyncio.create_task(
+            transcribe_file(audio_path, url, idle_timeout=idle_timeout, deadline_total=15)
+        )
+        final_gate_waiter = asyncio.create_task(final_send_entered.wait())
+        final_gate_done, _ = await asyncio.wait({final_gate_waiter}, timeout=10)
+        four_frames_waiter = asyncio.create_task(four_frames_received.wait())
+        four_frames_done, _ = await asyncio.wait({four_frames_waiter}, timeout=5)
+        upload_elapsed_at_gate = time.monotonic() - first_send_at if first_send_at else 0
+        caller_alive_during_upload = not caller.done()
+        no_receive_during_upload = received_messages == []
+        getter_not_created_during_upload = not getter_created.is_set()
+        frames_before_final = [frame["is_final"] for frame in state["frames"]]
+        release_final_send.set()
+        getter_waiter = asyncio.create_task(getter_created.wait())
+        getter_done, _ = await asyncio.wait({getter_waiter}, timeout=5)
+        getter_observed_after_upload = getter_waiter in getter_done
+        caller_done, _ = await asyncio.wait({caller}, timeout=5)
+        caller_finished = caller in caller_done
+        error = caller.exception() if caller_finished and not caller.cancelled() else None
+        if not caller_finished:
+            caller.cancel()
+            caller_cleanup_done, _ = await asyncio.wait({caller}, timeout=5)
+            caller_finished = caller in caller_cleanup_done
+            if caller_finished and not caller.cancelled():
+                error = caller.exception()
+        for waiter in (final_gate_waiter, four_frames_waiter, getter_waiter):
+            if not waiter.done():
+                waiter.cancel()
+                await asyncio.gather(waiter, return_exceptions=True)
 
-    assert transcript.text == "你好，世界。"
-    assert state["final_received"]
-    assert [frame["is_final"] for frame in state["frames"]] == [False, False, True]
-    assert elapsed >= 0.9, "上传被提前截断"
+    assert final_gate_done and four_frames_done, "慢上传屏障未到达"
+    assert upload_elapsed_at_gate > idle_timeout * 1.5
+    assert caller_alive_during_upload, "idle 预算在上传期间终止了调用"
+    assert no_receive_during_upload, "上传期间 SDK 收到了服务端消息"
+    assert getter_not_created_during_upload, "上传未结束就创建了 idle Queue.get"
+    assert frames_before_final == [False, False, False, False]
+    assert caller_finished, "上传完成后 idle 未在有界时间内结束调用"
+    assert isinstance(error, AsrError) and error.code == "timeout", error
+    assert getter_observed_after_upload
+    assert getter_tasks and all(task.done() for task in getter_tasks), getter_tasks
+    assert final_send_returned_at is not None and first_send_at is not None
+    upload_duration = final_send_returned_at - first_send_at
+    assert upload_duration > idle_timeout * 1.8
+    assert len(send_durations) == 5
+    assert all(duration < idle_timeout for duration in send_durations), send_durations
+    assert received_messages == []
+    assert [frame["is_final"] for frame in state["frames"]] == [False, False, False, False, True]
 
 
 @pytest.mark.asyncio
-async def test_caller_cancellation_propagates_and_reclaims(tmp_path, fake_media_tools):
+async def test_caller_cancellation_propagates_and_reclaims(
+    tmp_path, fake_media_tools, sdk_queue_getter_tasks
+):
     """调用方取消仍然上抛 CancelledError，且不遗留 SDK 内部任务。"""
     audio_path = make_audio(tmp_path / "source.wav")
+    getter_tasks, getter_created = sdk_queue_getter_tasks
 
     async def never_reply(ws, state):
         async for message in ws:
@@ -567,16 +705,21 @@ async def test_caller_cancellation_propagates_and_reclaims(tmp_path, fake_media_
 
     async with fake_v2_server(never_reply) as (url, state):
         task = asyncio.create_task(
-            transcribe_file(audio_path, url, idle_timeout=30, deadline_total=60)
+            transcribe_file(audio_path, url, idle_timeout=1, deadline_total=3)
         )
-        while not state["frames"]:
-            await asyncio.sleep(0.01)
-        await asyncio.sleep(0.05)  # 上传已结束、接收仍在等
+        getter_waiter = asyncio.create_task(getter_created.wait())
+        getter_done, _ = await asyncio.wait({getter_waiter}, timeout=5)
+        getter_observed = getter_waiter in getter_done
         task.cancel()
-        done, _ = await asyncio.wait({task}, timeout=10)
+        done, _ = await asyncio.wait({task}, timeout=6)
         cancelled = task in done and task.cancelled()
+        if not getter_waiter.done():
+            getter_waiter.cancel()
+            await asyncio.gather(getter_waiter, return_exceptions=True)
         leaked = _pending_sdk_tasks()
 
+    assert getter_observed, "调用方取消路径没有观察到 SDK 创建的 Queue.get Task"
+    assert getter_tasks and all(task.done() for task in getter_tasks), getter_tasks
     assert cancelled, "调用方取消后任务既没结束也没处于 cancelled 状态"
     assert leaked == [], f"SDK 内部任务未被回收：{leaked}"
 
@@ -699,21 +842,48 @@ async def test_health_gate_rejects_before_websocket(tmp_path, status, health, ex
 
 
 @pytest.mark.asyncio
-async def test_server_error_code_and_retryable_are_preserved(tmp_path):
+async def test_server_error_code_and_retryable_are_preserved(
+    tmp_path, sdk_queue_getter_tasks
+):
     audio_path = make_audio(tmp_path / "source.wav")
+    getter_tasks, getter_created = sdk_queue_getter_tasks
+    allow_error = asyncio.Event()
 
     async def send_error(ws, state):
-        await ws.recv()
-        await ws.send(json.dumps({
-            "type": "error", "code": "inference_failed", "message": "engine failed", "retryable": True
-        }))
+        async for message in ws:
+            frame = json.loads(message)
+            state["frames"].append(frame)
+            if frame["is_final"]:
+                await allow_error.wait()
+                await ws.send(json.dumps({
+                    "type": "error", "code": "inference_failed", "message": "engine failed", "retryable": True
+                }))
+                return
 
     async with fake_v2_server(send_error) as (url, _):
-        with pytest.raises(AsrError) as caught:
-            await transcribe_file(audio_path, url)
-    assert caught.value.code == "inference_failed"
-    assert caught.value.retryable is True
-    assert caught.value.message == "engine failed"
+        caller = asyncio.create_task(transcribe_file(audio_path, url))
+        getter_waiter = asyncio.create_task(getter_created.wait())
+        getter_done, _ = await asyncio.wait({getter_waiter}, timeout=5)
+        getter_observed = getter_waiter in getter_done
+        allow_error.set()
+        caller_done, _ = await asyncio.wait({caller}, timeout=10)
+        caller_finished = caller in caller_done
+        error = None
+        if caller_finished and not caller.cancelled():
+            try:
+                caller.result()
+            except AsrError as exc:
+                error = exc
+        if not getter_waiter.done():
+            getter_waiter.cancel()
+            await asyncio.gather(getter_waiter, return_exceptions=True)
+    assert caller_finished, "服务端 error 后调用没有在有界时间内结束"
+    assert getter_observed, "服务端 error 路径没有观察到 SDK 创建的 Queue.get Task"
+    assert getter_tasks and all(task.done() for task in getter_tasks), getter_tasks
+    assert isinstance(error, AsrError)
+    assert error.code == "inference_failed"
+    assert error.retryable is True
+    assert error.message == "engine failed"
 
 
 @pytest.mark.asyncio
