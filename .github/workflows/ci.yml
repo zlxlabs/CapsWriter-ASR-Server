@@ -17,15 +17,18 @@ jobs:
         include:
           # 生产解释器必须是矩阵里的一维：3.11 上 asyncio.wait_for 会吞取消（issue #67），
           # 只在 3.12 跑等于拿重写过的实现假绿。
-          # 3.11 只跑 SDK 测试：服务端面向 3.12（AGENTS.md），且仓库全量套件里
-          # tests/test_http_file_tasks.py 的两个并发准入用例在 3.11 上确定性失败
-          # （基线 b0818dc 复现 3/3，与本 SDK 改动无关，HTTP 里程碑不在本卡边界）。
+          # 3.11 维用 glob 覆盖全部 tests/test_sdk_*.py（client、deadline_stage、
+          # no_wait_for、samples_total、transcode_track），新增 SDK 测试文件自动入网，
+          # 不会再因为忘了往列表里补名字而静默漏测。
+          # 仍然排除 HTTP 继承红：全量 tests/ 在 3.11 上
+          # tests/test_http_file_tasks.py 的两个并发准入用例确定性失败
+          # （基线 b0818dc 复现 3/3，与 SDK 改动无关，HTTP 里程碑不在本卡边界）。
           - python-version: "3.11"
             websockets: "websockets==15.0.1"
-            pytest-targets: "tests/test_sdk_client.py tests/test_sdk_deadline_stage.py tests/test_sdk_no_wait_for.py"
+            pytest-targets: "tests/test_sdk_*.py"
           - python-version: "3.11"
             websockets: "websockets"
-            pytest-targets: "tests/test_sdk_client.py tests/test_sdk_deadline_stage.py tests/test_sdk_no_wait_for.py"
+            pytest-targets: "tests/test_sdk_*.py"
           - python-version: "3.12"
             websockets: "websockets"
             pytest-targets: "tests/"

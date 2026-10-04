@@ -57,3 +57,13 @@
   - 否决“把 3.11 维改成跑全量 `tests/` 并接受红”：会把边界外的继承红绑到 bugfix PR 的 gate 上。
   - 否决“为了让 3.11 全量绿而改 `tests/test_http_file_tasks.py`”：超边界，且会用放宽断言掩盖真实并发原子性问题。
 - 下一步唯一动作：交主脑验收；#69 自动预算（Card 2）必须等本卡进 `origin/master` 后才能派。
+
+## 里程碑 5：审查后 3.11 维改用 glob（独立审查 p2-only、无 P1）
+
+- 阶段：verifying（审查回修）
+- 本段结论：`ci.yml` 两行 3.11 的 `pytest-targets` 由三个文件枚举改为 `tests/test_sdk_*.py`，3.12 维保持 `tests/`；注释同步写明「glob 覆盖全部 SDK 测试、仍排除 HTTP 继承红」。实测 bash 展开为 5 个文件、3.11 上 55 passed（38+17），default 与 `websockets==15.0.1` 两腿均 exit 0；3.12 全量 `tests/` 457 passed / 3 skipped，exit 0。本轮只改 `ci.yml`（+8/-5），未动 client.py、测试、公式、pyproject、README。
+- 关键决策与否决：
+  - 采用 glob 而非继续枚举：新增 SDK 测试文件会自动入网，不会因为忘了补名字而静默漏测。
+  - 仍未把 3.11 维扩到全量 `tests/`：`test_http_file_tasks.py` 两个并发准入用例的继承红依旧存在（基线 `b0818dc` 复现 3/3），且该文件在本卡禁止修改边界内。
+  - 否决 cherry-pick 审查分支的文件：超出本卡 Scope-Globs，只按审查意见改 `ci.yml`。
+- 下一步唯一动作：推draft PR #70（仍为 draft，正文保持 `Refs #67, #68`），交主脑验收。
