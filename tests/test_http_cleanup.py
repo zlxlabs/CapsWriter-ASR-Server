@@ -5,8 +5,12 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import os
 import queue
+import shutil
+import signal
 import sqlite3
+import sys
 import threading
 import time
 from pathlib import Path
@@ -814,3 +818,494 @@ async def test_shutdown_waits_for_inflight_cleanup_io(tmp_path, monkeypatch):
         if not serve_task.done():
             server._fatal_event.set()
             await asyncio.gather(serve_task, return_exceptions=True)
+
+
+# ---------------------------------------------------------------- 进程边界探针
+
+# 真实进程边界探针（tests/fixtures/http_fatal_exit_probe.py）在**自有进程**里跑
+# 生产 CapsWriterServer：真实 SocketManager / HttpServer / HttpFileRunner /
+# multiprocessing 识别子进程 / Manager / ffmpeg / SQLite，只有 ASR 引擎与权重
+# 初始化按卡面 stub。探针与本测试的边界是「一个真实进程的退出与资源回收」，
+# 因此下面所有 PID、cgroup、源字节都取自探针进程与 /proc，不在本进程里推断。
+
+PROBE_MODULE = "tests.fixtures.http_fatal_exit_probe"
+PROBE_READY_TIMEOUT = 120.0
+PROBE_EXIT_TIMEOUT = 30.0
+REPO_ROOT = Path(__file__).resolve().parents[1]
+
+
+def _free_port() -> int:
+    import socket
+
+    with socket.socket() as probe:
+        probe.bind(("127.0.0.1", 0))
+        return probe.getsockname()[1]
+
+
+def _systemd_usable() -> bool:
+    """真实消费环境判定：本机 user systemd 能否拉起并观察一个瞬态 unit。"""
+    import subprocess
+
+    try:
+        probe = subprocess.run(
+            ["systemd-run", "--user", "--quiet", "--wait", "--collect",
+             "--service-type=exec", "/bin/true"],
+            capture_output=True, timeout=30,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return probe.returncode == 0
+
+
+def _probe_env(workdir: Path, mode: str) -> dict:
+    """只白名单传探针真正需要的环境变量，不整体继承测试环境。"""
+    http_dir = workdir / "httpdata"
+    if mode == "http_init_failure":
+        # 父路径是普通文件：真实 mkdir 在装配期失败，不是被测代码里的假分支
+        blocked = workdir / "blocked"
+        blocked.write_bytes(b"not-a-directory")
+        http_dir = blocked / "httpdata"
+    return {
+        "PATH": os.environ["PATH"],
+        "PYTHONPATH": str(REPO_ROOT),
+        "PYTHONUNBUFFERED": "1",
+        "CW_ADDR": "127.0.0.1",
+        "CW_PORT": str(_free_port()),
+        "CW_PROBE_MODE": mode,
+        "CW_PROBE_WAV": str(workdir / "probe.wav"),
+        "CW_PROBE_REPORT": str(workdir / "probe-report.jsonl"),
+        "CW_PROBE_DENIAL_LOG": str(workdir / "probe-denial.jsonl"),
+        **({} if mode == "ws_only" else {
+            "CW_HTTP_PORT": str(_free_port()),
+            "CW_HTTP_DATA_DIR": str(http_dir),
+        }),
+    }
+
+
+class ProbeRun:
+    """探针进程句柄。
+
+    回收只按自己拿到的句柄走：naked 走自己 setsid 出来的进程组，systemd 走自己
+    起的那个 unit 名。绝不按名字通配，也绝不碰父进程或别的进程组。
+    """
+
+    def __init__(self, workdir: Path, mode: str, launcher: str):
+        self.workdir = workdir
+        self.mode = mode
+        self.launcher = launcher
+        self.env = _probe_env(workdir, mode)
+        self.report_path = Path(self.env["CW_PROBE_REPORT"])
+        self.log_path = workdir / "probe.log"
+        self.exit_code = None
+        self.control_group = None
+        self._process = None
+        self._unit = None
+
+    # ---- 启动 ----
+
+    async def start(self) -> None:
+        import subprocess
+
+        argv = [sys.executable, "-m", PROBE_MODULE]
+        if self.launcher == "systemd":
+            import uuid
+
+            self._unit = f"cw-http-fatal-{os.getpid()}-{uuid.uuid4().hex[:8]}"
+            argv = [
+                "systemd-run", "--user", f"--unit={self._unit}", "--wait",
+                "--service-type=exec",
+                "--property=KillMode=control-group",
+                "--property=TimeoutStopSec=15",
+                f"--working-directory={REPO_ROOT}",
+            ]
+            argv += [f"--setenv={key}={value}" for key, value in self.env.items()]
+            argv += [sys.executable, "-m", PROBE_MODULE]
+            self._log = open(self.log_path, "wb")
+            self._process = subprocess.Popen(
+                argv, cwd=REPO_ROOT, stdout=self._log,
+                stderr=subprocess.STDOUT,
+            )
+            # systemd-run 返回前 unit 才真正入队；否则后面的 show 读到的是
+            # “unit 不存在”的默认值（ActiveState=inactive），会被误判成已结束。
+            code = await asyncio.to_thread(self._process.wait, 30)
+            assert code == 0, (
+                f"systemd-run 没能创建 unit {self._unit}（rc={code}）：{self.log_tail()}"
+            )
+        else:
+            env = dict(os.environ)
+            env.update(self.env)
+            self._log = open(self.log_path, "wb")
+            self._process = subprocess.Popen(
+                argv, cwd=REPO_ROOT, env=env, stdout=self._log,
+                stderr=subprocess.STDOUT, start_new_session=True,
+            )
+
+    # ---- 观察 ----
+
+    def reports(self) -> list:
+        if not self.report_path.exists():
+            return []
+        return [
+            json.loads(line)
+            for line in self.report_path.read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        ]
+
+    async def wait_report(self, phase: str, timeout: float = PROBE_READY_TIMEOUT):
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + timeout
+        while loop.time() < deadline:
+            for report in self.reports():
+                if report.get("phase") == phase:
+                    if self.launcher == "systemd" and self.control_group is None:
+                        self.control_group = self._unit_properties().get(
+                            "ControlGroup"
+                        ) or None
+                    return report
+            if self.launcher == "systemd":
+                await asyncio.to_thread(self._assert_unit_alive)
+            elif self._process.poll() is not None and not self.reports():
+                raise AssertionError(
+                    f"探针在产出 {phase} 报告前就退出了，exitcode="
+                    f"{self._process.returncode}：{self.log_tail()}"
+                )
+            await asyncio.sleep(0.05)
+        raise AssertionError(
+            f"探针 {PROBE_MODULE} 在 {timeout}s 内没有产出 {phase} 报告：{self.log_tail()}"
+        )
+
+    async def wait_exit(self, timeout: float = PROBE_EXIT_TIMEOUT) -> int:
+        # systemd 启动器用 `systemd-run --wait`：它的退出码就是 unit 主进程的退出码，
+        # 不依赖已被回收的 transient unit 对象。
+        try:
+            self.exit_code = await asyncio.to_thread(self._process.wait, timeout)
+        except Exception as exc:
+            state = (
+                await asyncio.to_thread(self._unit_properties)
+                if self.launcher == "systemd"
+                else f"pid={self._process.pid} alive={_pid_alive(self._process.pid)}"
+            )
+            raise AssertionError(
+                f"探针主进程在 {timeout}s 内没有退出（{state}）；"
+                f"探针日志：{self.log_tail()}"
+            ) from exc
+        return self.exit_code
+
+    def denial_records(self) -> list:
+        path = Path(self.env["CW_PROBE_DENIAL_LOG"])
+        if not path.exists():
+            return []
+        return [
+            json.loads(line)
+            for line in path.read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        ]
+
+    def cgroup_pids(self) -> list:
+        """unit cgroup 里剩下的 PID；unit 尚未起来过则返回空列表。"""
+        if not self.control_group:
+            return []
+        procs = Path("/sys/fs/cgroup") / self.control_group.lstrip("/") / "cgroup.procs"
+        if not procs.exists():
+            return []
+        return [int(line) for line in procs.read_text().split() if line.strip()]
+
+    def log_tail(self, limit: int = 3000) -> str:
+        if self.launcher == "systemd":
+            import subprocess
+
+            probe = subprocess.run(
+                ["journalctl", "--user", "-u", self._unit, "-n", "60",
+                 "--no-pager", "--output=cat"],
+                capture_output=True, timeout=30,
+            )
+            text = probe.stdout.decode("utf-8", errors="replace")
+            journal = _whitelisted_log(text)[-limit:]
+            if journal:
+                return journal
+        if not self.log_path.exists():
+            return ""
+        return _whitelisted_log(
+            self.log_path.read_text(encoding="utf-8", errors="replace")
+        )[-limit:]
+
+    # ---- 回收（只碰自己的 unit / 自己的进程组） ----
+
+    async def cleanup(self) -> None:
+        import subprocess
+
+        if self.launcher == "systemd" and self._unit is not None:
+            for verb in ("stop", "reset-failed"):
+                probe = subprocess.run(
+                    ["systemctl", "--user", verb, self._unit],
+                    capture_output=True, timeout=30,
+                )
+                del probe
+        elif self._process is not None:
+            try:
+                os.killpg(self._process.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            await asyncio.to_thread(self._process.wait, 10)
+            getattr(self, "_log", None) and self._log.close()
+
+    def _unit_properties(self) -> dict:
+        import subprocess
+
+        probe = subprocess.run(
+            ["systemctl", "--user", "show", self._unit,
+             "-p", "LoadState", "-p", "ActiveState", "-p", "ExecMainStatus",
+             "-p", "ControlGroup"],
+            capture_output=True, timeout=30,
+        )
+        properties = {}
+        for line in probe.stdout.decode("utf-8", errors="replace").splitlines():
+            key, _, value = line.partition("=")
+            if key:
+                properties[key] = value
+        return properties
+
+    def _assert_unit_alive(self) -> None:
+        properties = self._unit_properties()
+        if properties.get("LoadState") != "loaded":
+            return  # unit 尚未入队，show 到的只是默认值
+        if properties.get("ActiveState") in {"failed", "inactive"}:
+            raise AssertionError(
+                f"systemd unit {self._unit} 在产出报告前结束：{properties}；"
+                f"探针日志：{self.log_tail()}"
+            )
+
+
+def _whitelisted_log(text: str) -> str:
+    """只留本卡需要的白名单日志行；不回显环境变量、凭据或原始响应体。"""
+    keep = (
+        "PROBE=", "HTTP 未知 operation 失败", "listener 将停止",
+        "HTTP 文件任务 listener", "开始清理服务端资源", "服务端资源清理完成",
+        "正在终止识别子进程", "识别子进程已拉起", "HTTP 文件任务结果已持久化",
+        "HTTP 文件任务失败", "HTTP 存储初始化失败", "再见",
+        "Finished with result", "Main processes terminated",
+    )
+    return "".join(
+        line + "\n" for line in text.splitlines()
+        if any(marker in line for marker in keep)
+    )
+
+
+def _pid_alive(pid) -> bool:
+    if not pid:
+        return False
+    try:
+        os.kill(int(pid), 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return Path(f"/proc/{int(pid)}").exists()
+
+
+async def _wait_gone(pids, timeout: float = 15.0) -> list:
+    """等到这些真实 PID 从 /proc 消失；超时就把还活着的 PID 原样报出来。"""
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout
+    alive = list(pids)
+    while loop.time() < deadline and alive:
+        alive = [pid for pid in alive if _pid_alive(pid)]
+        if alive:
+            await asyncio.sleep(0.05)
+    return alive
+
+
+def _read_probe_db(data_dir: Path, sql: str, params: tuple = ()) -> list:
+    conn = sqlite3.connect(f"file:{data_dir / 'http.sqlite3'}?mode=ro", uri=True)
+    conn.row_factory = sqlite3.Row
+    try:
+        return conn.execute(sql, params).fetchall()
+    finally:
+        conn.close()
+
+
+PROBE_LAUNCHERS = [
+    pytest.param(
+        "naked", id="naked-shell",
+        marks=pytest.mark.skipif(
+            shutil.which("ffmpeg") is None,
+            reason="真实解码链需要本机 ffmpeg",
+        ),
+    ),
+    pytest.param(
+        "systemd", id="systemd-unit",
+        marks=pytest.mark.skipif(
+            shutil.which("ffmpeg") is None or not _systemd_usable(),
+            reason="需要本机 ffmpeg 与可用的 user systemd（真实消费环境）",
+        ),
+    ),
+]
+
+
+@pytest.mark.parametrize("launcher", PROBE_LAUNCHERS)
+def test_fatal_cleanup_exits_process_and_reaps_children(tmp_path, launcher):
+    """运行中 cleanup fatal：进程必须真的非零退出，识别子进程/Manager 必须被回收。
+
+    红（修复前）：具体 unlink PermissionError 之后 HTTP/WS 监听已关，但主进程与
+    识别子进程留在自己 unit 的 cgroup 里不退出，监督看不到退出也就无从重启。
+    """
+    import asyncio
+
+    workdir = tmp_path / "fatal"
+    workdir.mkdir()
+    run = ProbeRun(workdir, "fatal", launcher)
+
+    async def scenario():
+        await run.start()
+        try:
+            pre = await run.wait_report("pre_fatal")
+            code = await run.wait_exit()
+        finally:
+            await run.cleanup()
+        return pre, code
+
+    pre, code = asyncio.run(scenario())
+
+    assert run.denial_records(), (
+        "周期清理没有命中被注入 PermissionError 的那条具体源；"
+        f"探针日志：{run.log_tail()}"
+    )
+    assert code != 0, (
+        "fatal 之后进程必须以非零状态真正退出，监督才能触发重启；"
+        f"实际 exitcode={code}；探针日志：{run.log_tail()}"
+    )
+    # 识别子进程与共享 Manager 必须随进程一起消失（不是被 leave 在后台）
+    leftover = asyncio.run(_wait_gone([pre["worker_pid"], pre["manager_pid"]]))
+    assert leftover == [], f"fatal 之后这些子进程仍然存活：{leftover}"
+    assert run.cgroup_pids() == [], (
+        f"unit cgroup 里仍残留进程：{run.cgroup_pids()}；探针日志：{run.log_tail()}"
+    )
+    # 磁盘事实：源字节、Job 终态、结果 payload 与上传元数据都必须原样保留
+    data_dir = Path(run.env["CW_HTTP_DATA_DIR"])
+    source = data_dir / "sources" / (
+        run.denial_records()[0]["path"].rsplit("/", 1)[-1]
+    )
+    assert source.read_bytes() is not None
+    import hashlib as _hashlib
+
+    assert _hashlib.sha256(source.read_bytes()).hexdigest() == pre["source"]["sha256"]
+    assert source.stat().st_size == pre["source"]["bytes"] == pre["uploaded_bytes"]
+    rows = _read_probe_db(
+        data_dir,
+        "SELECT j.state, j.terminal_at, u.state AS upload_state,"
+        " (SELECT payload FROM results WHERE job_id=j.job_id) AS payload"
+        " FROM jobs j JOIN uploads u ON u.upload_id=j.upload_id"
+        " WHERE j.job_id=?",
+        (pre["job_id"],),
+    )
+    assert len(rows) == 1
+    row = rows[0]
+    assert (row["state"], row["upload_state"]) == ("DONE", "COMMITTED")
+    assert _hashlib.sha256(str(row["payload"]).encode("utf-8")).hexdigest() == (
+        pre["result_sha256"]
+    )
+    assert json.loads(row["payload"]) == pre["result_payload"]
+    assert pre["job_state"] == "DONE"
+    assert pre["uploaded_sha256"] == pre["source"]["sha256"]
+    assert pre["source"]["exists"], "PermissionError 不得删除已登记源"
+    assert pre["released_runner_jobs"] == [], (
+        "老化之前 runner 必须已经释放该 Job 的终态引用，否则清理不该命中它"
+    )
+    # 监听必须已停：进程退出后端口不再接受连接
+    assert _port_refused(pre["http_port"])
+    assert _port_refused(pre["ws_port"])
+    fatal_report = [
+        entry for entry in run.reports() if entry.get("phase") == "post_fatal"
+    ]
+    assert fatal_report, (
+        "没有观察到 listener 监督链上的具体 unlink PermissionError；"
+        f"探针日志：{run.log_tail()}"
+    )
+    assert (fatal_report[0]["fatal_type"], fatal_report[0]["fatal_message"]) == (
+        "PermissionError", "injected source unlink denial",
+    )
+    assert fatal_report[0]["source"]["sha256"] == pre["source"]["sha256"]
+    assert "HTTP 未知 operation 失败" in run.log_tail()
+
+
+def _port_refused(port: int) -> bool:
+    import socket
+
+    with socket.socket() as probe:
+        probe.settimeout(2)
+        return probe.connect_ex(("127.0.0.1", port)) != 0
+
+
+@pytest.mark.parametrize("launcher", PROBE_LAUNCHERS)
+def test_normal_sigterm_still_exits_zero(tmp_path, launcher):
+    """主动 stop 的既有语义不回归：正常 SIGTERM 仍以 0 退出并回收子进程。"""
+    import asyncio
+
+    workdir = tmp_path / "sigterm"
+    workdir.mkdir()
+    run = ProbeRun(workdir, "sigterm", launcher)
+
+    async def scenario():
+        await run.start()
+        try:
+            ready = await run.wait_report("ready")
+            code = await run.wait_exit()
+        finally:
+            await run.cleanup()
+        return ready, code
+
+    ready, code = asyncio.run(scenario())
+    assert code == 0, f"正常 SIGTERM 必须 0 退出，实际 {code}：{run.log_tail()}"
+    assert ready["worker_pid"] and ready["manager_pid"]
+    leftover = asyncio.run(_wait_gone([ready["worker_pid"], ready["manager_pid"]]))
+    assert leftover == [], f"主动 stop 后这些子进程仍然存活：{leftover}"
+
+
+@pytest.mark.parametrize("launcher", PROBE_LAUNCHERS)
+def test_http_startup_failure_exits_nonzero_without_hanging_worker(tmp_path, launcher):
+    """HTTP 显式启用但装配失败：同一条 root，启动期也不得把 worker 挂在后台。"""
+    import asyncio
+
+    workdir = tmp_path / "startup"
+    workdir.mkdir()
+    run = ProbeRun(workdir, "http_init_failure", launcher)
+
+    async def scenario():
+        await run.start()
+        try:
+            code = await run.wait_exit()
+        finally:
+            await run.cleanup()
+        return code
+
+    code = asyncio.run(scenario())
+    assert code != 0, f"HTTP 初始化失败必须非零退出，实际 {code}：{run.log_tail()}"
+    assert "HTTP 存储初始化失败" in run.log_tail(), run.log_tail()
+    assert run.cgroup_pids() == [], (
+        f"unit cgroup 里仍残留进程：{run.cgroup_pids()}"
+    )
+
+
+@pytest.mark.parametrize("launcher", PROBE_LAUNCHERS)
+def test_http_disabled_keeps_default_websocket_lifecycle(tmp_path, launcher):
+    """HTTP disabled：不装配 listener，默认 WS 生命周期与主动 stop 语义不变。"""
+    import asyncio
+
+    workdir = tmp_path / "wsonly"
+    workdir.mkdir()
+    run = ProbeRun(workdir, "ws_only", launcher)
+
+    async def scenario():
+        await run.start()
+        try:
+            ready = await run.wait_report("ready")
+            code = await run.wait_exit()
+        finally:
+            await run.cleanup()
+        return ready, code
+
+    ready, code = asyncio.run(scenario())
+    assert ready["http_server_is_none"], "未提供 CW_HTTP_PORT 时不得装配 HTTP listener"
+    assert code == 0, f"HTTP disabled 下 SIGTERM 必须 0 退出，实际 {code}：{run.log_tail()}"
+    leftover = asyncio.run(_wait_gone([ready["worker_pid"], ready["manager_pid"]]))
+    assert leftover == [], f"HTTP disabled 收尾后这些子进程仍然存活：{leftover}"
