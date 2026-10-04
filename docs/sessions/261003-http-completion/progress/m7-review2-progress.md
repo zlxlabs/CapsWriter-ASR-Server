@@ -27,3 +27,7 @@
 - 四问复核已落在 verdict：无吞错/伪成功路径；本轮没有新增重复抽象、配置层或双重包装；HTTP 与 WS-v2 分别按实际 SDK producer 路径采集；未把 synthetic/loopback 结果包装成质量通过或正式多平台量测。
 - 三态 OCR 与证据边界已记录；CI 历史失败底因未知，未因未复现而加兜底或扩大修复范围。
 - 下一步：推送授权分支，读取远端分支 SHA，并核对最终工作区干净状态；远端结果写入派发报告。
+
+## 指南 ID 契约补充（doc-only）
+- 补充区分：超时且 recovery 尚存时同 ID 上传前拒绝；成功且结果 JSON 已存在时同 ID 可能新建 HTTP job 后 `FileExistsError`，旧结果不覆盖且本次 recovery 已清理。新测量使用新匿名 ID。
+- 沿用冻结 `45c0c2c` source 上两轮冷审已有的完整矩阵；本次不重测、不改实现、不新增 review round 或 finding。
