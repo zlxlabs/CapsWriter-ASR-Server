@@ -99,3 +99,47 @@ tests/test_http_capacity.py::test_two_real_tcp_commits_race_for_last_storage_cap
 - **卡面偏差**：无。Scope 只含 3 个 md 文件；未新增/删除测试，未改业务代码，未重跑全量 suite，
   457 passed / 3 files 是上一轮历史实测，本次没有复跑，不当成本轮结果。
 - **最贵一步**：从新 /tmp 位置实跑 C/D 两条红验（各起真实服务与识别子进程），是本轮唯一执行动作。
+## M6R1-1：组 10 逐段 PCM 内容断言补强（只补测试观测，业务源码零变更）
+
+根因：R1 独立复核发现两个重采样 case 只验长度/格式标签/`sample_count`；把 runner 的
+`yield block` 换成 `yield bytes(len(block))`（同长度全零）后仍然 `2 passed`——
+worker 实际收到什么内容从未被观测。评为 P2：这是**测试契约缺口**，不是生产 decoder 有 bug，
+本卡也没有发现生产 decoder 的实际错误。
+
+四项：
+1. **producer fixture 观测字段**：`tests/harness/worker.py` 的 `received_task_record` 新增
+   `data_sha256`（完整摘要）。原 `data_sha256_prefix` 保留不动——直接把前缀换成完整摘要会让
+   既有的 `source_digest not in {…prefix}` 变成恒真断言。旧消费者（组 7、组 5 重启不重跑）
+   语义不变。
+2. **逐段内容比对**：`tests/test_http_qa_e2e.py` 新增 `decoded_pcm_bytes()`，在测试进程里用
+   固定 argv 直接跑系统真 ffmpeg 解出整条 16 k mono f32 PCM（**不调用** `FileSourceDecoder`、
+   不复用其状态）。两个 case 按每段实际 `offset` 切出参照片，逐段断言子进程真实收到的
+   `Task.data` 完整摘要 == 参照片摘要，并断言段起点与上一段步长精确相接、`0 < overlap < samples`、
+   参照片非全零（防「参考段也是零→恒真」）。
+3. **红验 E（证明断言有约束力）**：注入 `pcm_chunks` 同长度全零 → 两个 case 都在
+   `sha256(expected) == item["data_sha256"]` 处 `AssertionError`
+   （`ad60dc8e…`/`bdb59e30…` vs `fec9afb5…`，后者是 96000×4 字节全零摘要）；还原后 `2 passed`。
+   真修（断言 + fixture 字段）先 commit `7b42e45` 再注入，红验只临时改业务文件，
+   回放脚本 `/tmp/m6r1-dlg-20261004-023118-2117b7/red_e_zero_pcm.sh` 自带
+   「注入前必须无未提交修改 + grep 确认 + 还原后 git diff 复核」。
+4. **真实环境整跑**：新文件窄 case 5 轮全绿；完整 `tests/` 四次整跑——
+   裸 shell（`env -i` 白名单 HOME/PATH/TMPDIR/LANG）× websockets 15.0.1 与 17.2，
+   以及真实 `systemd --user` 单元 `pi-m6r1-2117b7-full-pinned` / `pi-m6r1-2117b7-full-latest`
+   各一次，四次均 `457 passed, 3 skipped`，3 条 skip 仍是 ForceAligner×2 + silero-VAD×1，
+   **无 HTTP 解码类 skip**；未延长任何超时、未加自动重跑。单元用 `--collect`，收尾查询
+   `ActiveState=inactive`、`MainPID=0`，`list-units 'pi-m6r1-2117b7*'` 为空，无残留进程。
+   会话内已确认没有 `PROBE_*`/`CW_TEST_*` 变量，白名单环境不会改变测试分支。
+
+仅本轮增量的四问：
+- **踩坑**：第一版逐段断言里手滑写了一条 `a - b == a - (b)` 形式的恒真断言，自查时删掉换成
+  `0 < overlap_samples < item["samples"]`；另一次是文档里写进一个 U+FFFD 乱码字符，
+  `git grep $'\ufffd'` 扫出后修掉。教训：新增断言要逐条问「喂一个已知为假的输入会不会红」。
+- **闸与绕过**：无绕过。红验 E 是先 commit 真修再注入、跑完立即还原（`git diff --quiet` 复核），
+  没有整文件 checkout 吞掉未提交的真修；没有把长度/前缀比较冒充内容比较；没有为测试新造
+  识别 pipeline、状态或账本；业务/SDK/runner/decoder 源码零改动。
+- **卡面偏差**：无。Scope = `tests/harness/worker.py`、`tests/test_http_qa_e2e.py`、
+  qa.md、m6-qa-evidence.md、本文件；`git add` 显式列路径，未用 `-A`；临时脚本只在唯一
+  `/tmp/m6r1-dlg-20261004-023118-2117b7/`，仓库内无未跟踪文件；未创建任何 freeze；
+  PR63 保持 stack C2 + draft，未 ready/merge/deploy；计数口径（7 组整体闭合 + 2 组部分）未回退。
+- **最贵一步**：四次完整 `tests/` 整跑，每轮约 3 分 35 秒–3 分 47 秒（合计约 14 分半），
+  是本轮主要墙钟成本；窄 case 5 轮合计不到 10 秒。

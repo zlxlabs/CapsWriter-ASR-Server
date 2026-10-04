@@ -75,16 +75,39 @@
 | B | `core/server/http_file_runner.py` 的 ffmpeg argv 去掉 `-ar 16000`（不重采样） | 组 10（两个参数） | `AssertionError: assert 882000 == 320000`（44.1k 立体声）、`assert 160000 == 320000`（8k 单声道），`2 failed`；撤销后绿 |
 | C | `HttpFileRunner.fail_job` 先 `record_result` 发布一段「正文」再失败（缺段成功） | 组 11 | `AssertionError: assert 'DONE' == 'FAILED'`，`1 failed` |
 | D | SDK `_request` 在 `AsrError(connection_lost/timeout)` 上自动重发一次（网络库自动重试） | 组 3 | `AssertionError: assert 2 == 1`（真实 commit 请求被发了两次），`1 failed` |
+| E（M6R1-1 补强） | `core/server/http_file_runner.py` 的 `FileSourceDecoder.pcm_chunks` 把真实 ffmpeg 输出换成 `yield bytes(len(block))`：**长度、sample_count、offset、重叠全部不变，只有内容变全零** | 组 10（两个参数） | 两个 case 都在 `sha256(expected).hexdigest() == item["data_sha256"]` 处 `AssertionError`：`stereo44.wav` `ad60dc8e… != fec9afb5…`、`mono8k.wav` `bdb59e30… != fec9afb5…`（`fec9afb5…` 是 96000×4 字节全零的摘要，两 case 相同）。`2 failed`；还原后 `2 passed` |
+
+红验 E 的注入回放脚本：`/tmp/m6r1-dlg-20261004-023118-2117b7/red_e_zero_pcm.sh`
+（先断言目标业务文件无未提交修改 → 注入 → `grep RED-INJECT-E` 确认落到源码 → 跑两个 case →
+还原并 `git diff --quiet` 复核）。真修改（断言与fixture 字段）已在 commit `7b42e45` 入库，
+红验只临时改业务文件，未整文件 checkout 吞掉任何真修。
 
 红验 A 之前先暴露了一个**恒真断言**：断连检查写成 `key[1] != "ws-drop"`，而
 `TaskKey = (owner_kind, owner_id, task_id)`，`key[1]` 是 socket_id 恒不等于 task_id，
 注入 A 也不变红。已改为 `key[2]` 并补显式 `== []` 断言，重跑 A 才拿到目标红。
 
+## 组 10 逐段内容补强（M6R1-1）
+
+R1 独立复核发现：本卡两个重采样 case 只验长度/格式标签/`sample_count`，把 ffmpeg 输出
+换成**同长度全零 PCM** 仍然 `2 passed`，即 worker 实际收到什么内容没有被观测。
+
+- `tests/harness/worker.py`：`received_task_record` 新增 `data_sha256`（完整摘要）。
+  原 `data_sha256_prefix` 保留不动——把前缀改成完整摘要会让既有的
+  `source_digest not in {…prefix}` 退化成恒真断言。
+- `tests/test_http_qa_e2e.py`：`decoded_pcm_bytes()` 在测试进程里用固定 argv 直接跑系统
+  真 ffmpeg 解出整条 16 k mono f32 PCM（**不调用** `FileSourceDecoder`）；两个 case 按每段
+  实际 `offset` 切出参照片，断言子进程真实收到的 `Task.data` 的完整摘要与之相等，并断言段起点
+  与上一段步长精确相接、`0 < overlap < samples`、参照片非全零（防恒真）。
+- 红验 E 证明该断言有约束力：同长度全零 PCM → 两个 case 都在摘要比对处 `AssertionError`。
+
 ## 未验证（明确留给 M7 / 后续）
 
 - 真实三平台部署、真实 ASR 模型、真实字节/质量基线：本卡全部用假引擎 + 真解码，
   **不得**据此宣称 HTTP 已可用或质量达标。
-- 组 1 的「相反实现→红」未跑（见上），只靠绿测试约束。
+- `/tmp/m6-red-dlg-20261004-023118-2117b7/`：M6R1-1 dispatch 唯一目录，
+  `red_e_zero_pcm.sh`（组 10 逐段内容红验回放）、`systemd-pinned.log`、`systemd-latest.log`
+  （两次 systemd 单元整跑原始输出）、`http_file_runner.py.orig`（注入前副本）。
+- 组 1 的「相反实现→红」未跑（只实跑了 A–D、E），只靠绿测试约束。
 - 组 9 的 1 GiB / 16 GiB / 2 GiB 物理上限按缩小常量验证类别与等值边界，未按真实上限压测。
 - `docs/sessions/261001-http-files/qa.md` 的 12 组「当前证明」已按上表逐组回填真实测试与证据路径。
 - 原主干 `2919` 那次并发 commit 读超时的根因仍未定位，见

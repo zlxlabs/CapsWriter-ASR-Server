@@ -8,7 +8,7 @@
 
 1. **真实二进制 producer**  
    待测：SDK/CLI 实际请求体是源文件原字节，不是 JSON、Base64 或完整文件入 worker；服务端文件字节、长度和 SHA-256 一致。  
-   当前证明：**已闭合**。`tests/test_http_qa_e2e.py:378` 用真实 SDK `submit_file_http` 走完 create→PATCH→commit，抓到的 PATCH body 拼接 == 源文件字节，服务端 `data_dir/sources/{upload_id}.bin` 的 SHA-256/长度 == 源文件（`:434/:442/:448`）。既有抓包侧：SDK→裸 TCP 字节流 `tests/test_http_client.py:144`（PATCH body 逐字节 `:220`）、CLI 子进程 `:413`；真服务端落盘 `tests/test_http_file_tasks.py:205`（`:222-223`）。未知：本组「相反实现→红」未单独跑（只实跑了红验 A–D，见 evidence），真实生产服务与真实录音未测。
+   当前证明：**已闭合**。`tests/test_http_qa_e2e.py:378` 用真实 SDK `submit_file_http` 走完 create→PATCH→commit，抓到的 PATCH body 拼接 == 源文件字节，服务端 `data_dir/sources/{upload_id}.bin` 的 SHA-256/长度 == 源文件（`:434/:442/:448`）。既有抓包侧：SDK→裸 TCP 字节流 `tests/test_http_client.py:144`（PATCH body 逐字节 `:220`）、CLI 子进程 `:413`；真服务端落盘 `tests/test_http_file_tasks.py:205`（`:222-223`）。未知：本组「相反实现→红」未单独跑（只实跑了红验 A–D、E，见 evidence），真实生产服务与真实录音未测。
 
 2. **受理后脱离连接**  
    待测：客户端拿到 COMMITTED/QUEUED 确认后退出，另一连接用保存的凭据领取完整文本、token 和 timestamp；HTTP 不依赖 socket。  
@@ -44,7 +44,7 @@
 
 10. **解码与 PCM producer**  
     待测：真实文件解码器的 argv、输入文件和环境可核对；输出是有界 16 kHz mono f32 PCM 段，不把整文件或路径交给 worker；格式矩阵不能用缺依赖 skip 冒充通过。  
-    当前证明：**已闭合**。`tests/test_http_qa_e2e.py:597`（2 参数）用真 ffmpeg 转码 44.1 kHz 立体声与 8 kHz 单声道源，各段 `samplerate == 16000`、`data_bytes % 4 == 0`、单段样本数有界（`:624-625`），各段样本数之和 == 独立跑一次真 ffmpeg 得到的样本数，送进 worker 的段字节远小于源文件（`:651-652`）——重采样/降混侧不再是未知。argv/env 逐项核对、峰值解码并发 == 1、无临时 PCM 文件见 `tests/test_http_file_runner.py:341`（`:405/:415-426`）。E1 的固定切点/吸附切点采样点量化、`process_audio_task` 消费实际 `Task.data`、整数默认与 final 剩余段契约仍在原有用例中并保持绿。未知：真实三平台容器与真实 ASR 模型的字节/质量基线未验证；本组用的是假引擎，不是识别质量证据。
+    当前证明：**已闭合**。`tests/test_http_qa_e2e.py:597`（2 参数）用真 ffmpeg 转码 44.1 kHz 立体声与 8 kHz 单声道源，各段 `samplerate == 16000`、`data_bytes % 4 == 0`、单段样本数有界（`:624-625`），各段样本数之和 == 独立跑一次真 ffmpeg 得到的样本数，送进 worker 的段字节远小于源文件（`:651-652`）——重采样/降混侧不再是未知。**段内容也已锁（M6R1-1）**：测试自己用真 ffmpeg 独立解出整条 16 k mono f32 PCM，按每段实际 `offset` 切出参照片，逐段断言子进程真实收到的 `Task.data` 完整 sha256 与参照片一致（`tests/test_http_qa_e2e.py:589-600`、`:673-708`），并锁相邻段在 `overlap` 处精确相接、参考段非全零（防恒真）。原先只验长度/`sample_count`/摘要前缀，同长度全零 PCM 能照样通过（红验 E 实测）。argv/env 逐项核对、峰值解码并发 == 1、无临时 PCM 文件见 `tests/test_http_file_runner.py:341`（`:405/:415-426`）。E1 的固定切点/吸附切点采样点量化、`process_audio_task` 消费实际 `Task.data`、整数默认与 final 剩余段契约仍在原有用例中并保持绿。未知：真实三平台容器与真实 ASR 模型的字节/质量基线未验证；本组用的是假引擎，不是识别质量证据。
 
 11. **整任务失败与监督**  
     待测：worker 中间段/末段失败、解码失败、结果超限、未知 RuntimeError 和正常 SIGTERM 分别验证；失败任务不发布缺段成功，正常停止为零退出，未知异常非零退出。  
