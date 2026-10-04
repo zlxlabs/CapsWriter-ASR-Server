@@ -47,3 +47,13 @@ schema 源 SHA（H0 `http_store.py`）：`23055c5cffd334762f19d7233bff8221ee3b97
 - `executedModel`：官方对象 A 缺键，保持 unknown
 
 无 P1。A2 为唯一本仓 P2（接受不修）。不为 P2/P3/nit 加防御、状态、重试或新抽象。
+
+## 续交纠正（dlg-20261004-182738-455fc2）
+
+旧 A5 测无效：当时 child 手写 `open`+`dup2`，在同函数 local handle 仍活时数 FD，没有调用 H0 `_redirect_output()`，也没覆盖 `sys.stdout=open(1, closefd=False)` 与函数返回后的 CPython 局部回收。因此「fd 4→5 / handle 仍开」只描述复制片段，不能证原 producer 泄漏。旧 `a4-a5-probe.json` 字节未改。
+
+纠正：private child 直接调用已加载的 `_redirect_output()`（origin 即 H0 `tests/fixtures/http_fatal_exit_probe.py`，CPython 3.12.3），函数返回后再数指向日志 inode 的 FD。stdout/stderr 各写合成标记，日志 34 B / sha256 `cdddcf09…d18593`。已知另开未关 owned FD 时「仍打开」为真（断言会红）；真实调用后日志角色 FD 仅为 `[1, 2]`，无 1/2 以外多余项。A5 精确命题（原函数返回后仍泄漏 local handle FD）**refuted**。不为它改产品。
+
+A4：保留 naked `Popen` 哨兵继承与 extra_key_count=91。`trust_env=False` 只是源码事实，不是抓到的网络 payload，不能证明 stderr/网络绝无传输。同 owner 测试子进程，仍 ≤P3；systemd launcher 无 bus，unknown，不重跑。未新读敏感 env。
+
+A1 正常 + PermissionError 证据本轮未动。failure-visibility 仍为 p2-only。

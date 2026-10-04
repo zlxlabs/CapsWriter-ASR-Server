@@ -40,3 +40,11 @@
 ## 未做
 
 不扩大 cold review、不恢复 09 资格、不修代码、不记账。
+
+## 续交纠正（dlg-20261004-182738-455fc2）
+
+- 旧 A5 观察者改了对象寿命，结论作废；不回写旧 JSON / 不改 c0e 历史正文为「当时已正确」
+- 新证据：`new-corrected.json`（本 dispatch 私有目录，不入库）。红输入能检出未关 owned FD；真实 `_redirect_output` 返回后日志角色 FD=`[1,2]`，A5 **refuted**
+- A4 证明范围缩窄：Popen 继承事实保留；`trust_env=False` 不充当全网络反证；systemd 仍 unknown
+- A1 证据不变；本卡未输出认证 token 摘要
+- 不为 A5 改产品；不新开审查轮
