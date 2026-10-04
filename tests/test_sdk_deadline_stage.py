@@ -1,4 +1,8 @@
-"""默认时限的两段计时：本地准备阶段结束后远端预算重新锚定，超时分阶段报错。"""
+"""默认时限的两段计时与自动预算公式：本地准备结束后远端预算重新锚定，超时分阶段报错。
+
+自动预算是 watchdog（挂死检测）不是识别时限 SLA：它的唯一职责是服务端不再推进时
+把调用救回来，因此必须覆盖实测耗时，不得在识别仍在跑时误杀（issue #69）。
+"""
 from __future__ import annotations
 
 import asyncio
@@ -13,6 +17,7 @@ from websockets.datastructures import Headers
 
 from sdk.capswriter_asr import AsrError, Transcript, transcribe_file
 from sdk.capswriter_asr import client as sdk_client
+from sdk.capswriter_asr.client import _auto_budget
 
 
 class FakeClock:
@@ -190,7 +195,7 @@ async def test_default_path_timeout_names_auto_budget(tmp_path, monkeypatch):
 
     async def handler(ws):
         await ws.recv()
-        clock.advance(200.0)  # 远超重锚定后的 max(120 秒, 1 + 60)
+        clock.advance(200.0)  # 远超重锚定后的自动预算 _auto_budget(1) = 124 秒
         await ws.send(_final_payload())
 
     async with fake_v2_server(handler) as url:
@@ -287,3 +292,120 @@ async def test_local_and_remote_timeout_messages_are_distinguishable(
     assert "本地准备" in messages["local"]
     assert "远端转录" in messages["remote"]
     assert messages["local"] != messages["remote"]
+
+def test_auto_budget_covers_observed_93s_recognition():
+    """93 秒音频的一次真实识别约需 306 秒，自动预算必须留有余量。
+
+    旧公式 max(120, 93 + 60) = 153 秒会在识别仍在跑时误杀长音频（issue #69）。
+    """
+    assert _auto_budget(93) > 306
+
+
+def test_auto_budget_formula_is_four_times_duration_plus_120():
+    """锁公式本身：93 秒 → 492 秒。改系数或常量会立刻转红。"""
+    assert _auto_budget(93) == 492
+
+
+def test_auto_budget_keeps_the_120_second_floor():
+    """0 时长与短音频不得跌破 120 秒下限（原 max(120, …) 的语义由 +120 覆盖）。"""
+    assert _auto_budget(0) == 120
+    assert _auto_budget(0) >= 120
+    assert _auto_budget(1) == 124
+    assert _auto_budget(1) >= 120
+    assert _auto_budget(30) >= 120
+
+
+def _write_93s_stub_audio(tmp_path):
+    """93 秒 s16le 音频（经 _transcode 直接产出字节，不经过 ffmpeg）。"""
+    audio = tmp_path / "long.wav"
+    audio.write_bytes(b"RIFF")
+    return audio
+
+
+def _install_93s_transcode(monkeypatch):
+    """让 _transcode 交出 93 秒 s16le 字节：samples_total/16000 恰好是 93.0。"""
+
+    async def transcode(*_args):
+        return b"\0" * (93 * 16000 * 2)
+
+    monkeypatch.setattr(sdk_client, "_transcode", transcode)
+
+
+@pytest.mark.asyncio
+async def test_auto_budget_lets_93s_identification_finish(tmp_path, monkeypatch):
+    """93 秒音频、识别耗时 306 秒：默认自动预算下必须成功返回，不得误杀。"""
+    audio = _write_93s_stub_audio(tmp_path)
+    clock = _install_fake_clock(monkeypatch)
+    _install_93s_transcode(monkeypatch)
+
+    async def handler(ws):
+        # 收完上传（含 is_final 帧），再把假时钟推到实测识别耗时。
+        while True:
+            frame = json.loads(await ws.recv())
+            if frame["is_final"]:
+                break
+        clock.advance(306.0)
+        await ws.send(_final_payload())
+
+    async with fake_v2_server(handler) as url:
+        transcript = await transcribe_file(audio, url, encoding="s16le", idle_timeout=5)
+
+    assert isinstance(transcript, Transcript)
+    assert transcript.text == "好的。"
+    # 旧公式的 153 秒预算在这里会把它误杀；新预算 492 秒留出余量。
+    assert clock.now == 1000.0 + 306.0
+
+
+@pytest.mark.asyncio
+async def test_default_timeout_message_reports_budget_and_audio_duration(
+    tmp_path, monkeypatch
+):
+    """默认路径超时消息必须同时写明预算秒数与音频时长，便于用户对照。"""
+    audio = _write_93s_stub_audio(tmp_path)
+    clock = _install_fake_clock(monkeypatch)
+    _install_93s_transcode(monkeypatch)
+
+    async def handler(ws):
+        while True:
+            frame = json.loads(await ws.recv())
+            if frame["is_final"]:
+                break
+        clock.advance(600.0)  # 越过 _auto_budget(93) = 492 秒
+        await ws.send(_final_payload())
+
+    async with fake_v2_server(handler) as url:
+        with pytest.raises(AsrError) as caught:
+            await transcribe_file(audio, url, encoding="s16le", idle_timeout=5)
+
+    assert caught.value.code == "timeout"
+    assert "自动预算" in caught.value.message
+    # 预算秒数与音频时长都要出现，只写「自动预算」用户无从判断是不是自己音频太长。
+    assert "492" in caught.value.message
+    assert "93.0" in caught.value.message
+    assert "远端转录" in caught.value.message
+    assert "deadline_total" not in caught.value.message
+
+
+@pytest.mark.asyncio
+async def test_local_stage_timeout_message_names_entry_cap(tmp_path, monkeypatch):
+    """本地准备阶段还没算出时长：消息写入口 120 秒上限，不编造音频时长。"""
+    audio = tmp_path / "source.wav"
+    audio.write_bytes(b"RIFF")
+
+    async def hanging_transcode(*_args):
+        await asyncio.sleep(30)
+
+    monkeypatch.setattr(sdk_client, "_transcode", hanging_transcode)
+
+    async def never_reply(ws):
+        await ws.recv()  # pragma: no cover - 本地阶段超时，走不到上传
+
+    async with fake_v2_server(never_reply) as url:
+        with pytest.raises(AsrError) as caught:
+            # 默认路径入口上限 120 秒，但本地阶段由假时钟推不倒，改用显式上限断言消息结构。
+            await transcribe_file(audio, url, encoding="s16le", deadline_total=7)
+
+    assert caught.value.code == "timeout"
+    assert "本地准备" in caught.value.message
+    assert "7" in caught.value.message
+    assert "音频" not in caught.value.message

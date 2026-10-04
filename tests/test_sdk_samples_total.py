@@ -248,15 +248,20 @@ async def test_deadline_uses_decoded_sample_count(monkeypatch, tmp_path):
 
     original_set_deadline = sdk_client._operation
 
+    def record_deadline(seconds, *, duration=None):
+        deadlines.append((seconds, duration))
+
     async def operation_with_observation(*args, **kwargs):
-        kwargs["set_deadline"] = deadlines.append
+        kwargs["set_deadline"] = record_deadline
         return await original_set_deadline(*args, **kwargs)
 
     monkeypatch.setattr(sdk_client, "_operation", operation_with_observation)
     transcript = await transcribe_file(source, "ws://127.0.0.1:1", encoding="flac")
 
     assert transcript.text == "ok"
-    assert deadlines == [660.0]
+    # 预算由解码出的 600 秒算出（_auto_budget(600) = 600*4+120 = 2520），不是源 WAV
+    # 容器的 1 秒（那会得到 124）；第二项是随预算一起回传的音频时长。
+    assert deadlines == [(2520.0, 600.0)]
 
 
 @pytest.mark.asyncio
