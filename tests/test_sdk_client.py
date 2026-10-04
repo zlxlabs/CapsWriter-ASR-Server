@@ -536,16 +536,22 @@ async def test_upload_failure_is_not_masked_by_final_when_both_tasks_done(
                 await release_server.wait()
                 return
 
+    caught_error = None
     async with fake_v2_server(final_then_hold) as (url, state):
         try:
-            with pytest.raises(AsrError) as caught:
+            try:
                 await transcribe_file(audio_path, url, deadline_total=20)
+            except AsrError as exc:
+                caught_error = exc
+            else:
+                assert False, "同轮合法 final 覆盖了 upload 的 send 异常"
         finally:
             release_receive.set()
             release_server.set()
 
-    assert caught.value.code == "connection_lost"
-    assert "connection reset by peer" in caught.value.message
+    assert caught_error is not None
+    assert caught_error.code == "connection_lost"
+    assert "connection reset by peer" in caught_error.message
     assert state["connections"] == 1
     assert state["final_received"]
     assert len(state["frames"]) == 1
