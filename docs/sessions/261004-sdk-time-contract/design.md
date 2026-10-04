@@ -2,7 +2,7 @@
 
 - 会话：`261004-sdk-time-contract`
 - issue：#67 / #68（本批 Card 1）；#69 串行后续（Card 2，不并行）
-- 咨询：Opus 5 `capswriter-sdk-python-floor-261004`，归档 `/home/zlx/.local/state/agent-config/consult/20261004-190749-claude-opus-09e2bb/`
+- 咨询：Opus 5 `capswriter-sdk-python-floor-261004`，归档 `~/.local/state/agent-config/consult/20261004-190749-claude-opus-09e2bb/`
 - 基线：`origin/master` `b0818dc7859d1d8100e42f5c70cb75d34da422f7`（PR #66 已合，`idle_watch` 已改 `asyncio.wait`）
 
 ## 目标
