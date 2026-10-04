@@ -15,3 +15,9 @@
 - CI run 37177435228 的 pinned-15 job 在 `test_real_process_body_idle_timeout_is_not_fatal_and_releases_port` 等不到 `HTTP_LISTENER_READY=`，发生于 idle-body 请求前；根因 unknown。该测试在 pinned/latest 的清洁 shell 与 transient systemd 各跑一次均通过，旧红未复现。45c 的两套 CI tests SUCCESS，primary/OCR SKIPPED（PR draft）。
 - OCR 状态 `reviewed`、coverage `complete`、findings 空；它的二次 verifier 因零 finding 为 `skipped`。Windows ACL 未在此环境测量，不用 Linux chmod 代证。
 - 下一步：按 P2-only 收口 verdict，完成远端提交和 clean 核验。
+
+## 3. Verdict 收口
+- 新 verdict 直接写入仓库，包含冻结范围、协议/guide/collector/SDK/test/golden 索引、实际消费者结果、CI 旧红判读、OCR 三态与四问。
+- 定级 `failure-visibility: p2-only`：无 P1；同成功 fixture ID 输出文件冲突会显式报错并浪费一次本地任务，接受不修；可用新 ID 重测。
+- 不把 synthetic 结果说成识别质量或三平台正式量测；不把工具 `verified` flag 当鉴真；Windows ACL 未测。
+- 下一步：按显式路径提交 verdict 与本 progress，再推远端并核 SHA/status。
