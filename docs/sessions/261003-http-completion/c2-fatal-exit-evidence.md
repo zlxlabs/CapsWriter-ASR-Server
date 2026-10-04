@@ -159,13 +159,13 @@ wrapper 线程在 future 已取消时 `set_exception` 抛 `InvalidStateError`。
 文件集（本轮结束后复核）：
 
 ```
-core/server/app.py                                                  49 / 17
-docs/…/c2-fatal-exit-evidence.md                                   266 /  2
-docs/…/progress/c2-cleanup-progress.md                             48 /  2
-tests/fixtures/__init__.py                                           2 /  0
-tests/fixtures/http_fatal_exit_probe.py                            472 /  0
-tests/test_http_cleanup.py                                         522 /  1
-                                                     合计 add=1359 / del=19，共 6 文件
+core/server/app.py
+docs/…/c2-fatal-exit-evidence.md
+docs/…/progress/c2-cleanup-progress.md
+tests/fixtures/__init__.py
+tests/fixtures/http_fatal_exit_probe.py
+tests/test_http_cleanup.py
+                                                     合计 6 个文件（add/del 见 §9.6）
 ```
 
 `tests/fixtures/__init__.py` 是 fixture 包让 `python -m tests.fixtures.http_fatal_exit_probe`
@@ -248,16 +248,26 @@ skip 身份与前文一致（ForceAligner 两项 + Silero-VAD/onnxruntime 一项
 本轮实际修掉的一处 run-to-run 干扰源：`ProbeRun.cleanup()` 在 systemd 分支不再遗留
 自己起的 `systemd-run --wait` 子进程给 pytest。
 
-### 9.6 本轮预算（最终，已含文档提交）
+### 9.6 本轮预算
 
-- 相对 `9ef0e52`：**4 文件，add=194 / del=4**（target 250 / hard 400，未超）。
-  `tests/fixtures/http_fatal_exit_probe.py` +41/−1、`tests/test_http_cleanup.py` +22/−1、
-  本文件 +111/−2、progress +20/−0。
-- 相对 `da854b2`（C2 累计）：**6 文件，add=1359 / del=19**。
-- 原报告「5 files」的记账错误在本卡按实际 6 文件更正；原报告正文保留不改写。
-- `core/server/app.py` 在本卡 diff 中为 0 行：`git diff --quiet 9ef0e52 HEAD --
+稳定事实（不随提交自引用变化）：
+
+- 累计相对 `da854b2` 是 **6 个文件**；本卡只动其中 4 个（两个测试 + 两份文档）。
+- `core/server/app.py` 在本卡 diff 中为 **0 行**：`git diff --quiet 9ef0e52 HEAD --
   core/server/app.py` 返回 0，确认与 `9ef0e52` 逐字一致。
-- Scope 自检：累计 6 个文件逐一比对卡面 Scope-Globs，全部 IN-SCOPE，无越界文件。
+- 6 个文件逐一比对卡面 Scope-Globs，全部 IN-SCOPE，无越界文件。
+
+add/del 逐行数会因「更正文档数字的那次提交自身也占行」而自引用，故只给复现命令，
+不写死一个会立刻过期的数字：
+
+```bash
+git diff --numstat 9ef0e52145bc89610fb322724462955fb2fad15a HEAD   # 本卡
+git diff --numstat da854b2 HEAD                                    # C2 累计，6 行 = 6 个文件
+```
+
+在提交 `8166b1b`（代码+测试）与首次文档提交之间测得本卡为 add=194 / del=4；本节这次
+「把数字改成自引用安全表述」的提交会再改几行，属预期内误差，不影响上述三条稳定事实。
+原报告「5 files」的记账错误在本卡按实际 6 文件更正；原报告正文保留不改写。
 
 ## 8. 尚属未知的部分
 
