@@ -21,3 +21,9 @@
 - 定级 `failure-visibility: p2-only`：无 P1；同成功 fixture ID 输出文件冲突会显式报错并浪费一次本地任务，接受不修；可用新 ID 重测。
 - 不把 synthetic 结果说成识别质量或三平台正式量测；不把工具 `verified` flag 当鉴真；Windows ACL 未测。
 - 下一步：按显式路径提交 verdict 与本 progress，再推远端并核 SHA/status。
+
+## 4. 收尾准备
+- 独立结论已提交：`39131c0`；review 状态为 `failure-visibility: p2-only`，无 P1。
+- 四问复核已落在 verdict：无吞错/伪成功路径；本轮没有新增重复抽象、配置层或双重包装；HTTP 与 WS-v2 分别按实际 SDK producer 路径采集；未把 synthetic/loopback 结果包装成质量通过或正式多平台量测。
+- 三态 OCR 与证据边界已记录；CI 历史失败底因未知，未因未复现而加兜底或扩大修复范围。
+- 下一步：推送授权分支，读取远端分支 SHA，并核对最终工作区干净状态；远端结果写入派发报告。
