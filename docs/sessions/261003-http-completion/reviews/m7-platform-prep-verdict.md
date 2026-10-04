@@ -5,6 +5,8 @@ failure-visibility: p2-only
 
 **结论：未通过，当前不能标记为就绪。** 本次只核验准备产物、实际依赖、真实音频解码消费者、权限和日志事件；不做 M7 功能代码冷审，也不加载模型或运行识别。
 
+**OCR 状态：skipped**（包装器返回 `status=skipped`、`reason=no_reviewable_items`；这不表示文档已被 OCR 扫过）。
+
 ## 验收四问
 
 1. **准备产物可否就绪？** 否。macOS 的真实解码消费者在当前环境找不到 FFmpeg；两个新环境的 `pip check` 都因环境内没有 `pip` 模块而退出；Windows 环境与 ACL 未能核验。已核对的权重文件只覆盖 Linux 源端与 macOS 目标端。

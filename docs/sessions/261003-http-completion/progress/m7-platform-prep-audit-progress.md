@@ -5,6 +5,8 @@ failure-visibility: p2-only
 
 **状态：独立验收已完成，准备产物未通过就绪判定。** 本卡仅记录公开验收结论；私有路径、日志细节和原始环境输出留在本机报告。
 
+OCR 状态为 `skipped`（`no_reviewable_items`），不是“扫过且干净”。
+
 ## 验收四问
 
 1. **是否就绪？** 否：macOS 实际解码缺少 FFmpeg；两个新环境都没有 `pip`，所以 `pip check` 未能执行；Windows 环境、ACL 与三平台 PCM 对齐未核验。
