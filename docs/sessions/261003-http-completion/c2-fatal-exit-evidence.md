@@ -278,4 +278,3 @@ git diff --numstat da854b2 HEAD                                    # C2 累计�
   仍未知的是它在真实生产部署下的 shutdown 耗时分布。
 - 主干基线 API 派发时即不可用（`gh api request failed`），继承红未能判定。
 - §9.5 记录的两次间歇红未能定位，属于本卡明确的未解决项。
-
