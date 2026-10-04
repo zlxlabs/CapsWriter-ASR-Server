@@ -88,8 +88,51 @@ m4 曾写「app.py 暂不改」针对的是清理任务挂在 `HttpServer.serve/
 
 创建边界缺口（冷读）：现有 HTTP 装配失败发生在 **Manager 与识别进程已经拉起之后**（数据目录父路径是普通文件，真实 `mkdir` 失败）。`check_model` 成功创建之前、以及 `Process.start` 边界的真实 OS 失败，仓内没有对应生产者。本轮必须用自有 subprocess/cgroup 限额或真实 `check_model` 消费路径去量；不能 stub raise、不能假 `is_alive`。量不到就 unknown，不造 P1。
 
-## 冷审暂不裁定
+## 冷审暂不裁定（已由本轮实验关闭）
 
-- 不把「测试没写到」自动升级为 P1。
-- 不修代码、P2/P3、不引入状态/重试/fallback。
-- 最终 `failure-visibility` 等本轮实验、OCR、红验之后写进 verdict。
+最终 `failure-visibility` 见 `docs/sessions/261003-http-completion/reviews/c2-fresh-review3-verdict.md`。
+
+## 本轮新实验（不引用旧报告）
+
+原始日志只在 `/tmp/dlg-20261004-114236-2c324e/`（目录 700，日志 600，脚本 700）。
+
+### 依赖与全量 pytest
+
+| 矩阵 | Python | pytest | pytest-asyncio | aiohttp | httpx | websockets | 结果 | skip 身份 |
+|---|---|---|---|---|---|---|---|---|
+| CI pin | 3.12.3 | 9.1.1 | 1.4.0 | 3.14.3 | 0.28.1 | 15.0.1 | 466 passed, 3 skipped, 232.86s | `tests/test_aligner_integration.py:53`、`:62`（ForceAligner 未装）；`tests/test_segmenter.py:208`（缺 silero-VAD/onnxruntime） |
+| CI latest | 3.12.3 | 9.1.1 | 1.4.0 | 3.14.3 | 0.28.1 | 17.2 | 466 passed, 3 skipped, 228.63s | 同上三条 |
+
+`git diff --check HEAD^ HEAD` 与 `35439fe..HEAD` 均为空（exit 0）。
+
+边界 8 项（fatal / SIGTERM / HTTP 装配失败 / HTTP disabled × naked+systemd）含在上述两次全量里，各一次，未连刷。
+
+### SDK 真实消费者（env -i + systemd / naked 两路）
+
+独立 WAV sha256 `8731812716b414517be39b56085da3ab83757ab3a4d218290d890496ad6e3e21`（64044 B）。SDK `submit_file_http_sync` → TCP → 真实 ffmpeg + stub ASR → DONE。老化 `terminal_at` 后由生产周期任务 unlink；重启新实例读同一 SQLite：
+
+- 结果 GET 与提交时 consumer sha 一致；sqlite payload sha 重启前后一致。
+- `source_available=false`；commit 重放 200 同一 upload/job，jobs/results 计数不变。
+- EXPIRED 410 `upload_expired`；FAILED `decode_failed`、result 409 `job_failed`。
+- 剩余 2 个 EXPIRED partial 文件共 21 B（物理保留）；终态源 remaining_exist=0。
+- 加载函数 SHA：`cleanup_terminal_sources=a0099a8d90ff2d0c6d6cd2042f7cdb06eed676a83889923eb1403478a8a7cc98`，`_drain_after_fatal=075e5615436c956fd5ade16f8b5bb5dceecc03c979513de55ecd688add8d6ca2`；两路 loaded_match=true。
+- 消费者 `environ_key_count=12`，无会话全量 env。stop leftover=[]。
+
+局限：老化把所有 UPLOADING 的 `expires_at` 一并打过期，故「未到期 live partial」没在这条 e2e 里单独留下 UPLOADING 行；未到期 partial 仍由 store 单测锁死。
+
+### 创建失败
+
+真实 `CW_MODEL_TYPE=not-a-supported-engine` 走生产 `check_model()`：`SystemExit(1)` 发生在 Manager 创建之前（`manager_is_none=true`），日志有「按非零退出收尾」与 `再见！`，naked/systemd 均为 rc=1、leftover=[]、`pm_is_alive=false`。
+
+自有 unit `TasksMax=2/3/4` 在 ~90ms 被 SIGINT 杀掉且无子进程报告，**不能**当作 `Process.start` 边界的真实失败。该点 unknown，不造 P1。未动全局 ulimit/他进程。
+
+### 红验（scratch `35439fe`，注入行已 grep）
+
+1. `_drain_after_fatal` 提前 `return`：`test_http_startup_failure...[naked-shell]` → `AssertionError`（探针 30s 未退出，Manager 当时仍活着）。scratch SHA 与注入行确认。
+2. cleanup 年龄改 `created_at`：store 边界测试 → `AssertionError: assert not True`（不该删的源还在）。 
+
+恢复后审查树仍 `78d2278`，产品三文件对 `35439fe` diff 为空。无 `.venv` shebang 污染。
+
+### OCR
+
+`ocr-review` 对冻结范围启动后 >10 min stdout 仍 0 字节，stderr 只有 `leg=primary event=start`。记 skipped，不说 passed。
