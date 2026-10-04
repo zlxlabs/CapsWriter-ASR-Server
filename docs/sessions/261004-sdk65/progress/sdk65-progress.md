@@ -186,6 +186,11 @@
     `wait_for(deadline_changed.wait())`、`cancelling=1`。与 #65 final 收尾主缺陷区分，P2 接受不修；
     3.10 `TimeoutError` 别名继承差异仍披露；无生产/下游验收。
   - `sdk/capswriter_asr/client.py` 与 `tests/` 本轮未改（代码与测试已冻结审过）。
+  - 文档集成后验证：Python 3.12.3 全量 `tests/` `453 passed, 3 skipped, 149 warnings in 220.62s`，EXIT=0
+    （`/tmp/sdk65_final_full312_20261004_dlg-20261004-085556-e4760d.log`）；Python 3.11.15 两文件窄测
+    `34 passed in 17.82s`，EXIT=0（`/tmp/sdk65_final_narrow311_20261004_dlg-20261004-085556-e4760d.log`）；
+    两环境 websockets 均解析为 17.2。
+  - PR #66 标题与正文已更新至准确范围（final 收尾主路径修复 + 两个独立 review pointer + P2/3.10 未修边界 +
+    未部署未下游验收），body 写入后回读比对一致。
 - 关键决策 / 否决方案：本轮只写文档 + 验证 + PR ready；不重复 OCR、不再开独立 review。
-- 下一步唯一动作：3.12 全量 tests/ 与 3.11 两文件窄测；绿后更新 PR #66 标题正文并 `gh pr ready`，
-  用 ci-watch 等完整 CI/gate，区分 SUCCESS 与 SKIPPED。
+- 下一步唯一动作：`gh pr ready 66` 触发完整 CI/gate，用 ci-watch.sh 等待，区分 SUCCESS 与 SKIPPED。 
