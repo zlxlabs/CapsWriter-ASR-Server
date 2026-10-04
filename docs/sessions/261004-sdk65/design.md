@@ -78,6 +78,10 @@ SDK 调用都会永久挂起。
 - `upload` / `deadline_watch`：独立审查在真实 SDK 公共调用路径上确认取消竞态可达，观察到的是有限响应
   延迟：3.11.15 上调用方取消时的 `deadline_watch` 首次未在 300ms 内结束；发送 Future 同拍取消耗时
   0.252s（`idle_timeout=0.25`），之后启动下一帧 send 并关闭连接。相同发送探针在 3.12.3 为 0.001s。
+- 本轮 3.11.15 整文件首跑中，连接拒绝映射用例用了默认预算并耗时 120.093s；单测复跑 120.09s，
+  改成显式 2s 预算后同断言 0.07s 通过。时长与默认远端预算一致，最可能是 `deadline_watch` 取消后被
+  `transcribe_file` 的 `gather` 等到预算结束；异步任务栈没有抓到，故这是路径归因，不是栈级实证。用例已设
+  显式短预算，只验证连接错误映射。
 - 最终 SDK 任务和连接都已收尾；未观察到错误结果、数据损坏或崩溃。这条外部取消路径与 #65 final 已收到后
   `idle_watch` 永久挂起的主缺陷不同。按 `internal` 风险档判为 **P2，接受本轮不修**，不新增防御逻辑；
   见 `root-cause.md` 第 6 节和 `reviews/independent-review1-verdict.md`。
@@ -130,9 +134,9 @@ tasks.difference_update(done)
 
 **同轮场景的确定性屏障**：`test_upload_failure_is_not_masked_by_final_when_both_tasks_done` 让 fake server
 先收到 SDK 实际序列化帧，再按帧内 UUID 回合法 final；send 包装器等 `_receive` 真正解析 final 后才抛
-`OSError`，并用一轮事件循环交错使 upload/receive 两个实际 Task 同时出现在同一个 `asyncio.wait done`
-集合。测试记录两者身份并断言集合成员，避免用 socket 的偶然时序代替机制证明。把错误优先逻辑变异成
-final 优先后，该测试产生明确 `AssertionError`。
+`OSError`。测试保留 SDK 创建的 upload Task 与接收 Task 身份，测试用 `asyncio.wait` 包装器等两者实际结束后
+一次性把这两个已完成 Task 交给裁决逻辑，断言同一 `done` 集合同时含两者。它验证混合终态的裁决，不宣称
+自然 socket 时序必然同拍。把错误优先逻辑变异成 final 优先后，该测试产生明确 `AssertionError`。
 
 **慢上传屏障**：`test_receive_idle_budget_does_not_fire_during_slow_upload` 发五帧、每次 send 延迟 0.5s、
 `idle_timeout=1s`。第四帧已到服务端、最终帧仍在屏障上时，总上传已超过 idle 预算；测试断言调用仍活着、

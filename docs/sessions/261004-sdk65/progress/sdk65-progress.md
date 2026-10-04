@@ -139,3 +139,16 @@
   外部取消延迟接受为 P2，不混入 #65 主缺陷。
 - 下一步唯一动作：用真实 Python 3.11 跑两份 SDK 测试文件 `-vv --durations=0`，外层 180 秒硬截止，记录逐用例
   起止和本地 asyncio Task 栈以定位 135 秒长等待。
+
+## 里程碑 7：3.11 长用例归因与测试身份修正
+
+- 阶段：verifying
+- 本段结论：
+  - 首次 3.11 两文件整测 `1 failed, 33 passed in 137.80s`；失败是同轮测试把 `wait_for(ws.send())` 的子任务
+    误认作 SDK upload Task。现改为从 SDK `client.py` 创建点保存真实 Task，受控等待 upload/receive 都完成后
+    再交给裁决逻辑；该用例 3.11 定向复跑 `1 passed in 0.09s`。
+  - 最慢用例 `test_websocket_connection_failure_maps_to_connection_lost` 耗时 120.093s；独立复跑 120.09s，
+    只取到事件循环 selector 等待栈。设显式 `deadline_total=2` 后同错误映射测试 0.07s 通过。
+    延迟最可能来自默认预算重锚后的 `deadline_watch` 取消收尾，但 async Task 栈缺失，归因仍属推断；用例现设短预算。
+- 关键决策 / 否决方案：不改 SDK 生产代码；不把延迟写成已获栈证明，也不归因于测试有意等待。
+- 下一步唯一动作：真实 3.11 两文件整测再跑一次（累计最多两次），然后完成剩余跨版本竞态重复和 3.12 全量套件。

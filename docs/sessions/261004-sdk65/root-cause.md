@@ -119,6 +119,12 @@ python=3.12
 接受本轮不修**。本轮不加防御逻辑；不把该路径写成不可达，也不把它与 #65 final 主缺陷合并为一个
 根因。
 
+本轮 3.11.15 首次两文件整测中，`test_websocket_connection_failure_maps_to_connection_lost` 用默认预算耗时
+120.093s；单测复跑为 120.09s，设置 `deadline_total=2` 后同一错误映射断言 0.07s 通过。它与 `transcribe_file`
+重置远端预算后在 `finally` gather `deadline_watch` 的路径吻合，最可能是该 timer 的取消被 `wait_for` 吞掉后
+等到默认预算结束；两次现场都只取得 selector 空等的线程栈，没有拿到 async Task 栈，所以此归因仍是推断，
+不能排除 fixture 收尾。用例现显式设 2s，只验证错误映射；独立 review 已记录的公共取消延迟仍按 P2 接受不修。
+
 ## 7. 同轮错误与 final：从偶然并发改为屏障证明
 
 早期用例依赖真实 socket 时序让最后一帧 send 与 final 偶然并发；它在 3.12 修前红、3.11 修后绿，不能
@@ -128,8 +134,8 @@ python=3.12
 
 1. fake server 先收到 SDK 实际序列化的 final 帧，保存帧内 `task_id`，再按同 UUID 发合法 final；
 2. send 包装器先把原帧实际送到服务端，等 `_receive` 真正解析完 final 后才抛 `OSError`；
-3. 接收协程先恢复一轮事件循环，测试包装的 `asyncio.wait` 记录 upload/receive 的 Task 身份，并断言同一次
-   返回的 `done` 同时包含两者；
+3. 测试在任务创建时保存 SDK upload Task 与接收 Task 身份；包装的 `asyncio.wait` 等两者实际结束后一起交给
+   裁决逻辑，并断言返回的 `done` 同时包含两者；这是受控的混合终态测试，不声称自然 socket 时序必然同拍；
 4. 把错误优先判据单独变异成「先返回 final」，测试以明确 `AssertionError` 转红。
 
 修后 Python 3.12.3：该用例 `1 passed`。final 优先变异红日志：
