@@ -430,21 +430,20 @@ async def test_final_result_returns_without_server_close_no_shim(
 
 
 @pytest.mark.asyncio
-async def test_upload_failure_is_not_masked_by_concurrent_final(
+async def test_upload_failure_is_not_masked_by_final(
     tmp_path, fake_media_tools, monkeypatch
 ):
-    """同拍收尾时上传失败不能被 final 盖掉；裁决顺序固定，不依赖 set 遍历顺序。
+    """上传失败不能被改判成成功的转录：必须上抛 AsrError，而不是返回 Transcript。
 
-    构造让 upload 与 receive 在同一个事件循环批次里收尾：服务端一发出 final，
-    客户端卡在最后一帧上的 send 就立刻失败。旧实现遍历 set，拿到哪个异常不定。
+    注意：这里**故意不复现「同拍完成」**——upload 是否恰好停在最后一帧的 send 上取决于
+    真实 socket 时序，实测在 3.12 修前红、3.11 修后绿，同一个场景两种结果，无法确定性构造。
+    因此只锁「失败不被 final 盖掉」这条契约本身（顺序确定即可），同拍的不确定性另在
+    root-cause.md 记录，不写成会飘的断言。
     """
     audio_path = make_audio(tmp_path / "source.wav")
-    pcm = b"\0" * (3 * 256 * 1024)
-    monkeypatch.setattr(sdk_client, "_transcode", lambda *_: asyncio.sleep(0, result=pcm))
     original_connect = websockets.connect
-    released = asyncio.Event()
 
-    class RacingConnection:
+    class FailingSendConnection:
         def __init__(self, context_manager):
             self.context_manager = context_manager
             self.ws = None
@@ -456,41 +455,32 @@ async def test_upload_failure_is_not_masked_by_concurrent_final(
         async def __aexit__(self, *args):
             return await self.context_manager.__aexit__(*args)
 
-        async def send(self, message):
-            frame = json.loads(message)
-            if frame["is_final"]:
-                # 最后一帧：等 receive 收到 final 再失败，让两个任务同拍收尾。
-                await released.wait()
-                raise OSError("connection reset by peer")
-            await self.ws.send(message)
+        async def send(self, _message):
+            raise OSError("connection reset by peer")
 
         async def recv(self):
-            message = await self.ws.recv()
-            released.set()
-            return message
+            return await self.ws.recv()
 
-    def racing_connect(url, **kwargs):
+    def failing_connect(url, **kwargs):
         options = {k: v for k, v in kwargs.items() if v is not None or k == "proxy"}
-        return RacingConnection(original_connect(url, **options))
+        return FailingSendConnection(original_connect(url, **options))
 
-    racing_connect.__signature__ = inspect.signature(original_connect)
-    monkeypatch.setattr(sdk_client.websockets, "connect", racing_connect)
+    failing_connect.__signature__ = inspect.signature(original_connect)
+    monkeypatch.setattr(sdk_client.websockets, "connect", failing_connect)
 
-    async def final_on_first_frame(ws, state):
+    async def silent(ws, state):
         async for message in ws:
-            frame = json.loads(message)
-            state["frames"].append(frame)
-            if len(state["frames"]) == 1:
-                await ws.send(json.dumps(final_result(task_id=frame["task_id"], text="同拍失败。")))
+            state["frames"].append(json.loads(message))
 
-    async with fake_v2_server(final_on_first_frame) as (url, state):
+    async with fake_v2_server(silent) as (url, state):
         with pytest.raises(AsrError) as caught:
-            await transcribe_file(audio_path, url)
+            await transcribe_file(audio_path, url, deadline_total=20)
 
     assert caught.value.code == "connection_lost"
     assert "connection reset by peer" in caught.value.message
-    # 最后一帧的 send 故意失败，服务端因此从未见过 is_final 帧。
-    assert [frame["is_final"] for frame in state["frames"]] == [False, False]
+    # 失败发生在上传阶段：连接已建立，但服务端没收到任何帧。
+    assert state["connections"] == 1
+    assert state["frames"] == []
     assert _pending_sdk_tasks() == []
 
 
@@ -648,8 +638,9 @@ async def handler(ws):
                 "task_id": frame["task_id"], "text": "子进程同步入口。",
                 "tokens": [], "timestamps": [], "duration": 5.5,
             }}))
-            # 生产形态：回完 final 不关连接，等客户端自己返回
-            await hold.wait()
+            # 生产形态：回完 final 不关连接，等客户端自己返回；
+            # 必须有上限，否则外层取消时 Server.__aexit__ 会等这个 handler 等到天荒地老。
+            await asyncio.wait_for(hold.wait(), timeout=30)
             return
 
 
@@ -670,7 +661,7 @@ async def main():
 
 
 make_wav(WAV)
-asyncio.run(asyncio.wait_for(main(), timeout=20))
+asyncio.run(asyncio.wait_for(main(), timeout=45))
 '''
     result = subprocess.run(
         [sys.executable, "-c", script],
@@ -683,7 +674,7 @@ asyncio.run(asyncio.wait_for(main(), timeout=20))
         capture_output=True,
         text=True,
         check=False,
-        timeout=60,
+        timeout=90,
     )
     assert result.returncode == 0, (result.stdout, result.stderr)
     payload = json.loads(result.stdout.strip().splitlines()[-1])
