@@ -50,3 +50,16 @@
 - 关键决策与否决：
   - 否决在 `on_progress` 续期上补实现：服务端 progress 节奏未实证，卡面把它排除在根因之外，不臆造。
 - 下一步唯一动作：交主脑验收与后续独立审查。
+## 里程碑 5：独立审查 P2（protocol.md 同步公式）
+
+- 阶段：repairing
+- 本段结论：
+  - 续派在同一 worktree、同一分支 `card/sdk-auto-budget-261004`、基线 `9efc7a6`（本卡即追加到 PR #71，无需新开 PR）。
+  - `docs/reference/protocol.md:161`「## Python SDK」段仍写旧公式 `max(120 秒, 音频时长 + 60 秒)`，已改为与实现、`sdk/README.md` 一致的 `音频时长 × 4 + 120 秒`；同段补一句「自动预算是 watchdog（挂死检测），不是识别时限 SLA……确需更长预算请显式传 `deadline_total`」，未复制 README 整段。
+  - 该段是单行长文本，两处改动都落在同一行，净 diff +1/-1 = 2 行（目标 40 / 硬上限 120）。
+  - 绿：Verify-Command `tests/test_sdk_deadline_stage.py` + `tests/test_sdk_no_wait_for.py` 14 passed exit 0（纯文档，运行时失败路径不变）。Narrow-Verify `git grep 'max(120 秒, 音频时长 + 60 秒)' -- docs/reference/protocol.md` rc=1 通过。
+- 关键决策与否决：
+  - **旧公式串在仓内还有一处 `sdk/README.md:52`，本卡刻意不动**：它在 watchdog 段里是「旧公式曾给 153 秒会误杀」的历史引证，不是仍在生效的合同；卡面明令禁止改 README。卡面完成条件第 4 条写的是「生产合同处为 0」，protocol.md 已 0 命中，README 属非合同处。
+  - 否决把 protocol.md 也写成含 306 秒/~3.3× RTF 的长篇：卡面要求「不要复制整段 README」，一句 watchdog 说明足够，细节留在 SDK 文档链接里。
+  - 否决顺带修 P3（超时消息文案在 protocol.md 的描述）：本卡锁定不碰，且现有描述仍然属实。
+- 下一步唯一动作：追加提交并推到 PR #71，保持 draft。
