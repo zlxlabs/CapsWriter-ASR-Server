@@ -199,3 +199,15 @@ ERROR tests/test_sdk_client.py
 - 未做下游 `VideoTranscriptAPI` 的端到端验收（不在本卡授权范围）。
 - Python 3.11.15 公共取消路径存在有限响应延迟，本轮按 P2 接受不修（第 6 节）；这不是 #65 final 收尾主缺陷。
 - 3.10 的超时分类缺陷未修（第 5 节）。
+
+## 11. 本轮最终验证
+
+- Python 3.11.15 两文件整测最终 `34 passed in 17.63s`；首跑的 `1 failed, 33 passed in 137.80s` 是新测试把
+  `wait_for(ws.send())` 子任务错认作 upload Task，修正身份跟踪后全绿。连接拒绝用例的 120 秒归因限制见第 6 节。
+- 同一 7 个 final / 错误 / 取消 / 慢上传关键用例，Python 3.11.15 与 3.12.3 各连续 5 轮全部 `7 passed`。
+- Python 3.12.3 全量 `tests/`：`453 passed, 3 skipped, 149 warnings in 222.54s`，EXIT=0；原始日志
+  `/tmp/sdk65_py312_full_tests_20261004_074109_52b55e.log`。
+- 最终代码树三条变异分别产生行为 `AssertionError`：final 优先、取消路径漏掉 `getter.cancel()`、上传未完先启 idle；
+  日志分别为 `/tmp/sdk65_final_priority_red_20261004_dlg-20261004-074109-52b55e.log`、
+  `/tmp/sdk65_skip_getter_cancel_red_20261004_dlg-20261004-074109-52b55e.log`、
+  `/tmp/sdk65_idle_before_upload_done_red_20261004_dlg-20261004-074109-52b55e.log`。
