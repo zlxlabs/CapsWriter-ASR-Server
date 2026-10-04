@@ -1,6 +1,6 @@
 # CapsWriter ASR Python SDK
 
-SDK 支持 Python 3.10 及以上版本。服务端推荐 Python 3.12。它将音频文件转为服务端可接收的格式，检查 `/health`，通过 WebSocket 上传并返回识别结果。
+SDK 支持 Python 3.11 及以上版本。服务端推荐 Python 3.12。它将音频文件转为服务端可接收的格式，检查 `/health`，通过 WebSocket 上传并返回识别结果。
 
 ## 安装与系统依赖
 

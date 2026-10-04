@@ -356,10 +356,24 @@ async def _transcribe_connected(
                     context=context,
                     model=model,
                 )
+                # 用 asyncio.wait 而不是 asyncio.wait_for：后者在 Python ≤3.11 上会在
+                # 「Future 完成与 task.cancel() 落在同一 tick」时吞掉取消
+                # （asyncio/tasks.py：except CancelledError: if fut.done(): return fut.result()），
+                # 本协程吞掉这一轮取消后会带着已发送的帧进入下一帧全新等待，而那次取消
+                # 已被消费，于是外层 gather 永久挂起（issue #67）。
+                # asyncio.wait 的内部 _wait 没有这个分支，取消一定向上抛。
+                sender = asyncio.ensure_future(ws.send(frame))
                 try:
-                    await asyncio.wait_for(ws.send(frame), timeout=idle_timeout)
-                except TimeoutError as exc:
-                    raise AsrError("timeout", "发送音频帧超过 idle_timeout") from exc
+                    done, _ = await asyncio.wait({sender}, timeout=idle_timeout)
+                    if sender in done:
+                        # 发送失败仍通过 Future 的结果上抛，不在这里另开异常通道。
+                        sender.result()
+                    else:
+                        raise AsrError("timeout", "发送音频帧超过 idle_timeout")
+                finally:
+                    # 与 idle_watch 的 getter 同构：超时分支只 cancel 不额外 await，
+                    # 回收由外层 finally 的 gather 把事件循环驱动到收尾。
+                    sender.cancel()
             upload_done.set()
 
         async def idle_watch() -> None:
@@ -512,13 +526,22 @@ async def transcribe_file(
             remaining = deadline["at"] - time.monotonic()
             if remaining <= 0:
                 raise timeout_error()
+            # 用 asyncio.wait 而不是 asyncio.wait_for：后者在 Python ≤3.11 上会在
+            # 「deadline_changed.set() 与 task.cancel() 落在同一 tick」时吞掉取消，
+            # 本协程吞掉这一轮取消后又进入下一轮全新等待，而那次取消已被消费，
+            # transcribe_file 的 finally 里的 gather 便永久挂起（issue #67）。
+            waiter = asyncio.ensure_future(deadline_changed.wait())
             try:
-                await asyncio.wait_for(deadline_changed.wait(), timeout=remaining)
-            except TimeoutError:
+                done, _ = await asyncio.wait({waiter}, timeout=remaining)
+                if waiter in done:
+                    deadline_changed.clear()
+                    continue
+                # 等待超时：只有确实越过预算才上抛，计时器与 set_deadline 同 tick 时
+                # 以真实时钟为准（asyncio.wait 的计时器精度不保证先于事件投递）。
                 if deadline["at"] <= time.monotonic():
                     raise timeout_error()
-            else:
-                deadline_changed.clear()
+            finally:
+                waiter.cancel()
 
     operation_task = asyncio.create_task(operation())
     timer_task = asyncio.create_task(deadline_watch())

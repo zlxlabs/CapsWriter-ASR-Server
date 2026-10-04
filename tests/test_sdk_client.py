@@ -1031,6 +1031,73 @@ async def test_websocket_connection_failure_maps_to_connection_lost(tmp_path, mo
 
 
 @pytest.mark.asyncio
+async def test_default_budget_connection_refused_returns_in_seconds(tmp_path, monkeypatch):
+    """#67：默认预算下连接拒绝必须秒级返回 connection_lost，不得挂到自动预算（120s）。
+
+    这是与上一条用例互补的锁：显式 deadline_total 从不触发 deadline_changed.set()，
+    走不到 deadline_watch 的默认预算重锚定，因此上一条用例结构上锁不住 #67。
+    断言入口是公共 API transcribe_file，不传 deadline_total。
+    """
+    audio_path = make_audio(tmp_path / "source.wav")
+
+    def refuse_connection(_url, **_kwargs):
+        raise OSError("connection refused")
+
+    async with fake_v2_server(accept_and_finish) as (url, _):
+        monkeypatch.setattr(sdk_client.websockets, "connect", refuse_connection)
+        started = time.monotonic()
+        with pytest.raises(AsrError) as caught:
+            await transcribe_file(audio_path, url)
+        elapsed = time.monotonic() - started
+
+    assert caught.value.code == "connection_lost"
+    assert elapsed < 5, f"连接拒绝耗时 {elapsed:.3f}s，超过 5s 说明挂到了自动预算"
+
+
+@pytest.mark.asyncio
+async def test_send_failure_surfaces_as_connection_lost(tmp_path, monkeypatch):
+    """发送帧抛 WebSocket 异常时必须经Future 结果上抛，映射成 connection_lost。
+
+    upload 改成 asyncio.wait 后，发送失败不再由 await 直接抛出，而是走 sender.result()；
+    这条用例盯住该分支不被改写成静默吞错。
+    """
+    audio_path = make_audio(tmp_path / "source.wav")
+    original_connect = websockets.connect
+    closed = websockets.exceptions.ConnectionClosedError(None, None)
+
+    class FailingSendConnection:
+        def __init__(self, context_manager):
+            self.context_manager = context_manager
+            self.ws = None
+
+        async def __aenter__(self):
+            self.ws = await self.context_manager.__aenter__()
+            return self
+
+        async def __aexit__(self, *args):
+            return await self.context_manager.__aexit__(*args)
+
+        async def send(self, _message):
+            raise closed
+
+        async def recv(self):
+            return await self.ws.recv()
+
+    def failing_connect(url, *, ping_interval=None, max_size=None, max_queue=None, proxy=None):
+        options = {"ping_interval": ping_interval, "max_size": max_size, "max_queue": max_queue}
+        if proxy is not None:
+            options["proxy"] = proxy
+        return FailingSendConnection(original_connect(url, **options))
+
+    monkeypatch.setattr(sdk_client.websockets, "connect", failing_connect)
+
+    async with fake_v2_server(accept_and_finish) as (url, _state):
+        with pytest.raises(AsrError) as caught:
+            await transcribe_file(audio_path, url, deadline_total=5, idle_timeout=5)
+    assert caught.value.code == "connection_lost"
+
+
+@pytest.mark.asyncio
 async def test_transcode_failure_uses_decode_failed(monkeypatch, tmp_path):
     monkeypatch.setattr(sdk_client.shutil, "which", lambda _name: None)
     with pytest.raises(AsrError) as caught:
