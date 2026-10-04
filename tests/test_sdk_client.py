@@ -156,7 +156,12 @@ def legacy_wait_for_semantics(monkeypatch):
 
 
 def _pending_sdk_tasks() -> list[str]:
-    """列出仍未结束的 SDK 内部任务；假服务端的任务不在此列。"""
+    """列出仍未结束的 SDK 内部任务；假服务端的任务不在此列。
+
+    只收 SDK 自己的协程名：idle_watch 每轮新建的 Queue.get getter 实测在
+    transcribe_file 返回前一定会被事件循环收尾（见 root-cause.md 第 4 节的注入实验），
+    把它写进断言并不能在“取消后不 await”时转红，属于恒真断言，故不收。
+    """
     pending = []
     for task in asyncio.all_tasks():
         qualname = getattr(task.get_coro(), "__qualname__", "")
@@ -425,13 +430,13 @@ async def test_final_result_returns_without_server_close_no_shim(
 
 
 @pytest.mark.asyncio
-async def test_final_wins_when_upload_fails_in_same_tick(
+async def test_upload_failure_is_not_masked_by_concurrent_final(
     tmp_path, fake_media_tools, monkeypatch
 ):
-    """同时完成时的裁决固定为「final 优先」，不依赖 set 遍历顺序。
+    """同拍收尾时上传失败不能被 final 盖掉；裁决顺序固定，不依赖 set 遍历顺序。
 
     构造让 upload 与 receive 在同一个事件循环批次里收尾：服务端一发出 final，
-    客户端卡在最后一帧上的 send 就立刻失败。旧实现遍历 set，结果取决于哈希顺序。
+    客户端卡在最后一帧上的 send 就立刻失败。旧实现遍历 set，拿到哪个异常不定。
     """
     audio_path = make_audio(tmp_path / "source.wav")
     pcm = b"\0" * (3 * 256 * 1024)
@@ -476,13 +481,14 @@ async def test_final_wins_when_upload_fails_in_same_tick(
             frame = json.loads(message)
             state["frames"].append(frame)
             if len(state["frames"]) == 1:
-                await ws.send(json.dumps(final_result(task_id=frame["task_id"], text="同拍裁决。")))
+                await ws.send(json.dumps(final_result(task_id=frame["task_id"], text="同拍失败。")))
 
     async with fake_v2_server(final_on_first_frame) as (url, state):
-        transcript = await transcribe_file(audio_path, url)
+        with pytest.raises(AsrError) as caught:
+            await transcribe_file(audio_path, url)
 
-    assert transcript.text == "同拍裁决。"
-    assert transcript.task_id == state["frames"][0]["task_id"]
+    assert caught.value.code == "connection_lost"
+    assert "connection reset by peer" in caught.value.message
     # 最后一帧的 send 故意失败，服务端因此从未见过 is_final 帧。
     assert [frame["is_final"] for frame in state["frames"]] == [False, False]
     assert _pending_sdk_tasks() == []

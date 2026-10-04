@@ -67,6 +67,29 @@
 
 ## 里程碑 4：跨版本验证与交付
 
-- 阶段：verifying
-- 本段结论：见下方「验证矩阵」。
-- 关键决策 / 否决方案 / 下一步：见最终报告。
+- 阶段：verifying → delivered（draft PR #66，未标 ready、未合并、未关 issue）
+- 本段结论（验证矩阵）：
+
+  | 运行 | 解释器 | 结果 |
+  | --- | --- | --- |
+  | 全量 Verify-Command（`tests/`） | 3.12 | `453 passed, 3 skipped` |
+  | Narrow-Verify 连续 5 次 | 3.12 | 每次 `34 passed` |
+  | 既有 SDK 套件（修前基线） | 3.11 | `4 failed, 23 passed`（挂满 120s 预算） |
+  | 既有 SDK 套件 + 新回归（修后） | 3.11 | `34 passed` |
+  | 旧码 + `legacy_wait_for_semantics` | 3.12 | `3 failed, 4 passed`（红） |
+  | 新码 + `legacy_wait_for_semantics` | 3.12 | `7 passed`（绿） |
+  | SDK 套件（修前基线） | 3.10 | `11 failed, 16 passed, 1 error`（继承红） |
+  | SDK 套件 + 新回归（修后） | 3.10 | **待补**（运行中，完成后填入实际输出） |
+
+- 关键决策：
+  - 不在本卡修 3.10 的 `except TimeoutError` / `asyncio.TimeoutError` 别名缺陷（属继承红，
+    且与本卡根因不同），只实证、归档、上报，另开单。
+  - PR 保持 draft，不标 ready、不合并、不关 issue，验收权留给主脑。
+- 否决方案：
+  - 为了让 3.10 变绿而在本卡顺手改 `except (TimeoutError, asyncio.TimeoutError)`：越出本卡根因，
+    会把两个缺陷混在一个 diff 里，反而让主脑难判。
+- 下一步唯一动作：等主脑验收 PR #66。
+
+### 里程碑 4 补记：Python 3.10 修后
+
+**待补**：修后 3.10 的实测输出尚未产生，此处不预填结论。

@@ -377,6 +377,9 @@ async def _transcribe_connected(
                     if not done:
                         raise AsrError("timeout", "上传结束后等待服务端消息超时")
                 finally:
+                    # 实测：只 cancel 不 await 在本代码结构下也不会留下可观测的 pending
+                    # getter（外层 finally 的 gather 会把事件循环驱动到它收尾），因此不额外
+                    # 加一次 await；证据见 docs/sessions/261004-sdk65/root-cause.md 第 4 节。
                     getter.cancel()
 
         upload_task = asyncio.create_task(upload())
@@ -390,15 +393,19 @@ async def _transcribe_connected(
         try:
             while True:
                 done, _ = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
-                if receive_task in done:
-                    # 裁决：final 与其他任务同时完成时以 final 为准——服务端已经给出
-                    # 可用结果，上传或 idle 侧的失败不应把一次成功转录改判为失败。
-                    tasks.discard(receive_task)
-                    return receive_task.result()
-                # 其余任务报错：按 upload → idle 的固定顺序上抛，不依赖 set 遍历顺序。
+                # 同时完成时的裁决：任一已完成的子任务带异常，就先按 upload → receive → idle
+                # 的固定顺序上抛。上传失败/idle 超时不能因为同轮收到了 final 就被改判成成功；
+                # set 的遍历顺序不定，用 ordered 消掉这个不确定性。
                 for task in ordered:
-                    if task in done:
-                        task.result()
+                    if task not in done:
+                        continue
+                    if task.cancelled():
+                        raise asyncio.CancelledError
+                    error = task.exception()
+                    if error is not None:
+                        raise error
+                if receive_task in done:
+                    return receive_task.result()
                 tasks.difference_update(done)
         finally:
             for task in tasks:

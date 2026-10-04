@@ -1,122 +1,155 @@
 # issue #65 根因报告：SDK 收到 final 后不返回
 
-- 派发：`dlg-20261004-044541-f474be`
-- 分支：`card/sdk65-rootcause-261004`
-- Base commit：`820c3a2ee4fccc1b44187bd99c40cf99c16e1ca2`
-- 结论：**根因已实证，最小修复已落地并在 3.10/3.11/3.12 上对照验证。**
+- 派发：`dlg-20261004-044541-f474be` / `dlg-20261004-061926-9968e0`
+- 分支：`card/sdk65-rootcause-261004`；Base commit：`820c3a2ee4fccc1b44187bd99c40cf99c16e1ca2`
+- 结论：**根因已实证，最小修复已落地，真实 3.10 / 3.11 / 3.12 上做了修前修后对照。**
 
 ## 1. 一句话根因
 
-`client.py` 的 `idle_watch()` 用「无限循环 + 每轮 `asyncio.wait_for(queue.get())`」实现接收侧
-idle 超时。CPython **≤3.11** 的 `asyncio.wait_for` 有一个吞取消分支：当被等待对象在**同一 tick**
-已完成、同时外层收到 `task.cancel()` 时，它返回结果而不是传播 `CancelledError`。final 到达恰好
-制造这个同刻条件，于是 `idle_watch` 吞掉取消后进入下一轮**全新**等待（那次取消已被消费），
-永久阻塞；`_transcribe_connected` 的 `finally` 里 `await asyncio.gather(...)` 等的就是它，
-于是 `_operation` 不返回，直到外层 120s 自动预算到点抛 `AsrError(timeout)`。
-Python 3.12 把 `wait_for` 改写成 `asyncio.timeout`，删掉了这个分支——所以只在 ≤3.11 复现。
+`client.py` 的 `idle_watch()` 用「无限循环 + 每轮 `asyncio.wait_for(queue.get())`」实现接收侧 idle
+超时。CPython **≤3.11** 的 `asyncio.wait_for` 有一个吞取消分支——被等待对象在同一 tick 已完成、
+外层同刻收到 `task.cancel()` 时，它返回结果而不是传播 `CancelledError`。`final` 到达恰好制造这个
+同刻条件：取消被吞后 `idle_watch` 进入下一轮**全新**等待，而那次取消已被消费，于是永久阻塞；
+`_transcribe_connected` 的 `finally` 里 `await asyncio.gather(...)` 等的就是它，`_operation` 不返回，
+直到外层预算到点抛 `AsrError(timeout)`。Python 3.12 把 `wait_for` 改写成 `asyncio.timeout`，删掉了该
+分支——所以只在 ≤3.11 复现；本仓 CI 只跑 3.12（`.github/workflows/ci.yml` 仅 `python-version: "3.12"`），
+既有测试因此从未暴露。
 
-## 2. 生产版本定位（只读证据）
+## 2. 被测代码自证
 
-| 证据 | 来源 | 结论 |
+A/B 对照用 `SDK_PATH` 指向两份 `capswriter_asr`，每份输出都带 `client_sha256`：
+
+```
+ff476ad7cd40401b7ed77c7606cb4fc14dc3d529043c29c4714b199c13423cdf  ← 修前
+    与 issue #65 正文记录的运行 client.py SHA256 逐字一致（= pin 858c6b9 的原始代码）
+eccec1a69b81c4a2360d33e15f0ddb8adffb85725dc93d41f8e3150a0863f6c7  ← 修后
+```
+
+## 3. 修前/修后对照（真实解释器，硬截止）
+
+脚本 `/tmp/sdk65_repro_e2e.py`（真实 `websockets.serve` 随机端口 + 真实 `/health` + 真实 `ffmpeg`
+转码，单帧 `is_final=true`，回完 final **保持连接打开**，按实际收到的 `task_id` 回帧），
+`HARD_DEADLINE=8`，shell 再套 `timeout 45`。原始输出：
+
+| 解释器 | 修前 | 修后 |
 | --- | --- | --- |
-| issue 记录调用以 `AsrError(code=timeout)` 收场 | issue #65 正文 | 若生产是 3.10，`except TimeoutError` 抓不到 `asyncio.TimeoutError`，调用方会看到裸 `asyncio.TimeoutError`（本地 3.10 实测如此）。**故生产不是 3.10** |
-| 3.12 不复现（本地矩阵） | `/tmp/sdk65_repro_e2e.py` | **故生产是 3.11** |
-| 下游容器基础镜像 | `VideoTranscriptAPI@ff92a175` 的 `docker/Dockerfile` 第 1 行 `FROM python:3.11-slim`；仓库根 `.python-version` = `3.11` | **直接确认生产解释器为 3.11** |
+| 3.10 | `RAISED: asyncio.exceptions.TimeoutError`，final@0.201s，elapsed 6.004s，exit=4 | `OK` final@0.097s，elapsed 0.098s，exit=0 |
+| **3.11** | `TIMEOUT_AFTER_FINAL: AsrError(code=timeout)`，final@0.089s，elapsed 6.007s，exit=3 | `OK` final@0.100s，elapsed 0.101s，exit=0 |
+| 3.12 | `OK` final@0.103s，elapsed 0.104s，exit=0 | `OK` exit=0 |
 
-说明：只对下游做了 4 次只读 `gh` 请求（仓库树、`.python-version`、`docker/` 列表、`Dockerfile`），
-未读任何凭据、未读原始生产日志、未写入他仓。issue 中 pin 的下游 commit 就是 `ff92a175`，与本次
-读取的 commit 一致。
+原始日志：`/tmp/sdk65_ab_prefix_3.10.log`、`/tmp/sdk65_ab_prefix_3.11.log`、`/tmp/sdk65_ab_prefix_3.12.log`、
+`/tmp/sdk65_ab_postfix_3.10.log`、`/tmp/sdk65_ab_postfix_3.11.log`、`/tmp/sdk65_ab_postfix_3.12.log`；
+退出码汇总 `/tmp/sdk65_ab_exitcodes.txt`。
 
-## 3. 复现证据链
+3.10 修前那一格同时暴露第 5 节的继承缺陷（抛的是裸 `asyncio.TimeoutError`，不是约定的 `AsrError`）。
 
-### 3.1 隔离判据（先证明机制，再看整链）
+## 4. getter 只 cancel 不 await —— 实测无收益，故不加
 
-`/tmp/sdk65_min_waitfor_cancel.py`——只保留 `idle_watch` 骨架（`asyncio.Queue(maxsize=1)` +
-`while True` + `wait_for`），用 `shield` + 2s 上界判定 watcher 是否还能结束：
+`idle_watch` 每轮新建 `getter = ensure_future(idle_messages.get())`，`finally` 里只 `getter.cancel()`。
+是否需要再 `await` 回收？做了注入实验：只删掉 `await asyncio.gather(getter, return_exceptions=True)`
+这一行，其余不动，用同步入口子进程在真实 3.11 上跑：
 
-```
-$ for v in 3.10 3.11 3.12; do uv run --no-project --python $v python /tmp/sdk65_min_waitfor_cancel.py; done
-py3.10: HANG 复现 —— wait_for 吞掉 cancel，watcher 永不完成      (exit=3)
-py3.11: HANG 复现 —— wait_for 吞掉 cancel，watcher 永不完成      (exit=3)
-py3.12: cancel 正确传播                                          (exit=0)
-```
+| 变体 | 退出码 | stdout | `Task was destroyed but it is pending!` 计数 |
+| --- | --- | --- | --- |
+| 带 `await` 回收 | 0 | `{"text": "子进程同步入口。", "task_id_matches": true, "frames": 1}` | 0 |
+| 只 `cancel` 不 `await` | 0 | `{"text": "子进程同步入口。", "task_id_matches": true, "frames": 1}` | 0 |
 
-判据自检：把 `put_nowait` 与 `cancel` 拆到不同 tick 后，3.10/3.11 立刻正常结束——说明红由
-「同刻」触发，不是脚本恒红。
+两者完全一致：`_transcribe_connected` / `transcribe_file` 的 `finally` 里的 `gather` 会把事件循环驱动
+到 getter 收尾。**结论：不加那次 `await`**。
 
-### 3.2 整链复现（真实 websockets 假服务端 + 真实 ffmpeg）
+同时把测试里的 `_pending_sdk_tasks()` 断言范围改回只收 SDK 自己的协程名：先前把 `Queue.get`
+也收进去，注入实验显示**它转不红**（恒真断言），按纪律撤掉而不是留着装样子。
 
-`/tmp/sdk65_repro_e2e.py`：随机端口 `websockets.serve` + 真实 `/health` + 真实 `ffmpeg` 转码，
-单帧 `is_final=true`，服务端回 final 后**保持连接打开**，回帧按实际收到的 `task_id` 构造。
+## 5. 继承红：3.10 上 `except TimeoutError` 抓不到 `asyncio.TimeoutError`（**本卡未修**）
 
-```
-$ uv run --no-project --python 3.11 --with websockets --with numpy --with httpx \
-    python -u /tmp/sdk65_repro_e2e.py --budget 6
-{"verdict": "TIMEOUT_AFTER_FINAL: AsrError(code=timeout)", "python": "3.11",
- "websockets": "17.2", "final_sent_at": 0.135, "elapsed": 6.007, "frames": 1,
- "frame_is_final": [true], "samples_total_on_final": 88000}
+3.10 里 `asyncio.TimeoutError` 尚未是内建 `TimeoutError` 的别名（3.11 才合并，实测
+`asyncio.TimeoutError is TimeoutError` 在 3.10 为 `False`）。`client.py` 里三处 `except TimeoutError`
+（`upload` / `idle_watch` / `deadline_watch`）因此抓不到它，所有超时路径在 3.10 上抛裸
+`asyncio.exceptions.TimeoutError` 而非约定的 `AsrError(code="timeout")`。
 
-$ uv run --no-project --python 3.12 ... python -u /tmp/sdk65_repro_e2e.py --budget 6
-{"verdict": "OK", "python": "3.12", ..., "final_sent_at": 0.125, "elapsed": 0.125,
- "text": "本地复现文本。", "task_id_matches": true}
-```
+SDK 套件在 3.10 上的有界对照（同一命令，只换被测代码）：
 
-服务端主动关连接（`--close-after-final`）时 3.11 同样复现——**该缺陷与「服务端是否关连接」无关**，
-仓库既有测试之所以没抓到，是因为 CI 只跑 3.12（`.github/workflows/ci.yml` 仅 `python-version: "3.12"`）。
+| 被测代码 | 结果 |
+| --- | --- |
+| 修前（sha `ff476ad7`） | `11 failed, 16 passed, 1 error in 642.78s` |
+| 修后（sha `eccec1a6`） | `5 failed, 29 passed in 134.28s` |
 
-### 3.3 仓库既有测试在 3.10 上的既有红（继承红，非本卡引入）
+修后剩余 5 个失败全部属于本缺陷（`test_blocked_send_uses_idle_timeout`、
+`test_total_deadline_expires_despite_continuous_progress`、`test_explicit_deadline_kills_local_ffmpeg`、
+`test_remote_stage_timeout_message`、`test_local_and_remote_timeout_messages_are_distinguishable`），
+与 #65 的「收到 final 后不返回」不是同一根因（本卡根因在 3.11 上成立，而 3.11 的别名是好的），
+因此**本卡不动**。建议单独收敛「SDK 声明 `requires-python >= 3.10` 但 CI 只跑 3.12」这个缺口。
 
-`tests/test_sdk_client.py::test_flac_upload_matches_transcode_and_v2_frames`（未改动的既有测试）
-在 3.10 上挂满 120s 自动预算后失败，在 3.12 上通过。
+## 6. 存量另作追踪：`upload` / `deadline_watch` 的同形态隐患
 
-## 4. 最小修复
-
-见 `design.md` 第 3 节。改动只有两处，都在 `sdk/capswriter_asr/client.py`：
-
-1. `idle_watch()`：每轮的 `asyncio.wait_for(idle_messages.get(), timeout=...)` 换成
-   `asyncio.wait({getter}, timeout=...)` + `finally: getter.cancel()`；语义等价，取消一定传播。
-2. `_transcribe_connected` 的任务裁决：`receive_task` 在 `done` 里时直接返回其结果（**final 优先**）；
-   其余任务报错时按 `upload → receive → idle` 的固定顺序上抛，不再依赖 `set` 的遍历顺序。
-
-diff：`sdk/capswriter_asr/client.py | 34 +-`（含注释）。
-
-### 已否决方案
-
-见 `design.md` 第 3 节表格（删 `idle_watch` / 三处 `wait_for` 全换 / `gather` 加超时兜底 /
-`sys.version_info` 分叉 / `asyncio.timeout`）。
-
-## 5. 本卡范围外但已实证的另一处 3.10 缺陷（**未修，需另开单**）
-
-`client.py` 里三处 `except TimeoutError`（`upload` / `idle_watch` / `deadline_watch`）在
-**Python 3.10 上抓不到 `asyncio.TimeoutError`**——3.10 里 `asyncio.TimeoutError` 尚未是内建
-`TimeoutError` 的别名（3.11 才合并）。后果：所有超时路径在 3.10 上抛裸
-`asyncio.exceptions.TimeoutError`，而不是约定的 `AsrError(code="timeout")`。
-
-实测（未改动的基线代码）：
+`/tmp/sdk65_shapes_measure.py` 在真实解释器上的有界测量（每形态 `shield` + 2s 上界）：
 
 ```
-$ uv run --no-project --python 3.10 ... pytest tests/test_sdk_client.py tests/test_sdk_deadline_stage.py -q
-11 failed, 16 passed, 1 error in 642.78s
+python=3.10 / python=3.11
+  A_idle_watch(队列+死循环): HANG 挂死
+  B_upload(第1/3帧被吞)  : HANG 挂死
+  C_deadline_watch(事件)  : HANG 挂死
+python=3.12
+  A_idle_watch(队列+死循环): OK 取消已传播
+  B_upload(第1/3帧被吞)  : OK 取消已传播
+  C_deadline_watch(事件)  : OK 取消已传播
 ```
 
-失败项：`test_flac_upload_matches_transcode_and_v2_frames`、`test_raw_f32le_frames_are_at_most_sixty_seconds`、
-`test_progress_is_received_before_upload_finishes`、`test_server_error_code_and_retryable_are_preserved`、
-`test_idle_timeout_is_independent_of_incoming_messages`、`test_blocked_send_uses_idle_timeout`、
-`test_total_deadline_expires_despite_continuous_progress`、`test_cli_writes_srt_txt_and_json_with_legacy_srt_layout`、
-`test_explicit_deadline_kills_local_ffmpeg`、`test_remote_stage_timeout_message`、
-`test_local_and_remote_timeout_messages_are_distinguishable`（+1 error）。
+**这推翻了本报告早期版本「B/C 吞掉取消后会自终止」的断言**——那次取消已被消费，下一轮并没有待投递的
+取消，B/C 与 A 一样会挂死。已在本卡删除该断言。
 
-这些是 **3.10 上的继承红**，与 issue #65 的「收到 final 后不返回」不是同一根因（本卡的根因在
-3.11 上同样成立，而 3.11 的 `TimeoutError` 别名是好的），因此本卡**没有**动它。SDK 声明
-`requires-python = ">=3.10"`，CI 却只跑 3.12——这个支持面与验证面的缺口建议单独收敛。
+未决问题（留给后续单）：
 
-## 6. 尚未验证的边界（不得当作已验）
+- `upload`：形态会挂死，但在本 SDK 里需要「`ws.send()` 完成与 `_transcribe_connected` 收尾的
+  `task.cancel()` 同刻」才触发。本次整链复现是**单帧**上传，未覆盖多帧中途收尾，**可达性未证**。
+- `deadline_watch`：形态会挂死，但其取消来自 `transcribe_file` 的 `finally`，而 `deadline_changed.set()`
+  只在 `set_deadline` 里发生一次、且在建连之前；要同刻需要远端调用在建连瞬间就结束，**可达性未证**。
 
-- 生产**尚未**升级到本修复；本卡不接触生产、不部署、不重启。
+两者都**未改**，也不在报告里断言它们无害。
+
+## 7. 卡面 Narrow-Verify 命令退出码 2 的实际原因（继承问题，非本卡引入）
+
+卡面 Narrow-Verify：
+
+```
+uv run --no-project --python 3.12 --with numpy --with websockets --with pytest==9.1.1 \
+  --with pytest-asyncio==1.4.0 --with httpx==0.28.1 \
+  python -m pytest tests/test_sdk_client.py tests/test_sdk_deadline_stage.py -q -p no:cacheprovider
+```
+
+实测 `EXIT=2`，pytest 原文：
+
+```
+tests/test_sdk_client.py:21: in <module>
+    import soundfile as sf
+E   ModuleNotFoundError: No module named 'soundfile'
+=========================== short test summary info ============================
+ERROR tests/test_sdk_client.py
+!!!!!!!!!!!!!!!!!!!! Interrupted: 1 error during collection !!!!!!!!!!!!!!!!!!!!
+1 error in 0.11s
+```
+
+原因：该命令的依赖清单**漏了 `soundfile`**，而 `tests/test_sdk_client.py` 在模块顶层 import 它
+（收集阶段就炸 → pytest 报 `Interrupted: 1 error during collection` → 退出码 2，不是 1）。
+
+**继承判定**：把测试文件换回 base commit `820c3a2` 的版本（`git show 820c3a2:tests/test_sdk_client.py`
+第 20 行同样是 `import soundfile as sf`）再跑同一条命令，仍是 `EXIT=2`。所以这是**卡面命令本身的缺陷**，
+不是本卡引入。补上 `soundfile`（并与 Verify-Command 的依赖对齐）后窄测 `EXIT=0`。
+
+## 8. 生产版本取证（只读，4 次 `gh` 请求）
+
+| 证据 | 来源 | 能证明什么 |
+| --- | --- | --- |
+| `FROM python:3.11-slim` | `VideoTranscriptAPI@ff92a175` 的 `docker/Dockerfile` 第 1 行 | 生产镜像的**大次版本构建线索**为 3.11 |
+| `.python-version` = `3.11` | 同仓根目录 | 开发侧大次版本与之一致 |
+| issue 记录的是 `AsrError(code=timeout)` 而非裸 `asyncio.TimeoutError` | issue #65 正文 | 结合第 5 节可排除 3.10 |
+
+**不能证明的**：生产容器内 `python --version` 的具体小版本。本报告出现的 3.11.15 / 3.11.16 都是
+本机 uv 解析结果，不得当作生产精确版本。未取证项：生产容器内 `websockets` 的实际小版本。
+
+## 9. 尚未验证的边界
+
+- 生产**尚未**升级到本修复；本卡不接触生产、不部署、不重启、不改配置。
 - 未做下游 `VideoTranscriptAPI` 的端到端验收（不在本卡授权范围）。
-- 生产容器内的 `websockets` 具体小版本未取证（本地下游解析到 17.2；SDK 声明 `websockets>=15.0.1`）。
-  根因在 `asyncio.wait_for`，与 websockets 版本无关，但未在生产版本上跑过。
-- `transcribe_file` 的 `deadline_watch` / `upload` 仍用 `asyncio.wait_for`。它们在 ≤3.11 上
-  也可能被吞取消，但按 `design.md` 2.3 的分析，吞掉之后下一步就会遇到仍待投递的取消，
-  **会自终止、不挂死**；本卡未改，也未为它们单独造用例。若将来有人把这两处改成
-  `asyncio.wait`，需重新评估取消语义。
+- `upload` / `deadline_watch` 的可达性未证（第 6 节）。
+- 3.10 的超时分类缺陷未修（第 5 节）。
