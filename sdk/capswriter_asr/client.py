@@ -427,6 +427,20 @@ async def _transcribe_connected(
             await asyncio.gather(*tasks, return_exceptions=True)
 
 
+def _auto_budget(duration: float) -> float:
+    """远端转录阶段的自动预算（秒）。
+
+    这是 **watchdog**（挂死检测），不是识别时限 SLA：它唯一的职责是在服务端不再推进
+    时把调用救回来，正常识别远快于它，所以必须按实测耗时留足余量。93 秒音频的一次
+    真实识别约需 306 秒（~3.3× 实时因子），旧公式 ``max(120, 时长 + 60)`` 给到的
+    153 秒会在识别仍在跑时就误杀（issue #69），故改为时长 4 倍 + 120 秒。
+
+    ``+ 120`` 同时覆盖了旧公式 ``max(120, …)`` 的下限语义：时长为 0 或短音频时
+    仍不低于 120 秒，无需双分支。
+    """
+    return duration * 4 + 120
+
+
 async def _operation(
     path: Path,
     url: str,
@@ -452,7 +466,7 @@ async def _operation(
     else:
         samples_total = await _count_decoded_samples(audio, encoding)
     duration = samples_total / _RAW_SAMPLE_RATE
-    set_deadline(max(120.0, duration + 60.0))
+    set_deadline(_auto_budget(duration), duration=duration)
     try:
         return await _transcribe_connected(
             url,
@@ -492,10 +506,21 @@ async def transcribe_file(
     # 阶段标记：本地准备（健康检查/转码/样本计数）结束后由 set_deadline 翻到远端转录，
     # 只用于让 timeout 消息能区分卡在哪一段，不对外暴露。
     stage = {"name": "本地准备"}
+    # 被超过的预算快照：显式传参时是入口的 deadline_total，默认路径在本地准备结束后
+    # 由 set_deadline 改写成自动预算的秒数；duration 为 None 表示音频时长还没算出来。
+    budget = {
+        "seconds": 120.0 if deadline_total is None else float(deadline_total),
+        "duration": None,
+    }
 
-    def set_deadline(seconds: float) -> None:
+    def set_deadline(seconds: float, *, duration: float | None = None) -> None:
         stage["name"] = "远端转录"
+        if duration is not None:
+            # 超时消息要能对照「预算多少秒 / 音频多长」，duration 由 _operation 算出后
+            # 随预算一起回传，不走全局变量。
+            budget["duration"] = duration
         if deadline_total is None:
+            budget["seconds"] = seconds
             # 默认时限：本地准备阶段结束后重新锚定，转码耗时不再算进远端转录预算。
             deadline["at"] = time.monotonic() + seconds
             deadline_changed.set()
@@ -503,8 +528,11 @@ async def transcribe_file(
     def timeout_error() -> AsrError:
         # 默认路径下调用方从未传过 deadline_total，被超过的是自动预算；写错名字会让人
         # 误以为自己把预算设太紧了。
-        budget = "自动预算" if deadline_total is None else "deadline_total"
-        return AsrError("timeout", f"转录超过{budget}：{stage['name']}阶段超时")
+        name = "自动预算" if deadline_total is None else "deadline_total"
+        detail = f"{budget['seconds']:.0f} 秒"
+        if budget["duration"] is not None:
+            detail += f"（音频 {budget['duration']:.1f} 秒）"
+        return AsrError("timeout", f"转录超过{name} {detail}：{stage['name']}阶段超时")
 
     async def operation() -> Transcript:
         return await _operation(
