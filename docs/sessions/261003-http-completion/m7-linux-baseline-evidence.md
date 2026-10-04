@@ -49,7 +49,8 @@ HTTP 模式将 `--protocol http --server http://127.0.0.1:<HTTP_PORT>` 替换 WS
 
 ## 回归与未覆盖项
 
-- 全量 `tests/` 固定 websockets `15.0.1`：`452 passed, 3 skipped`。最新 `17.2`：`452 passed, 3 skipped`。两次的三个既有 skip 均为两项 ForceAligner 集成依赖缺失和一项 silero VAD/onnxruntime 集成依赖缺失，没有 HTTP decode skip。
+- M7 Linux 首测工具提交 `d4eab579a93da326e79786002a7cf5ddf3e79a9a` 的全量 `tests/` 固定 websockets `15.0.1` 与最新 `17.2` 均为 `452 passed, 3 skipped`。
+- M7-A 续交最终提交 `dfc1267c63575bd22a53097e6bdfcf4b40b47cae` 的全量测试固定 websockets `15.0.1` 与最新 `17.2` 均为 `457 passed, 3 skipped, 149 warnings`；定向测试两版本均为 `11 passed`。三个既有 skip 为两项 ForceAligner 集成依赖缺失和一项 silero VAD/onnxruntime 集成依赖缺失，没有 HTTP decode skip。
 - 本次只在 Linux CPU Paraformer、该固定服务 SHA、这一组匿名素材上验证；没有跨平台实测、生产服务启动、对外上传或部署。
 - 字幕来源未核实；工具不测 CPU/RSS、TCP/TLS/WS frame/link payload，不测客户端网络重传，也不据 CER 宣称绝对准确率。
 
@@ -65,3 +66,5 @@ HTTP 模式将 `--protocol http --server http://127.0.0.1:<HTTP_PORT>` 替换 WS
 | systemd 用户级 one-shot unit | HTTP | `m7-systemd-http-01` | 4,034 | 5 个请求；控制 JSON 197 字节；1 个 PATCH、8,044 body 字节；重发 0 |
 
 两环境均逐字运行加入 `rich` 与 `colorama` 的独立 CLI 命令。实际进程 argv/env 捕获和四个 CLI 私有 JSON 的原始字节、SHA-256 与权限检查保留在派发私有目录；结果文件权限均为 `0600`。这组桩服务结果不扩展上面的 Linux Paraformer 质量或媒体测量结论。
+
+续交最终提交 `dfc1267c63575bd22a53097e6bdfcf4b40b47cae` 的 GitHub CI 单元测试矩阵（run#37177914589）中，固定 `15.0.1` 与未固定版本均为 `SUCCESS`。门禁 run#37177914924 的 path classify、quality、ledger 与 draft aggregator 为 `SUCCESS`；primary 为 `SKIPPED`，因为 PR 仍是 draft，故这不表示主审已执行。此前提交 `587f219` 的固定版本 job 曾有一项监督集成测试失败；本次 push 自动触发的新 head 检查通过，未手工重跑旧 run、未增加 timeout，也没有据此推定先前失败根因。
