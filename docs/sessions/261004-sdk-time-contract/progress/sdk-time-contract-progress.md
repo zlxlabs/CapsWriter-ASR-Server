@@ -41,3 +41,19 @@
   - 否决“把 3.11 维也跑全量然后留着红”：会让本卡 PR 的 gate 永久红，把一个边界外的继承红绑到 bugfix 上。
   - 否决改 `tests/test_http_file_tasks.py` 让它在 3.11 过：既超边界，又会用放宽断言掩盖真实并发原子性问题。
 - 下一步唯一动作：小步 commit+push，开 draft PR（`Refs #67, #68`），不标 ready、不合并。
+
+## 里程碑 4：补发送失败锁 + 推送与 PR
+
+- 阶段：verifying（收尾）
+- 本段结论：
+  - 自查发现：`upload` 改写后「发送失败经`sender.result()` 上抛」这条分支**无测试锁**（改写前由 `await` 直接抛出，改写后走 Future 结果）。已在 `tests/test_sdk_client.py` 新增 `test_send_failure_surfaces_as_connection_lost`。
+  - 该锁的牙齿已验：把 `sender.result()` 变异成 `pass` 后该用例转红（ConnectionClosedError 泄漏），还原后与 HEAD 无 diff。
+  - 终态验证（补锁后）：3.11 Narrow 38 passed（exit 0）、3.12 Narrow 38 passed（exit 0）、3.12 全量 457 passed / 3 skipped（exit 0）。
+  - draft PR #70（base master），head `card/sdk-time-contract-261004`，远端 SHA 与本地一致。未标 ready、未合并、未关 issue。
+- 踩到的坑：
+  1. **pre-push 公开内容扫描三次拦下推送**：`local_absolute_path` + `username`。一次是我自己写进度档时描述“脱敏”的句子复述了被禁字面模式，一次是里程碑 1 记了本地工作树绝对路径。处理方式是删掉本地路径与用户名，**未设 `CC_PRE_PUSH_PUBLIC_SCAN_OFF`、未绕过守卫**。
+  2. **卡面 Narrow-Verify 字面命令在本仓跑不起来**：`tests/conftest.py` 会 import `core.server...` → 需要 `rich` 与 `colorama`，卡面 `--with` 列表没列这两个，pytest 直接 exit 4 `ModuleNotFoundError: No module named 'rich'`。这是卡面命令的缺陷（基线同样如此，与本卡无关），执行时补上 `rich colorama`。
+- 关键决策与否决：
+  - 否决“把 3.11 维改成跑全量 `tests/` 并接受红”：会把边界外的继承红绑到 bugfix PR 的 gate 上。
+  - 否决“为了让 3.11 全量绿而改 `tests/test_http_file_tasks.py`”：超边界，且会用放宽断言掩盖真实并发原子性问题。
+- 下一步唯一动作：交主脑验收；#69 自动预算（Card 2）必须等本卡进 `origin/master` 后才能派。
