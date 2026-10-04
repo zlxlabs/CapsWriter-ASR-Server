@@ -163,3 +163,9 @@
   - `sdk/capswriter_asr/client.py` 本轮未改；3.11 默认预算连接错误用例 120 秒延迟已设显式短预算，推断限制见 `root-cause.md` 第 6 节。
 - 关键决策 / 否决方案：保持 PR #66 draft；接受独立审查记录的 P2，不扩改生产机制。
 - 下一步唯一动作：同步 PR 正文、push 本分支并核实远端 SHA，然后写完整 delegate 回执。
+
+## 里程碑 9：远端交付核实
+
+- 阶段：delivered
+- 本段结论：PR #66 正文已更新且仍 OPEN / draft；分支已 push，远端分支与 PR head SHA 同为 `23ebf69fdf0dd0ea6b46e5af438dfc990b60d894`。
+- 下一步唯一动作：写完整 delegate 回执到派发报告路径。
