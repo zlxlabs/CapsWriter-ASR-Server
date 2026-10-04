@@ -34,6 +34,26 @@ PR #62 保持 draft。
   state/账本/池/retry/fallback；未改 `http_store`、runner、SDK；未部署。
 - 证据：`docs/sessions/261003-http-completion/c2-fatal-exit-evidence.md`。
 
+## 2026-10-04 补交一轮（dispatch `dlg-20261004-041532-14a6d3`，Base `9ef0e52`）
+
+- 本轮 `core/server/app.py` 与 `9ef0e52` 逐字一致（diff 0 行），业务源码零新改。
+- 包 Scope 正式追加 `tests/fixtures/__init__.py`：相对 `da854b2` 的实际文件集是
+  **6 个不是 5 个**（原报告记账少算一个）。原 envelope / card 历史不改写。
+- 启动失败模式补真实 Manager 回收契约：探针在真实 HTTP 装配点记录 Manager 的真实
+  PID 与 `/proc` 痕迹（分开记「建过」与「活过」），测试断言它是与 app/worker 都不同
+  的非空 PID 且退出后从 `/proc` 消失。`prepare()` 本体照旧执行并照旧抛真实异常。
+- 红验：单处把 `app.py` 回移到 `da854b2`，两条启动失败用例以目标 AssertionError 转红
+  （日志里 manager 非空且 alive=true），还原后转绿。
+- 定向真实五轮：8-case 进程边界用例 `8 passed` ×5；cleanup+supervision 24 case
+  `24 passed` ×5。不再用「两 whole + 定向」冒充五轮。
+- 双版本全量：固定 `websockets==15.0.1` 与 `websockets==17.2` 各 `459 passed, 3 skipped`，
+  skip 身份与前轮一致，HTTP decode 未 skip。
+- **如实记录两次未复现的间歇红**（早期定向一轮、`17.2` 全量第一轮），断言输出未捕获，
+  其后 61 轮未复现；已定位的薄弱点是端口选取的 bind-and-release TOCTOU（本卡按卡面
+  不加重试式防御，选择报告）。详见证据文档 §9.5。
+- 本轮预算：相对 `9ef0e52` 为 2 文件 add=63 / del=2；相对 `da854b2` 累计 6 文件
+  add=1230 / del=19。
+
 ## 决策与否决
 
 - 年龄只读 `jobs.terminal_at`，候选条件为 DONE/FAILED 且 `terminal_at <= now - 7 天`；不增加 schema、账本或配置项。

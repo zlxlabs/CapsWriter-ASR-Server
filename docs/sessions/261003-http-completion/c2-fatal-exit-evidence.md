@@ -147,11 +147,120 @@ systemd 侧：Main processes terminated with: code=exited/status=1
 wrapper 线程在 future 已取消时 `set_exception` 抛 `InvalidStateError`。这是
 `_serve_all` 取消 WS task 的既有行为，修复前的红跑同样出现，未改动。
 
+## 9. 补交一轮（dispatch `dlg-20261004-041532-14a6d3`，Base `9ef0e52`）
+
+补交卡点三项：包 Scope 正式追加、启动失败模式的 Manager 回收契约、报告卫生。本轮
+**`core/server/app.py` 与 `9ef0e52` 逐字一致**（`git diff 9ef0e52 HEAD -- core/server/app.py`
+输出 0 行），业务源码零新改。
+
+### 9.1 包 Scope：实际是 6 个文件，不是 5 个
+
+原报告写「5 files changed」，少算了 `tests/fixtures/__init__.py`。相对 `da854b2` 的实际
+文件集（本轮结束后复核）：
+
+```
+core/server/app.py                                                  49 / 17
+docs/…/c2-fatal-exit-evidence.md                                   157 /  0
+docs/…/progress/c2-cleanup-progress.md                             28 /  2
+tests/fixtures/__init__.py                                           2 /  0
+tests/fixtures/http_fatal_exit_probe.py                            472 /  0
+tests/test_http_cleanup.py                                         522 /  0
+                                                     合计 add=1230 / del=19，共 6 文件
+```
+
+`tests/fixtures/__init__.py` 是 fixture 包让 `python -m tests.fixtures.http_fatal_exit_probe`
+成立的必要文件，有两个真实 consumer（探针自身以模块方式启动 + 测试按 Scope 引用）。
+本卡把它正式追加进有效 Scope，文件保留不删。原 envelope 与历史 card 不做任何改写。
+
+### 9.2 启动失败模式：Manager 回收契约补证
+
+原测试只断言启动失败后 worker 消失，共享 Manager 的回收没有证据；且若 `manager_pid`
+为 `None`，`/proc/<None>` 类断言会恒真。
+
+补法（只用现 fixture 字段 + 最小新增观测，不引状态/池/重试）：
+`_observe_manager_before_http_assembly()` 在真实 `HttpServer.prepare()` 之前包一层记录，
+`prepare()` 本体照旧执行并照旧抛真实异常——没有改 factory 去不建 Manager。记录分开存
+「确实建过」（`manager_process_created`）、「确实活过」（`manager_process_alive`）、
+以及同一时刻从 `/proc` 读出的 `manager_argv` / `manager_cgroup`。
+
+启动失败模式实测（`websockets==15.0.1`，两个真实消费环境各一条）：
+
+| 字段 | 裸 shell（naked） | systemd 瞬态 unit |
+|---|---|---|
+| `app_pid` | 1563739 | 1563910 |
+| `worker_pid` | 1563810 | 1563960 |
+| `manager_pid` | 1563800 | 1563951 |
+| `manager_process_created` / `_alive` | `true` / `true` | `true` / `true` |
+| `manager_cgroup` | `…/claude.slice/delegate-dlg-20261004-041532-14a6d3.service` | `…/app.slice/cw-http-fatal-1563582-3127a8b7.service` |
+| 退出后 `/proc/<manager_pid>` | 不存在 | 不存在 |
+
+测试侧断言：`manager_pid` 是与 `app_pid`、`worker_pid` 都不同的真实非空整数；created 与
+alive 都为 True；argv 与 cgroup 非空；退出后 Manager 与 worker 都必须从 `/proc` 消失；
+unit cgroup `cgroup.procs` 为空。
+
+**红验**（单处回移，测试与 fixture 保持最终版）：
+`git show da854b2:core/server/app.py > core/server/app.py`（未动 index、未改历史），
+跑 `-k startup` → `2 failed, 11 deselected in 75.91s`，两条都是目标 `AssertionError`
+（`探针主进程在 30.0s 内没有退出（pid=… alive=True）` / systemd 侧
+`ActiveState='active'`），日志里同时可见 `manager_pid` 非空且
+`manager_process_alive=true`——即 Manager 确实活过而进程不退。还原后转绿。
+
+### 9.3 定向五轮（真实五轮，不是「五轮级别」）
+
+原报告用「两 whole + 定向」称「5 轮级别」，本卡不接受该替代。本轮实跑：
+
+| 套件 | 轮次 | 结果 |
+|---|---|---|
+| 定向 8 case（4 个进程边界用例 × naked/systemd） | 5 轮 | `8 passed` ×5（3.69s / 3.73s / 3.75s / 3.86s / 4.48s） |
+| `tests/test_http_cleanup.py` + `tests/test_http_supervision.py`（24 case） | 5 轮 | `24 passed` ×5（18.35s / 18.63s / 18.24s / 21.84s / 21.39s） |
+
+### 9.4 双版本全量
+
+| 依赖 | 结果 |
+|---|---|
+| `websockets==15.0.1`（固定） | `459 passed, 3 skipped, 149 warnings` |
+| `--with websockets`（解析到 `17.2`） | `459 passed, 3 skipped, 149 warnings` |
+
+skip 身份与前文一致（ForceAligner 两项 + Silero-VAD/onnxruntime 一项），HTTP decode 未 skip。
+原两套 `459 passed, 3 skipped` 作为历史结论保留，本轮实测值与之一致。
+
+### 9.5 两次未复现的间歇红（如实记录，不当绿灯）
+
+本轮观察到 **两次** 间歇失败，都没能留下断言输出（当时只保留了输出末行），此后无法复现：
+
+1. 定向 8-case 集合的早期一轮：`1 failed, 5 passed`（断言未捕获）。
+2. `websockets==17.2` 全量第一轮：`1 failed, 458 passed, 3 skipped`（断言未捕获）。
+
+其后累计 **61 轮**未复现：8-case 定向 38 轮、24-case 定向 8 轮、全量 15 轮
+（latest 4 轮 + pinned 4 轮 + 本节之前 7 轮中已含的 3 轮）。因此不能宣称「零失败」，
+也不能宣称已定位。
+
+已知且**未修**的结构性薄弱点（本卡选择报告而不是加防御）：
+
+- 端口选取是 bind-and-release 的 TOCTOU：本卡新增的 `_free_port()` 与既有
+  `tests/test_http_supervision.py`、`tests/test_http_file_runner.py` 的同名 helper 同形。
+  若端口在释放与探针 bind 之间被占，探针会以「端口被占用」非零退出，
+  `test_normal_sigterm_still_exits_zero` / `test_http_disabled_…` 会转红。
+  修它需要「重选端口」式重试，正是卡面禁止的自动 retry；且该假设未被证实。
+- 真实 systemd user manager 的时序：`_wait_unit_loaded` 20s、`wait_exit` 30s、
+  `wait_report` 120s 都已留足余量，纯超时不足以解释两秒级完成的失败。
+
+本轮实际修掉的一处 run-to-run 干扰源：`ProbeRun.cleanup()` 在 systemd 分支不再遗留
+自己起的 `systemd-run --wait` 子进程给 pytest。
+
+### 9.6 本轮预算
+
+- 相对 `9ef0e52`：**2 文件，add=63 / del=2**（target 250 / hard 400，未超）。
+- 相对 `da854b2`（C2 累计）：**6 文件，add=1230 / del=19**。
+- 原报告「5 files」的记账错误在本卡按实际 6 文件更正；原报告正文保留不改写。
+
 ## 8. 尚属未知的部分
 
 - 未在真实 GPU/CPU 生产负载与真实模型权重下验证；ASR 引擎与权重按卡面 stub。
 - 未做 systemd `Restart=on-failure` 的端到端重启实测；本卡验证的是「进程以非零状态
   真正退出 + 子进程被回收」，这正是重启能被触发的前提。
-- `Manager` 进程在 `http_init_failure` 模式下由 `ProcessManager.stop()` 关闭，
-  该模式下没有单独断言其 PID 消失（fatal 与 sigterm 两条都断言了）。
+- `Manager` 进程在 `http_init_failure` 模式下的 PID 消失断言由补交轮（§9.2）补上；
+  仍未知的是它在真实生产部署下的 shutdown 耗时分布。
 - 主干基线 API 派发时即不可用（`gh api request failed`），继承红未能判定。
+- §9.5 记录的两次间歇红未能定位，属于本卡明确的未解决项。
+
