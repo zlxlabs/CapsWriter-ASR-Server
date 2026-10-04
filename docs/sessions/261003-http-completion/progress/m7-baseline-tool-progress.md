@@ -33,3 +33,12 @@
 
 - 主干 CI 基线派发时不可用，继承红暂时无法判定。
 - 本卡公开记录只写匿名 fixture ID、字节数和指标；原文、素材路径/哈希、字幕与 SDK 结果正文留在派发私有目录。
+
+## M7-A 续交补充（2026-10-04）
+
+- 指南现列出独立 CLI 的既有导入依赖 `rich`、`colorama`，并说明 SDK 默认 WebSocket v2 使用 flac 编码的 UTF-8 JSON/Base64；`status=ok` 只表示采集完成。HTTP 超时可能已有服务端任务，指南只提供一次性的 SDK 状态查询示例，明确保留 recovery、不自动删除/重试/恢复/取消，也说明 Linux 权限结论不覆盖 Windows ACL。
+- 新增 timestamp 形状测试：空列表、多 token 非单调、闭区间端点、越界和非均匀时间戳；三 token HTTP 结果通过 SDK Transcript 到 CLI 私有 JSON 字节落盘路径断言。现有静态 producer fixture 是实际 SDK 合成序列化契约；续交卡正式把它列入允许范围，但本次无需重生或修改它。脚本、SDK 与服务行为未改。
+- 裸 `env -i` 和真实 systemd 用户级 one-shot unit 各执行 HTTP、WS v2 一次，共四次；均使用本轮新造的 0.25 秒合成 WAV 和本机 TCP stub，仅验证隔离 CLI、协议往返、argv/env 与私有文件权限，不代表 ASR 质量，也未读取旧素材或模型。
+- 本地 targeted 两版本各 `11 passed`。全量 websockets `15.0.1` 为 `457 passed, 3 skipped, 149 warnings`；最新解析 `17.2` 同为 `457 passed, 3 skipped, 149 warnings`。三个 skip 是两项 ForceAligner 依赖和一项 silero VAD/onnxruntime 依赖缺失；无 HTTP decode skip。两条反向 AssertionError 变异均实际变红并已精确还原。
+- PR #64 在 `587f219` 的 GitHub CI 中：未固定 websockets 单测 `SUCCESS`；`15.0.1` 单测有 1 项既有监督集成测试失败（`test_real_process_body_idle_timeout_is_not_fatal_and_releases_port`，456 passed/3 skipped）。测试等待 `HTTP_LISTENER_READY` 超时，捕获 stdout 含 `HTTP_DISABLED` 初始化行；测试 helper 没有把子进程 stderr 放入失败消息，故根因未定。按续交卡未重跑 CI、未改该测试/服务器、未加 timeout。gate quality、path classify 和 draft aggregator 为 `SUCCESS`；primary 为 `SKIPPED`，PR 仍是 draft。
+- Scope-Globs 已正式由续交卡覆盖 producer fixture；续交范围的 scope 检查通过，所有实际变更文件都在授权路径中。PR #64 仍 open、base `master`、draft；禁止 ready、merge 或 deploy。

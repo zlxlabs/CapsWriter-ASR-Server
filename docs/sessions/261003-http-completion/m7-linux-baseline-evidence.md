@@ -52,3 +52,16 @@ HTTP 模式将 `--protocol http --server http://127.0.0.1:<HTTP_PORT>` 替换 WS
 - 全量 `tests/` 固定 websockets `15.0.1`：`452 passed, 3 skipped`。最新 `17.2`：`452 passed, 3 skipped`。两次的三个既有 skip 均为两项 ForceAligner 集成依赖缺失和一项 silero VAD/onnxruntime 集成依赖缺失，没有 HTTP decode skip。
 - 本次只在 Linux CPU Paraformer、该固定服务 SHA、这一组匿名素材上验证；没有跨平台实测、生产服务启动、对外上传或部署。
 - 字幕来源未核实；工具不测 CPU/RSS、TCP/TLS/WS frame/link payload，不测客户端网络重传，也不据 CER 宣称绝对准确率。
+
+## 续交卡环境隔离 smoke（2026-10-04）
+
+此项只验证 CLI 命令、依赖闭包、HTTP/WS 往返和私有落盘；使用本轮新生成的 0.25 秒/8,044 字节合成 WAV 与仅监听 loopback 的本地协议 stub，没有使用真实模型、旧素材、字幕或生产服务。stub 的 health SHA 为测试值，不代表任何 server build。四次结果均 `status=ok`、2 tokens/2 timestamps；这是采集成功，不是识别质量结论。
+
+| 环境 | 协议 | 匿名 ID | 结果文件字节 | 应用层 producer 事实 |
+| --- | --- | --- | ---: | --- |
+| 裸 `env -i` 白名单 | WS v2 | `m7-bare-ws-03` | 2,951 | 1 个文本帧；JSON UTF-8 13,161 字节；二进制帧 0 |
+| 裸 `env -i` 白名单 | HTTP | `m7-bare-http-01` | 4,031 | 5 个请求；控制 JSON 197 字节；1 个 PATCH、8,044 body 字节；重发 0 |
+| systemd 用户级 one-shot unit | WS v2 | `m7-systemd-ws-01` | 2,954 | 1 个文本帧；JSON UTF-8 13,161 字节；二进制帧 0 |
+| systemd 用户级 one-shot unit | HTTP | `m7-systemd-http-01` | 4,034 | 5 个请求；控制 JSON 197 字节；1 个 PATCH、8,044 body 字节；重发 0 |
+
+两环境均逐字运行加入 `rich` 与 `colorama` 的独立 CLI 命令。实际进程 argv/env 捕获和四个 CLI 私有 JSON 的原始字节、SHA-256 与权限检查保留在派发私有目录；结果文件权限均为 `0600`。这组桩服务结果不扩展上面的 Linux Paraformer 质量或媒体测量结论。
