@@ -473,12 +473,30 @@ async def test_upload_failure_is_not_masked_by_final_when_both_tasks_done(
     original_connect = websockets.connect
     original_receive = sdk_client._receive
     original_wait = asyncio.wait
+    original_create_task = asyncio.create_task
     receive_ready = asyncio.Event()
-    release_receive = asyncio.Event()
     release_server = asyncio.Event()
+    loop = asyncio.get_running_loop()
+    upload_gate = loop.create_future()
+    receive_gate = loop.create_future()
     upload_task = {}
     receive_task = {}
     observed_same_done = []
+
+    def tracked_create_task(coro, *args, **kwargs):
+        task = original_create_task(coro, *args, **kwargs)
+        code = getattr(coro, "cr_code", None)
+        if (
+            code is not None
+            and code.co_filename == sdk_client.__file__
+            and code.co_name == "upload"
+        ):
+            upload_task["task"] = task
+        elif code is tracked_receive.__code__:
+            receive_task["task"] = task
+        return task
+
+    monkeypatch.setattr(asyncio, "create_task", tracked_create_task)
 
     class FailingSendConnection:
         def __init__(self, context_manager):
@@ -493,11 +511,9 @@ async def test_upload_failure_is_not_masked_by_final_when_both_tasks_done(
             return await self.context_manager.__aexit__(*args)
 
         async def send(self, message):
-            upload_task["task"] = asyncio.current_task()
             await self.ws.send(message)
             await receive_ready.wait()
-            release_receive.set()
-            await asyncio.sleep(0)
+            await upload_gate
             raise OSError("connection reset by peer")
 
         async def recv(self):
@@ -511,12 +527,14 @@ async def test_upload_failure_is_not_masked_by_final_when_both_tasks_done(
     monkeypatch.setattr(sdk_client.websockets, "connect", failing_connect)
 
     async def tracked_receive(ws, *, on_progress, idle_messages):
-        receive_task["task"] = asyncio.current_task()
         result = await original_receive(
             ws, on_progress=on_progress, idle_messages=idle_messages
         )
         receive_ready.set()
-        await release_receive.wait()
+        # Queue both task resumptions before asyncio.wait handles either completion.
+        loop.call_soon(upload_gate.set_result, None)
+        loop.call_soon(receive_gate.set_result, None)
+        await receive_gate
         return result
 
     async def tracked_wait(tasks, *args, **kwargs):
@@ -524,6 +542,13 @@ async def test_upload_failure_is_not_masked_by_final_when_both_tasks_done(
         upload = upload_task.get("task")
         receive = receive_task.get("task")
         if upload is not None and receive is not None and upload in tasks and receive in tasks:
+            # Test-only scheduler gate: wait for both real SDK tasks to finish before
+            # returning the actual completed Task identities as one decision set.
+            if upload not in done or receive not in done:
+                together, _ = await original_wait(
+                    {upload, receive}, return_when=asyncio.ALL_COMPLETED
+                )
+                done = done | together
             observed_same_done.append(upload in done and receive in done)
         return done, pending
 
@@ -551,7 +576,6 @@ async def test_upload_failure_is_not_masked_by_final_when_both_tasks_done(
             else:
                 assert False, "同轮合法 final 覆盖了 upload 的 send 异常"
         finally:
-            release_receive.set()
             release_server.set()
 
     assert caught_error is not None
@@ -1001,7 +1025,8 @@ async def test_websocket_connection_failure_maps_to_connection_lost(tmp_path, mo
     async with fake_v2_server(accept_and_finish) as (url, _):
         monkeypatch.setattr(sdk_client.websockets, "connect", refuse_connection)
         with pytest.raises(AsrError) as caught:
-            await transcribe_file(audio_path, url)
+            # 只验证连接异常映射；显式短预算避免该用例等待默认远端预算的取消收尾。
+            await transcribe_file(audio_path, url, deadline_total=2)
     assert caught.value.code == "connection_lost"
 
 
