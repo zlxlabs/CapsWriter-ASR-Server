@@ -129,7 +129,7 @@ m4 曾写「app.py 暂不改」针对的是清理任务挂在 `HttpServer.serve/
 ### 红验（scratch `35439fe`，注入行已 grep）
 
 1. `_drain_after_fatal` 提前 `return`：`test_http_startup_failure...[naked-shell]` → `AssertionError`（探针 30s 未退出，Manager 当时仍活着）。scratch SHA 与注入行确认。
-2. cleanup 年龄改 `created_at`：store 边界测试 → `AssertionError: assert not True`（不该删的源还在）。 
+2. cleanup 年龄改 `created_at`：store 边界测试 → `AssertionError: assert not True`（不该删的源还在）。
 
 恢复后审查树仍 `78d2278`，产品三文件对 `35439fe` diff 为空。无 `.venv` shebang 污染。
 
