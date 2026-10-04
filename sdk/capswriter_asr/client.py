@@ -365,25 +365,41 @@ async def _transcribe_connected(
         async def idle_watch() -> None:
             await upload_done.wait()
             while True:
+                # 用 asyncio.wait 而不是 asyncio.wait_for：后者在 Python ≤3.11 上会在
+                # 「令牌到达与 task.cancel() 落在同一 tick」时吞掉取消
+                # （asyncio/tasks.py：except CancelledError: if fut.done(): return fut.result()），
+                # 于是本协程吞掉这一轮取消后又进入下一轮全新等待，而那次取消已被消费，
+                # 永远等不到新的取消 —— finally 里的 gather 便永久挂起（issue #65）。
+                # asyncio.wait 的内部 _wait 没有这个分支，取消一定向上抛。
+                getter = asyncio.ensure_future(idle_messages.get())
                 try:
-                    await asyncio.wait_for(idle_messages.get(), timeout=idle_timeout)
-                except TimeoutError as exc:
-                    raise AsrError("timeout", "上传结束后等待服务端消息超时") from exc
+                    done, _ = await asyncio.wait({getter}, timeout=idle_timeout)
+                    if not done:
+                        raise AsrError("timeout", "上传结束后等待服务端消息超时")
+                finally:
+                    getter.cancel()
 
         upload_task = asyncio.create_task(upload())
         receive_task = asyncio.create_task(
             _receive(ws, on_progress=on_progress, idle_messages=idle_messages)
         )
         idle_task = asyncio.create_task(idle_watch())
-        tasks = {upload_task, receive_task, idle_task}
+        # ordered 决定多个任务同时完成时的上抛顺序；tasks 只交给 asyncio.wait。
+        ordered = (upload_task, receive_task, idle_task)
+        tasks = set(ordered)
         try:
             while True:
                 done, _ = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
-                for task in done:
-                    result = task.result()
-                    tasks.remove(task)
-                    if task is receive_task:
-                        return result
+                if receive_task in done:
+                    # 裁决：final 与其他任务同时完成时以 final 为准——服务端已经给出
+                    # 可用结果，上传或 idle 侧的失败不应把一次成功转录改判为失败。
+                    tasks.discard(receive_task)
+                    return receive_task.result()
+                # 其余任务报错：按 upload → idle 的固定顺序上抛，不依赖 set 遍历顺序。
+                for task in ordered:
+                    if task in done:
+                        task.result()
+                tasks.difference_update(done)
         finally:
             for task in tasks:
                 task.cancel()
