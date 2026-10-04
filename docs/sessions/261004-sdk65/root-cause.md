@@ -43,7 +43,7 @@ eccec1a69b81c4a2360d33e15f0ddb8adffb85725dc93d41f8e3150a0863f6c7  ← 修后
 
 3.10 修前那一格同时暴露第 5 节的继承缺陷（抛的是裸 `asyncio.TimeoutError`，不是约定的 `AsrError`）。
 
-## 4. getter 只 cancel 不 await —— 实测无收益，故不加
+## 4. getter 清理：保留真实 Task 身份验证，不增加 await
 
 `idle_watch` 每轮新建 `getter = ensure_future(idle_messages.get())`，`finally` 里只 `getter.cancel()`。
 是否需要再 `await` 回收？做了注入实验：只删掉 `await asyncio.gather(getter, return_exceptions=True)`
@@ -57,8 +57,14 @@ eccec1a69b81c4a2360d33e15f0ddb8adffb85725dc93d41f8e3150a0863f6c7  ← 修后
 两者完全一致：`_transcribe_connected` / `transcribe_file` 的 `finally` 里的 `gather` 会把事件循环驱动
 到 getter 收尾。**结论：不加那次 `await`**。
 
-同时把测试里的 `_pending_sdk_tasks()` 断言范围改回只收 SDK 自己的协程名：先前把 `Queue.get`
-也收进去，注入实验显示**它转不红**（恒真断言），按纪律撤掉而不是留着装样子。
+前一轮把 `Queue.get` 按协程名塞进 `_pending_sdk_tasks()`，实际注入时断言转不红，已撤掉。
+本轮改为包住 `asyncio.ensure_future`：仅当传入协程的代码对象是 `asyncio.Queue.get`，且调用来源
+是 SDK 的 `client.py` 时，保存该次调用返回的真实 `Task`。final 正常返回、服务端 error 和调用方取消
+三条路径都先等到该 Task 已创建，再断言追踪集合非空且每个 Task 已结束。把 `getter.cancel()` 单独删掉的
+临时变异在取消路径明确失败：`AssertionError` 显示捕获到的 `Queue.get` Task 仍为 pending。
+
+这验证的是当前 `cancel()` 已执行后 getter 能收尾；它不主张额外 `await gather(getter)` 有收益，前一节
+注入实验仍说明本地同步入口没有可观察差异，因此不增加那次 await。
 
 ## 5. 继承红：3.10 上 `except TimeoutError` 抓不到 `asyncio.TimeoutError`（**本卡未修**）
 
@@ -80,7 +86,7 @@ SDK 套件在 3.10 上的有界对照（同一命令，只换被测代码）：
 与 #65 的「收到 final 后不返回」不是同一根因（本卡根因在 3.11 上成立，而 3.11 的别名是好的），
 因此**本卡不动**。建议单独收敛「SDK 声明 `requires-python >= 3.10` 但 CI 只跑 3.12」这个缺口。
 
-## 6. 存量另作追踪：`upload` / `deadline_watch` 的同形态隐患
+## 6. 外部取消响应延迟：与 #65 final 收尾主缺陷分开记录（P2，接受本轮不修）
 
 `/tmp/sdk65_shapes_measure.py` 在真实解释器上的有界测量（每形态 `shield` + 2s 上界）：
 
@@ -95,36 +101,51 @@ python=3.12
   C_deadline_watch(事件)  : OK 取消已传播
 ```
 
-**这推翻了本报告早期版本「B/C 吞掉取消后会自终止」的断言**——那次取消已被消费，下一轮并没有待投递的
-取消，B/C 与 A 一样会挂死。已在本卡删除该断言。
+**这推翻了本报告早期版本「B/C 吞掉取消后会自终止」的断言**：那次取消已被消费，下一轮并没有待投递的
+取消。隔离形态证明这些 `wait_for` 存在风险，但不单独证明每条真实调用都会永久挂起。
 
-未决问题（留给后续单）：
+独立审查在真实 SDK 公共调用路径上确认 `upload` / `deadline_watch` 的取消竞态可达，观测结果为**有限取消
+响应延迟**，不是 #65 的 final 已收到后永久卡在 `idle_watch` 收尾：
 
-- `upload`：形态会挂死，但在本 SDK 里需要「`ws.send()` 完成与 `_transcribe_connected` 收尾的
-  `task.cancel()` 同刻」才触发。本次整链复现是**单帧**上传，未覆盖多帧中途收尾，**可达性未证**。
-- `deadline_watch`：形态会挂死，但其取消来自 `transcribe_file` 的 `finally`，而 `deadline_changed.set()`
-  只在 `set_deadline` 里发生一次、且在建连之前；要同刻需要远端调用在建连瞬间就结束，**可达性未证**。
+- Python 3.11.15 上 `deadline_changed` 等待者与 `transcribe_file` 调用方取消落在同一调度窗口，首次取消
+  300ms 内未结束；任务快照含 `deadline_watch`（`cancelling=1`）和 `Event.wait`，再次取消后才结束。
+- 另一个真实发送 Future 同拍取消探针在 `idle_timeout=0.25` 下耗时 0.252s，随后启动下一帧 send 并关闭
+  连接；Python 3.12.3 同一探针耗时 0.001s。
+- 最终 SDK 任务和连接均已收尾；没有观察到错误结果被当成功、数据损坏或崩溃。
 
-两者都**未改**，也不在报告里断言它们无害。
+原始输出：`/tmp/sdk65-review1-boundaries311.log`、`/tmp/sdk65-review1-boundaries312.log`、
+`/tmp/sdk65-review1-send-cancel.log`（审查 verdict 见 `reviews/independent-review1-verdict.md`）。按本仓
+`internal` 风险档的评审两问，这条路径真实可触发，但当前证据只显示有限响应延迟且最终清理，判为 **P2，
+接受本轮不修**。本轮不加防御逻辑；不把该路径写成不可达，也不把它与 #65 final 主缺陷合并为一个
+根因。
 
-## 7. 「同拍完成」不可确定性构造（一个被扬弃的测试构造）
+## 7. 同轮错误与 final：从偶然并发改为屏障证明
 
-曾构造「upload 与 receive 在同一个事件循环批次里收尾」用来验证裁决顺序：服务端一发出 final，
-客户端卡在最后一帧上的 `send` 就立刻失败。**实测该构造不可靠**——upload 是否恰好停在最后一帧的
-`ws.send()` 上取决于真实 socket 时序：
+早期用例依赖真实 socket 时序让最后一帧 send 与 final 偶然并发；它在 3.12 修前红、3.11 修后绿，不能
+稳定保证两个 SDK 子任务进入同一个 `asyncio.wait` 的 `done` 集合，因此不能证明 I4。
 
-| 运行 | 被测代码 | 结果 |
-| --- | --- | --- |
-| 3.12 修前 | sha `ff476ad7` | 红：`Failed: DID NOT RAISE AsrError`（返回了 Transcript，上传失败被吐掉） |
-| 3.11 修前 | sha `ff476ad7` | 红：同上 |
-| 3.12 修后 | sha `eccec1a6` | 绿 |
-| 3.11 修后 | sha `eccec1a6` | **红**：`Failed: DID NOT RAISE AsrError`——同一场景两种结果 |
+`test_upload_failure_is_not_masked_by_final_when_both_tasks_done` 现在使用屏障：
 
-因此该用例**不能当断言**，已换成顺序完全确定的 `test_upload_failure_is_not_masked_by_final`
-（`send` 一律失败、`recv` 始终挂起），锁的仍是「上传失败不被改判成成功转录」这条契约。
-原始日志：`/tmp/sdk65_py311_PREFIX_red.log`、`/tmp/sdk65_py311_POSTFIX_green.log`。
-从 3.11 修后那一格能看出：final 先到、upload 仍挂在真实 send 上时，返回 Transcript 是**正确**行为
-（此时上传不是失败，是我们自己取消的），不能拿来当缺陷证据。
+1. fake server 先收到 SDK 实际序列化的 final 帧，保存帧内 `task_id`，再按同 UUID 发合法 final；
+2. send 包装器先把原帧实际送到服务端，等 `_receive` 真正解析完 final 后才抛 `OSError`；
+3. 接收协程先恢复一轮事件循环，测试包装的 `asyncio.wait` 记录 upload/receive 的 Task 身份，并断言同一次
+   返回的 `done` 同时包含两者；
+4. 把错误优先判据单独变异成「先返回 final」，测试以明确 `AssertionError` 转红。
+
+修后 Python 3.12.3：该用例 `1 passed`。final 优先变异红日志：
+`/tmp/sdk65_final_priority_red_20261004_dlg-20261004-074109-52b55e.log`。
+这条测试证明同轮已有 send 异常时不返回 Transcript；它不把“send 尚未失败、只是客户端在取消它”的情形当成上传错误。
+
+### 慢上传与上传后 idle 的屏障
+
+`test_receive_idle_budget_does_not_fire_during_slow_upload` 用五帧、每次 send 延迟 0.5s、`idle_timeout=1s`。
+第四帧实际到达服务端且最后一帧仍被屏障挡住时，已经超过 idle 预算；测试断言调用仍活着、SDK 尚未收到
+服务端消息、idle getter 尚未创建。释放最后一帧后，服务端继续保持静默，测试再断言上传后 getter 已创建、
+调用以 `AsrError(code="timeout")` 结束，且五次 send 各自仍低于 send timeout。
+
+把 `idle_watch` 中的 `await upload_done.wait()` 单独移除后，屏障用例以 `AssertionError` 转红：上传尚未
+抵达最终帧就被 idle 结束。红日志：
+`/tmp/sdk65_idle_before_upload_done_red_20261004_dlg-20261004-074109-52b55e.log`。
 
 ## 8. 卡面 Narrow-Verify 命令退出码 2 的实际原因（继承问题，非本卡引入）
 
@@ -170,5 +191,5 @@ ERROR tests/test_sdk_client.py
 
 - 生产**尚未**升级到本修复；本卡不接触生产、不部署、不重启、不改配置。
 - 未做下游 `VideoTranscriptAPI` 的端到端验收（不在本卡授权范围）。
-- `upload` / `deadline_watch` 的可达性未证（第 6 节）。
+- Python 3.11.15 公共取消路径存在有限响应延迟，本轮按 P2 接受不修（第 6 节）；这不是 #65 final 收尾主缺陷。
 - 3.10 的超时分类缺陷未修（第 5 节）。

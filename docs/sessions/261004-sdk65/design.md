@@ -71,17 +71,16 @@ python=3.12
   C_deadline_watch(事件)  : OK 取消已传播
 ```
 
-即：**三种形态在 ≤3.11 上都会挂死**。
+即：**隔离形态在 ≤3.11 上都会挂死**。这证明这些 `wait_for` 的取消语义风险，不单独证明每条真实
+SDK 调用都会永久挂起。
 
 - `idle_watch`：已在整链上实证可达并复现（2.2），本卡修它。
-- `upload`：形态本身会挂死，但在本 SDK 里需要「`ws.send()` 完成与 `_transcribe_connected` 收尾的
-  `task.cancel()` 同刻」才触发；本次整链复现是单帧上传，未覆盖到多帧中途收尾。**可达性未证**。
-- `deadline_watch`：形态本身会挂死，但其 `wait_for` 的取消来自 `transcribe_file` 的 `finally`，
-  而 `deadline_changed.set()` 只在 `set_deadline` 里发生一次、在建连之前；要同刻需要远端调用
-  在建连瞬间就结束。**可达性未证**。
-
-按本轮卡面要求，后两者**另作存量追踪**（见 `root-cause.md` 第 6 节），本卡不改，也不再用
-「它们会自终止」这类未证断言把它们排除在视野之外。
+- `upload` / `deadline_watch`：独立审查在真实 SDK 公共调用路径上确认取消竞态可达，观察到的是有限响应
+  延迟：3.11.15 上调用方取消时的 `deadline_watch` 首次未在 300ms 内结束；发送 Future 同拍取消耗时
+  0.252s（`idle_timeout=0.25`），之后启动下一帧 send 并关闭连接。相同发送探针在 3.12.3 为 0.001s。
+- 最终 SDK 任务和连接都已收尾；未观察到错误结果、数据损坏或崩溃。这条外部取消路径与 #65 final 已收到后
+  `idle_watch` 永久挂起的主缺陷不同。按 `internal` 风险档判为 **P2，接受本轮不修**，不新增防御逻辑；
+  见 `root-cause.md` 第 6 节和 `reviews/independent-review1-verdict.md`。
 
 ## 3. 最小方案
 
@@ -104,9 +103,10 @@ finally:
 
 **关于 `getter.cancel()` 后要不要再 `await` 回收**：做过注入实验（把 `await gather(...)` 那行删掉，
 其余不动），用同步入口子进程在真实 3.11 上跑，`exit` 与 stderr 完全一致，`Task was destroyed but
-it is pending!` 计数为 0。原因是 `_transcribe_connected` 的 `finally` 与 `transcribe_file` 的
-`finally` 里的 `gather` 都会把事件循环驱动到 getter 收尾。因此**不加**那次 `await`——没有证据支持
-它带来可观测收益，多加一行就是凭猜测的改动。
+it is pending!` 计数为 0。另有 `sdk_queue_getter_tasks` fixture 按 `Queue.get` 代码对象和 SDK `client.py`
+调用来源保存真实 getter Task，在 final 返回、服务端 error、调用方取消后断言集合非空且任务均 `done`。
+单独去掉 `getter.cancel()` 的取消路径变异使这条断言明确转红。因此保留现有 cancel，不增加没有可观察
+收益的 `await gather(getter)`。
 
 ### 3.2 同时完成的裁决：先上抛异常，再谈成功
 
@@ -128,32 +128,39 @@ tasks.difference_update(done)
 新实现只做一件事：**把这个不确定性变成确定的**，且保持原契约——**任何一个已完成子任务的异常都优先
 上抛**（上传失败不能因为之后收到了 final 就被改判成成功）。只有全部无异常时才返回 `Transcript`。
 
-**同拍场景不可确定性构造**：曾尝试构造「upload 与 receive 在同一事件循环批次里收尾」，实测该构造
-依赖 upload 是否恰好停在最后一帧的 `ws.send()` 上（取决于真实 socket 时序）——同一场景在 3.12 修前
-红、3.11 修后绿。因此**没有**把它写成断言，只保留顺序确定的 I5 用例；观察到的现象记录在
-`root-cause.md`。
+**同轮场景的确定性屏障**：`test_upload_failure_is_not_masked_by_final_when_both_tasks_done` 让 fake server
+先收到 SDK 实际序列化帧，再按帧内 UUID 回合法 final；send 包装器等 `_receive` 真正解析 final 后才抛
+`OSError`，并用一轮事件循环交错使 upload/receive 两个实际 Task 同时出现在同一个 `asyncio.wait done`
+集合。测试记录两者身份并断言集合成员，避免用 socket 的偶然时序代替机制证明。把错误优先逻辑变异成
+final 优先后，该测试产生明确 `AssertionError`。
+
+**慢上传屏障**：`test_receive_idle_budget_does_not_fire_during_slow_upload` 发五帧、每次 send 延迟 0.5s、
+`idle_timeout=1s`。第四帧已到服务端、最终帧仍在屏障上时，总上传已超过 idle 预算；测试断言调用仍活着、
+SDK 没收到消息、idle getter 尚未创建。放行最后一帧后服务端保持静默，断言上传完成后才启动 idle 并抛
+`AsrError(code="timeout")`。把 `await upload_done.wait()` 单独移除后，用例以 `AssertionError` 转红；日志
+见 `/tmp/sdk65_idle_before_upload_done_red_20261004_dlg-20261004-074109-52b55e.log`。
 
 ### 已否决方案
 
 | 方案 | 否决理由 |
 | --- | --- |
 | 把 `idle_watch` 删掉 | 删掉后接收侧就没有计时了：`_receive` 变成无界 `recv()`，接收侧 idle 预算消失，而「上传结束后长时间无消息」正是要检测的情况。正确的删法是**把计时归回 `_receive`**（在 recv 循环里按最后一条消息的时间判超时），保留上传后 idle 语义——那是另一个实现，不是本卡的最小改动 |
-| 三处 `wait_for` 一起换成 `asyncio.wait` | 2.3 证明 `upload` / `deadline_watch` 的形态在 ≤3.11 上同样会挂死，但**在本 SDK 里的可达性未证**。本轮卡面要求存量另作追踪；先改会掩盖「可达性到底如何」这个问题 |
+| 三处 `wait_for` 一起换成 `asyncio.wait` | 独立审查已确认外部取消响应延迟路径真实可达，但判为 P2 并接受本轮不修；本轮任务只收紧测试契约与披露，不扩大到生产机制改动 |
 | 给 `finally` 的 `gather` 加超时兜底 | 掩盖症状；挂死后仍要等超时，还会静默漏回收 |
 | 用 `sys.version_info` 分叉 | 把解释器差异扩散进业务代码；`asyncio.wait` 写法各版本语义一致 |
 | 用 `asyncio.timeout`（3.11+） | SDK 声明 `requires-python = ">=3.10"`，3.10 无此 API |
-| `getter.cancel()` 后补 `await` 回收 | 注入实验证明无收益（3.1），不加 |
+| `getter.cancel()` 后补 `await` 回收 | 同步子进程注入实验无可观察收益；本轮直接追踪 Task 身份证明当前 cancel 后能 done，故不加 |
 
 ## 4. 不变式与检测点
 
 | # | 不变式 | 锁它的测试 |
 | --- | --- | --- |
 | I1 | 收到合法 final 后立即返回正确 `Transcript`，**不依赖服务端关连接**，不遗留 SDK 任务 | `test_final_result_returns_without_server_close`（3.11 真实解释器上旧码红、修后绿） |
-| I2 | `_transcribe_connected` 收尾不无限等待 | 同上（10s 硬上界，超时即断言失败） |
+| I2 | `_transcribe_connected` 收尾不无限等待；真实 getter Task 在终态已完成 | final 返回、server error、调用方取消用例追踪非空 Task 身份并断言 `done`；final 主路径另有 10s 上界 |
 | I3 | 上传结束后真的没有消息，仍按 `idle_timeout` 抛 `AsrError(code="timeout")` | `test_idle_timeout_still_fires_after_upload` |
 | I4 | 服务端 `error`、发送失败、总预算超时、调用方取消仍按原契约上抛并回收 | 既有 `test_server_error_code_and_retryable_are_preserved` / `test_blocked_send_uses_idle_timeout` / `test_total_deadline_expires_despite_continuous_progress` / `test_close_without_error_frame_maps_to_connection_lost` + 新增 `test_caller_cancellation_propagates_and_reclaims` |
-| I5 | **上传失败不被改判成成功的转录** | `test_upload_failure_is_not_masked_by_final` |
-| I6 | 发送与接收并行：上传期间不被接收 idle 预算截断，上传完成后 idle 才生效 | `test_receive_idle_budget_does_not_fire_during_upload` |
+| I5 | 同一 done 集合中的合法 final 不掩盖 send 异常 | `test_upload_failure_is_not_masked_by_final_when_both_tasks_done`；屏障断言真实 upload/receive Task 同轮完成 |
+| I6 | 上传耗时远超 idle 预算期间不提前终止；上传结束且无消息后 idle 生效 | `test_receive_idle_budget_does_not_fire_during_slow_upload`；五帧每帧 send 均小于 idle timeout，总上传大于 1.8 倍预算 |
 | I7 | 跨序列化契约：fake server 只按**实际收到的帧**回 final（同 `task_id`、帧顺序、`is_final`、`samples_total`） | I1/I6 两例内的 `frames` 断言 |
 | I8 | `transcribe_file_sync` 走独立进程时同样及时返回 | `test_sync_entrypoint_returns_transcript_in_subprocess` |
 
@@ -163,5 +170,5 @@ tasks.difference_update(done)
 - 不动 `VideoTranscriptAPI` 或任何他仓（只读查证 Dockerfile 与 `.python-version`，4 次 `gh` 请求）。
 - 不推进本仓 HTTP 里程碑。
 - 不修 3.10 上 `except TimeoutError` 抓不到 `asyncio.TimeoutError` 的继承缺陷（`root-cause.md` 第 5 节）。
-- 不修 `upload` / `deadline_watch` 的同形态隐患（第 2.3 / 6 节，存量另作追踪）。
+- 本轮不修独立审查确认的外部取消响应延迟（P2，接受不修，见第 2.3 与 `root-cause.md` 第 6 节）；不将其描述为不可达。
 - 不宣称生产已修复：本卡只交付 SDK 侧代码与本地回归，生产升级与端到端验收由下游执行。

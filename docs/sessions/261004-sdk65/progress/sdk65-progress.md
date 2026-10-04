@@ -112,3 +112,30 @@
 
 - 关键决策 / 否决方案：见里程碑 4；本轮无新增否决。
 - 下一步唯一动作：交主脑验收 PR #66（保持 draft）。
+
+## 里程碑 6：独立审查后的测试契约收口（本轮）
+
+- 阶段：review-follow-up / verifying
+- 本段结论：
+  - 在当前分支集成独立 review verdict（提交内容来自 `8d6da46`、`b6ff415`）。原 cherry-pick 被仓库
+    `prepare-commit-msg` 因旧 Dispatch-Id/Task-Id trailer 拒绝；未绕过守卫，按两步内容重建为当前派发身份提交。
+  - verdict 支持 #65 final 主路径修复，无 P1；另实证 Python 3.11.15 的公共调用方取消会有有限响应延迟，
+    最终仍清理，按 `internal` 风险档记 P2、接受本轮不修。它与 final 收尾主缺陷分开记录，不写成不可达。
+  - `test_upload_failure_is_not_masked_by_final_when_both_tasks_done` 现在真实发出序列化 final 帧，按帧内 UUID
+    回合法 final；屏障让 send 异常与 receive Task 同轮进入 `asyncio.wait done`。final 优先变异产生
+    `AssertionError: 同轮合法 final 覆盖了 upload 的 send 异常`，日志 `/tmp/sdk65_final_priority_red_20261004_dlg-20261004-074109-52b55e.log`。
+  - `sdk_queue_getter_tasks` 通过 `Queue.get` 代码对象和 SDK `client.py` 调用来源保留真实 Task 身份；final、
+    服务端 error、调用方取消三条终态路径均断言集合非空且任务 `done`。在取消路径单独移除 `getter.cancel()`
+    后明确 AssertionError（捕获 Task 仍 pending），日志 `/tmp/sdk65_skip_getter_cancel_red_20261004_dlg-20261004-074109-52b55e.log`。
+  - 慢上传用例五帧、每次 send 延迟 0.5s、`idle_timeout=1s`；第四帧到达服务端后由屏障确认上传已超 idle
+    预算、调用仍活着且 SDK 未收消息，上传结束后才因静默触发 idle。提前启动 idle 的单行变异以
+    `AssertionError: 慢上传屏障未到达` 转红，日志 `/tmp/sdk65_idle_before_upload_done_red_20261004_dlg-20261004-074109-52b55e.log`。
+  - 早期红验发现：在 final 成功路径移除 getter cancel 仍全绿，因为 final 本身会唤醒 Queue.get；已改在 getter
+    挂起时的调用方取消路径验收。另把 `pytest.raises` 产生的 `Failed: DID NOT RAISE` 改成显式 `assert`，满足
+    卡面要求的 AssertionError 红。
+  - 初轮 3.12.3 关键用例为 `6 passed, 22 deselected in 3.85s`；之后只收紧 getter 来源过滤和慢上传屏障超时，
+    最终两文件绿测尚待下面长验证确认。
+- 关键决策 / 否决方案：不改 `sdk/capswriter_asr/client.py`；不加 getter await、预算、重试或取消防御逻辑；
+  外部取消延迟接受为 P2，不混入 #65 主缺陷。
+- 下一步唯一动作：用真实 Python 3.11 跑两份 SDK 测试文件 `-vv --durations=0`，外层 180 秒硬截止，记录逐用例
+  起止和本地 asyncio Task 栈以定位 135 秒长等待。
