@@ -407,8 +407,28 @@ async def run_ws_only_scenario(app) -> None:
 # ------------------------------------------------------------------ 入口
 
 
+def _redirect_output() -> None:
+    """把探针自己的 stdout/stderr 落成真实日志文件。
+
+    systemd 把 unit 输出交给 journald，而 journald 是异步落盘、并且已回收的
+    transient unit 事后未必还能按 unit 名检索。探针自己掌握一份文件，消费者
+    才有一个与进程退出无关的证据源。
+    """
+    target = os.environ.get("CW_PROBE_LOG")
+    if not target:
+        return
+    path = Path(target)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    handle = open(path, "wb", buffering=0)
+    os.dup2(handle.fileno(), 1)
+    os.dup2(handle.fileno(), 2)
+    sys.stdout = open(1, "w", buffering=1, errors="replace", closefd=False)
+    sys.stderr = sys.stdout
+
+
 def main() -> int:
     mode = os.environ.get("CW_PROBE_MODE", "fatal")
+    _redirect_output()
     _shorten_cleanup_interval()
     from core.server.app import CapsWriterServer
 

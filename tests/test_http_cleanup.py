@@ -872,6 +872,7 @@ def _probe_env(workdir: Path, mode: str) -> dict:
         "CW_ADDR": "127.0.0.1",
         "CW_PORT": str(_free_port()),
         "CW_PROBE_MODE": mode,
+        "CW_PROBE_LOG": str(workdir / "probe-process.log"),
         "CW_PROBE_WAV": str(workdir / "probe.wav"),
         "CW_PROBE_REPORT": str(workdir / "probe-report.jsonl"),
         "CW_PROBE_DENIAL_LOG": str(workdir / "probe-denial.jsonl"),
@@ -896,9 +897,11 @@ class ProbeRun:
         self.env = _probe_env(workdir, mode)
         self.report_path = Path(self.env["CW_PROBE_REPORT"])
         self.log_path = workdir / "probe.log"
+        self.process_log_path = Path(self.env["CW_PROBE_LOG"])
         self.exit_code = None
         self.control_group = None
         self._process = None
+        self._log = None
         self._unit = None
 
     # ---- 启动 ----
@@ -925,12 +928,10 @@ class ProbeRun:
                 argv, cwd=REPO_ROOT, stdout=self._log,
                 stderr=subprocess.STDOUT,
             )
-            # systemd-run 返回前 unit 才真正入队；否则后面的 show 读到的是
-            # “unit 不存在”的默认值（ActiveState=inactive），会被误判成已结束。
-            code = await asyncio.to_thread(self._process.wait, 30)
-            assert code == 0, (
-                f"systemd-run 没能创建 unit {self._unit}（rc={code}）：{self.log_tail()}"
-            )
+            # `systemd-run --wait` 返回时 unit 已被回收，且它的退出码就是被测行为。
+            # 先单独确认 unit 真的被创建出来（LoadState=loaded），才能把后续
+            # 看到的退出码当作 unit 的退出码而不是 systemd-run 自己的失败。
+            await self._wait_unit_loaded()
         else:
             env = dict(os.environ)
             env.update(self.env)
@@ -991,6 +992,22 @@ class ProbeRun:
             ) from exc
         return self.exit_code
 
+    async def wait_log(self, marker: str, timeout: float = 15.0) -> str:
+        """等真实日志里出现白名单标记。
+
+        journald 是异步落盘：unit 已经退出时那一行未必立刻可读。这里只是等它
+        到达，不会把「没有出现」当成通过。
+        """
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + timeout
+        tail = ""
+        while loop.time() < deadline:
+            tail = await asyncio.to_thread(self.log_tail)
+            if marker in tail:
+                return tail
+            await asyncio.sleep(0.1)
+        return tail
+
     def denial_records(self) -> list:
         path = Path(self.env["CW_PROBE_DENIAL_LOG"])
         if not path.exists():
@@ -1011,6 +1028,7 @@ class ProbeRun:
         return [int(line) for line in procs.read_text().split() if line.strip()]
 
     def log_tail(self, limit: int = 3000) -> str:
+        chunks = []
         if self.launcher == "systemd":
             import subprocess
 
@@ -1019,35 +1037,50 @@ class ProbeRun:
                  "--no-pager", "--output=cat"],
                 capture_output=True, timeout=30,
             )
-            text = probe.stdout.decode("utf-8", errors="replace")
-            journal = _whitelisted_log(text)[-limit:]
-            if journal:
-                return journal
-        if not self.log_path.exists():
-            return ""
-        return _whitelisted_log(
-            self.log_path.read_text(encoding="utf-8", errors="replace")
-        )[-limit:]
+            chunks.append(probe.stdout.decode("utf-8", errors="replace"))
+        for path in (self.process_log_path, self.log_path):
+            if path.exists():
+                chunks.append(path.read_text(encoding="utf-8", errors="replace"))
+        # 探针自己的进程日志与 systemd-run 输出合并后再过滤；
+        # 已被回收的 transient unit 不作为唯一证据源。
+        return _whitelisted_log("".join(chunks))[-limit:]
 
     # ---- 回收（只碰自己的 unit / 自己的进程组） ----
 
     async def cleanup(self) -> None:
+        """只回收本探针自己创建的 unit / 进程组。"""
         import subprocess
 
-        if self.launcher == "systemd" and self._unit is not None:
-            for verb in ("stop", "reset-failed"):
-                probe = subprocess.run(
-                    ["systemctl", "--user", verb, self._unit],
-                    capture_output=True, timeout=30,
-                )
-                del probe
-        elif self._process is not None:
-            try:
-                os.killpg(self._process.pid, signal.SIGKILL)
-            except ProcessLookupError:
-                pass
-            await asyncio.to_thread(self._process.wait, 10)
-            getattr(self, "_log", None) and self._log.close()
+        try:
+            if self.launcher == "systemd" and self._unit is not None:
+                for verb in ("stop", "reset-failed"):
+                    subprocess.run(
+                        ["systemctl", "--user", verb, self._unit],
+                        capture_output=True, timeout=30,
+                    )
+            elif self._process is not None:
+                try:
+                    os.killpg(self._process.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+                await asyncio.to_thread(self._process.wait, 10)
+        finally:
+            if getattr(self, "_log", None) is not None:
+                self._log.close()
+                self._log = None
+
+    async def _wait_unit_loaded(self, timeout: float = 20.0) -> None:
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + timeout
+        while loop.time() < deadline:
+            properties = await asyncio.to_thread(self._unit_properties)
+            if properties.get("LoadState") == "loaded":
+                return
+            await asyncio.sleep(0.05)
+        raise AssertionError(
+            f"systemd-run 没能创建 unit {self._unit}：{self._unit_properties()}；"
+            f"systemd-run 输出：{self.log_tail()}"
+        )
 
     def _unit_properties(self) -> dict:
         import subprocess
@@ -1225,7 +1258,10 @@ def test_fatal_cleanup_exits_process_and_reaps_children(tmp_path, launcher):
         "PermissionError", "injected source unlink denial",
     )
     assert fatal_report[0]["source"]["sha256"] == pre["source"]["sha256"]
-    assert "HTTP 未知 operation 失败" in run.log_tail()
+    fatal_log = asyncio.run(run.wait_log("HTTP 未知 operation 失败"))
+    assert "HTTP 未知 operation 失败" in fatal_log, (
+        f"日志里没有 listener 监督链的 fatal 记录：{fatal_log}"
+    )
 
 
 def _port_refused(port: int) -> bool:
@@ -1280,7 +1316,10 @@ def test_http_startup_failure_exits_nonzero_without_hanging_worker(tmp_path, lau
 
     code = asyncio.run(scenario())
     assert code != 0, f"HTTP 初始化失败必须非零退出，实际 {code}：{run.log_tail()}"
-    assert "HTTP 存储初始化失败" in run.log_tail(), run.log_tail()
+    startup_log = asyncio.run(run.wait_log("HTTP 存储初始化失败"))
+    assert "HTTP 存储初始化失败" in startup_log, (
+        f"日志里没有真实装配失败记录：{startup_log}"
+    )
     assert run.cgroup_pids() == [], (
         f"unit cgroup 里仍残留进程：{run.cgroup_pids()}"
     )

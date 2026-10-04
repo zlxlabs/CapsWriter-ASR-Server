@@ -125,6 +125,10 @@ class CapsWriterServer:
         同步启动服务端 (主入口)
 
         注册信号处理、拉起子进程并进入网络服务监听循环。
+
+        正常 SIGINT/SIGTERM 走 stop() 收尾并以 0 退出；启动期装配失败与运行期
+        的任何 fatal 都先按同一顺序回收资源，再以非零退出——不能出现「端口已关、
+        识别子进程还在」而进程本身不退出（监督看不到退出，也就不会重启）。
         """
         # 防连续触发
         if self.is_alive: return
@@ -135,30 +139,58 @@ class CapsWriterServer:
 
         self._print_banner()
 
-        # 拉起识别子进程
-        self.process_manager.start()
-
-        # 装配 HTTP listener：显式启用后任何初始化错误都 fail fast 非零退出，不退回 disabled
-        http_settings = resolve_http_settings()
-        if http_settings is not None:
-            self.http_server = HttpServer(self, *http_settings).prepare()
-            # 装配真实文件 runner：ffmpeg 不可用时同样 fail fast，不假受理
-            self.http_file_runner = HttpFileRunner(self.state, self.http_server)
-            self.http_server.attach_runner(self.http_file_runner)
-            self.state.http_result_sink = self.http_file_runner.result_sink
-
-        # 开启网络服务监听 (接管当前线程直至退出)
         try:
+            # 拉起识别子进程
+            self.process_manager.start()
+
+            # 装配 HTTP listener：显式启用后任何初始化错误都 fail fast 非零退出，不退回 disabled
+            http_settings = resolve_http_settings()
+            if http_settings is not None:
+                self.http_server = HttpServer(self, *http_settings).prepare()
+                # 装配真实文件 runner：ffmpeg 不可用时同样 fail fast，不假受理
+                self.http_file_runner = HttpFileRunner(self.state, self.http_server)
+                self.http_server.attach_runner(self.http_file_runner)
+                self.state.http_result_sink = self.http_file_runner.result_sink
+
+            # 开启网络服务监听 (接管当前线程直至退出)
             self.loop.run_until_complete(self._serve_all())
         except RuntimeError:
-            # 正常信号会先将 is_alive 置 False，再由收尾回调 stop loop。
-            # 运行中的 listener RuntimeError 必须继续失败，不能按正常退出处理。
+            # 正常信号会先将 is_alive 置 False，再由收尾回调 stop loop；
+            # 这条路径的收尾已经由 stop() 发起，不再重复。
             if self.is_alive:
-                if self.exit_code:
-                    raise SystemExit(self.exit_code)
+                # 运行中的 listener RuntimeError 必须继续失败，不能按正常退出处理；
+                # 但同样要先回收资源（见下面 except 分支的说明）。
+                self.exit_code = self.exit_code or 1
+                self._drain_after_fatal()
                 raise
+        except BaseException as fatal:
+            # 启动期的装配失败与运行期的监督 fatal 同一条 root：异常本身只把
+            # 监听关掉，识别子进程、共享 Manager、ffmpeg 解码进程与 I/O 线程
+            # 只在 stop() 里回收。不回收就是“端口已关、子进程还活着”的假存活，
+            # systemd 看到进程还在就不会重启，真实的不可用被报成存活。
+            #
+            # 回收完再原样重抛：traceback 仍由解释器打到 stderr（既有诊断口径），
+            # 进程以非零状态真正退出，监督才能看到并重启。
+            self.exit_code = self.exit_code or 1
+            logger.error("服务端启动/运行失败，按非零退出收尾：%r", fatal)
+            self._drain_after_fatal()
+            raise
         if self.exit_code:
             raise SystemExit(self.exit_code)
+
+    def _drain_after_fatal(self) -> None:
+        """fatal 之后把既有 stop() 真正跑完，并观察它的异步收尾。
+
+        复用 stop()（不再造第二套回收顺序）：它把 HTTP 收尾挂在 loop 的 done
+        callback 上，只有回到事件循环里跑到那个 callback 才算“等到了”，否则
+        等于只发起了收尾。异常在 finish_http_shutdown 里被读到并转成 exit_code，
+        在途 I/O 也不会被 loop.stop 取消。
+
+        HTTP 未启用时 stop() 同步停 loop，没有 future 可等，直接返回。
+        """
+        self.stop()
+        if self.http_server is not None:
+            self.loop.run_forever()
 
     async def _serve_all(self):
         """WS 与 HTTP 两条监听并行；任一真实失败让进程以非零退出。"""
