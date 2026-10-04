@@ -120,10 +120,24 @@ python=3.12
 根因。
 
 本轮 3.11.15 首次两文件整测中，`test_websocket_connection_failure_maps_to_connection_lost` 用默认预算耗时
-120.093s；单测复跑为 120.09s，设置 `deadline_total=2` 后同一错误映射断言 0.07s 通过。它与 `transcribe_file`
-重置远端预算后在 `finally` gather `deadline_watch` 的路径吻合，最可能是该 timer 的取消被 `wait_for` 吞掉后
-等到默认预算结束；两次现场都只取得 selector 空等的线程栈，没有拿到 async Task 栈，所以此归因仍是推断，
-不能排除 fixture 收尾。用例现显式设 2s，只验证错误映射；独立 review 已记录的公共取消延迟仍按 P2 接受不修。
+120.093s；单测复跑为 120.09s，设置 `deadline_total=2` 后同一错误映射断言 0.07s 通过。当时只取得 selector
+空等的线程栈，归因只能写为推断。
+
+第二轮独立复核（`reviews/independent-review2-verdict.md`，`pass`）用独立探针
+`/tmp/sdk65_review2_probe_connrefused.py`（真实 fake server + monkeypatch connect 拒绝，外层
+`asyncio.wait_for` 170s 硬截止 + shell `timeout 200`）把该推断升级为 **async Task 栈级实证**：
+
+- 显式 `deadline_total=2`：0.097s 返回 `AsrError(code="connection_lost")`；
+- 默认预算：**120.145s** 后正确交付同一个 `AsrError(code="connection_lost")`（≈ 默认预算 120s）；
+- t+2s 时 `task.get_stack()`（非 selectors 线程栈，`/tmp/sdk65_review2_stackprobe.py`）：
+  `transcribe_file` 停在 client.py:538 `await asyncio.gather(operation_task, timer_task, …)`，
+  `deadline_watch` 停在 client.py:516 `await asyncio.wait_for(deadline_changed.wait(), …)` →
+  `tasks.py:476 await waiter`，且 `cancelling=1`——取消确被 3.11 `wait_for` 吞掉，`gather` 等到预算结束
+  才放行已算好的错误。
+
+该路径与 #65 的 final 收尾主缺陷**不是同一条**：错误码正确、延迟有界（≤ 默认预算）、外部取消 2s 内可
+中断，且 `deadline_watch` 是存量代码（本 diff 未触碰）。维持 P2 接受不修，只披露不新增机制；用例显式
+设 2s 只验证错误映射契约，不掩盖此披露。
 
 ## 7. 同轮错误与 final：从偶然并发改为屏障证明
 

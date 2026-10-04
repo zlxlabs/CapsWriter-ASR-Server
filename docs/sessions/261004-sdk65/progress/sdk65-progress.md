@@ -169,3 +169,23 @@
 - 阶段：delivered
 - 本段结论：PR #66 正文已更新且仍 OPEN / draft；分支已 push，远端分支与 PR head SHA 同为 `23ebf69fdf0dd0ea6b46e5af438dfc990b60d894`。
 - 下一步唯一动作：写完整 delegate 回执到派发报告路径。
+
+## 里程碑 10：集成第二轮独立复核 verdict 与收尾交付
+
+- 阶段：verifying
+- 本段结论：
+  - 集成独立 review2 verdict（源提交 `8d3c92afcfc6ecdd7c32d1f57e8020e67ecea7d6`，结论 **pass**）到
+    `reviews/independent-review2-verdict.md`；仅把 `- failure-visibility: clean` 改为顶格
+    `failure-visibility: clean` 以兼容 extract 脚本，不改动任何审查结论。cherry-pick 被
+    prepare-commit-msg 守卫拒绝（旧 Dispatch-Id/Task-Id trailer 与当前 DELEGATE_* 冲突），改为按当前派发
+    身份正常提交同内容，未绕过 hook。
+  - `origin/master` 仍为 base `820c3a2e`，主干未推进，无需 merge。
+  - `root-cause.md` 第 6 节与 `design.md` 2.3 中「默认连接拒绝 120s 归因仍是推断」更新为 review2 的
+    async Task 栈级实证：默认预算 120.145s 后正确交付 `AsrError(connection_lost)`；t+2s 时
+    `transcribe_file` 停 client.py:538 `gather`、`deadline_watch` 停 client.py:516
+    `wait_for(deadline_changed.wait())`、`cancelling=1`。与 #65 final 收尾主缺陷区分，P2 接受不修；
+    3.10 `TimeoutError` 别名继承差异仍披露；无生产/下游验收。
+  - `sdk/capswriter_asr/client.py` 与 `tests/` 本轮未改（代码与测试已冻结审过）。
+- 关键决策 / 否决方案：本轮只写文档 + 验证 + PR ready；不重复 OCR、不再开独立 review。
+- 下一步唯一动作：3.12 全量 tests/ 与 3.11 两文件窄测；绿后更新 PR #66 标题正文并 `gh pr ready`，
+  用 ci-watch 等完整 CI/gate，区分 SUCCESS 与 SKIPPED。

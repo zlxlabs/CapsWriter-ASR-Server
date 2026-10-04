@@ -79,9 +79,10 @@ SDK 调用都会永久挂起。
   延迟：3.11.15 上调用方取消时的 `deadline_watch` 首次未在 300ms 内结束；发送 Future 同拍取消耗时
   0.252s（`idle_timeout=0.25`），之后启动下一帧 send 并关闭连接。相同发送探针在 3.12.3 为 0.001s。
 - 本轮 3.11.15 整文件首跑中，连接拒绝映射用例用了默认预算并耗时 120.093s；单测复跑 120.09s，
-  改成显式 2s 预算后同断言 0.07s 通过。时长与默认远端预算一致，最可能是 `deadline_watch` 取消后被
-  `transcribe_file` 的 `gather` 等到预算结束；异步任务栈没有抓到，故这是路径归因，不是栈级实证。用例已设
-  显式短预算，只验证连接错误映射。
+  改成显式 2s 预算后同断言 0.07s 通过。第二轮独立复核（`reviews/independent-review2-verdict.md`）已把该
+  归因升级为 async Task 栈级实证：默认预算 120.145s 后正确交付 `AsrError(connection_lost)`；t+2s 时
+  `transcribe_file` 停在 client.py:538 `gather`，`deadline_watch` 停在 client.py:516
+  `wait_for(deadline_changed.wait())`，`cancelling=1`。用例已设显式短预算，只验证连接错误映射。
 - 最终 SDK 任务和连接都已收尾；未观察到错误结果、数据损坏或崩溃。这条外部取消路径与 #65 final 已收到后
   `idle_watch` 永久挂起的主缺陷不同。按 `internal` 风险档判为 **P2，接受本轮不修**，不新增防御逻辑；
   见 `root-cause.md` 第 6 节和 `reviews/independent-review1-verdict.md`。
