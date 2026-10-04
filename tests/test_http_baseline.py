@@ -129,7 +129,7 @@ def _http_response_for_fixture(request, *, source_size=None, job_state="QUEUED")
             "task_id": "job-fixture", "is_final": True, "duration": 0.01,
             "time_start": 1.0, "time_submit": 2.0, "time_complete": 3.0,
             "text": "private-transcript", "text_accu": "Hello, WORLD!",
-            "tokens": ["private-token"], "timestamps": [0.002],
+            "tokens": ["Hello", ",", "WORLD!"], "timestamps": [0.001, 0.004, 0.009],
         })
     raise AssertionError((method, path))
 
@@ -264,7 +264,7 @@ async def test_cli_http_producer_payload_and_private_json_bytes(tmp_path):
     assert summary["producer_payloads"]["http_patch_request_count"] == 1
     assert summary["producer_payloads"]["http_retransmitted_bytes"] == 0
     assert b"private-transcript" not in stdout
-    assert b"private-token" not in stdout
+    assert b"WORLD!" not in stdout
     assert b"sample.wav" not in stdout
     assert b"Hello" not in stdout
     assert b"private-env-sentinel" not in stdout
@@ -282,13 +282,56 @@ async def test_cli_http_producer_payload_and_private_json_bytes(tmp_path):
     assert stat_mode(private_file) == 0o600
     private_document = json.loads(output_bytes)
     assert private_document["result"]["text"] == "private-transcript"
-    assert private_document["result"]["tokens"] == ["private-token"]
+    assert private_document["result"]["tokens"] == ["Hello", ",", "WORLD!"]
+    assert private_document["result"]["timestamps_s"] == [0.001, 0.004, 0.009]
+    assert private_document["result"]["token_count"] == 3
+    assert private_document["result"]["timestamp_count"] == 3
+    assert private_document["result"]["timestamps_monotonic"] is True
+    assert private_document["result"]["timestamps_cover_tokens"] is True
+    assert private_document["result"]["timestamps_within_duration"] is True
+    assert private_document["result"]["timestamps_within_source_duration"] is True
     assert private_document["reference"]["text"].startswith("1\n")
     assert len([item for item in server.requests if item["method"] == "PATCH"]) == 1
 
 
 def stat_mode(path):
     return path.stat().st_mode & 0o777
+
+
+@pytest.mark.parametrize(
+    "tokens,timestamps,duration,source_duration,expected",
+    [
+        pytest.param([], [], 0.01, 0.01, (True, False, False, False), id="empty"),
+        pytest.param(
+            ["a", "b", "c"], [0.004, 0.002, 0.009], 0.01, 0.01,
+            (False, True, True, True), id="multi_nonmonotonic",
+        ),
+        pytest.param(
+            ["a", "b"], [0.0, 0.01], 0.01, 0.01,
+            (True, True, True, True), id="inclusive_endpoints",
+        ),
+        pytest.param(
+            ["a", "b"], [-0.001, 0.010001], 0.01, 0.01,
+            (True, True, False, False), id="out_of_range",
+        ),
+        pytest.param(
+            ["a", "b", "c"], [0.001, 0.004, 0.009], 0.01, 0.01,
+            (True, True, True, True), id="nonuniform_timestamps",
+        ),
+    ],
+)
+def test_result_metric_boundary_shapes(tokens, timestamps, duration, source_duration, expected):
+    transcript = ws_client.Transcript(
+        text="synthetic", text_accu="synthetic", tokens=tokens, timestamps=timestamps,
+        duration=duration, raw={}, task_id="task-shape", is_final=True,
+    )
+    metrics = baseline._result_metrics(transcript, source_duration)
+    assert metrics["token_count"] == len(tokens)
+    assert metrics["timestamp_count"] == len(timestamps)
+    assert metrics["timestamps_monotonic"] is expected[0]
+    assert metrics["timestamps_cover_tokens"] is expected[1]
+    assert metrics["timestamps_within_duration"] is expected[2]
+    assert metrics["timestamps_within_source_duration"] is expected[3]
 
 
 @pytest.mark.asyncio
