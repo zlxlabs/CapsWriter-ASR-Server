@@ -586,6 +586,21 @@ def make_pcm_container(tmp_path: Path, name: str, *, seconds: float, rate: int, 
     return target
 
 
+def decoded_pcm_bytes(path: Path) -> bytes:
+    """独立跑一次真实 ffmpeg，拿完整 16 kHz mono f32le PCM 字节。
+
+    不调用 runner 的 `FileSourceDecoder`，也不复用它的任何状态；只是用固定 argv
+    直接跑系统里的真 ffmpeg，作为「这段音频真实内容」的参照系。
+    """
+    process = subprocess.run(
+        [FFMPEG, "-nostdin", "-hide_banner", "-loglevel", "error",
+         "-i", str(path), "-ar", "16000", "-ac", "1", "-f", "f32le", "pipe:1"],
+        check=True, capture_output=True,
+    )
+    assert len(process.stdout) % 4 == 0
+    return process.stdout
+
+
 RESAMPLE_MATRIX = [
     {"name": "stereo44.wav", "rate": 44100, "channels": 2},
     {"name": "mono8k.wav", "rate": 8000, "channels": 1},
@@ -600,7 +615,9 @@ async def test_resampled_sources_produce_bounded_16k_mono_f32_segments(
     """组 10：44.1 kHz 立体声 / 8 kHz 单声道经真 ffmpeg 后仍是有界 16 k mono f32 段。
 
     关键不变式：段样本数之和等于独立跑一次真 ffmpeg 得到的样本数（真的重采样+降混，
-    不是把原始字节搬过去）；每段 `samplerate=16000`、字节数是 4 的倍数、单段有界；
+    不是把原始字节搬过去）；**worker 实际收到的每段 PCM 内容逐段等于独立真 ffmpeg
+    解出的同一段**（只比长度/前缀/sample_count 会被「同长度全零 PCM」骗过）；
+    每段 `samplerate=16000`、字节数是 4 的倍数、单段有界；
     送进 worker 的 PCM 字节明显少于源文件字节（没有把整文件交给 worker）。
     """
     ffmpeg_log = install_recording_ffmpeg(tmp_path, monkeypatch)
@@ -609,6 +626,8 @@ async def test_resampled_sources_produce_bounded_16k_mono_f32_segments(
     )
     source_bytes = source.stat().st_size
     expected_samples = decoded_sample_count(source)
+    reference_pcm = decoded_pcm_bytes(source)
+    assert len(reference_pcm) // 4 == expected_samples, (case, len(reference_pcm))
     recovery = tmp_path / "resume.json"
 
     async with running_runner_server(tmp_path) as harness:
@@ -650,6 +669,43 @@ async def test_resampled_sources_produce_bounded_16k_mono_f32_segments(
         )
         source_digest = sha256(source.read_bytes()).hexdigest()[:16]
         assert source_digest not in {item["data_sha256_prefix"] for item in segments}
+
+        # 逐段内容（组 10 的真正不变式）：子进程实际收到的 PCM 必须与独立真 ffmpeg
+        # 解出的同一段逐字节相同。摘要取自跨进程收到的 Task.data，不是父进程自造。
+        assert all(
+            item["data_sha256"].startswith(item["data_sha256_prefix"])
+            for item in segments
+        ), segments
+        cursor = 0
+        for index, item in enumerate(segments):
+            start = round(item["offset"] * WS_SAMPLE_RATE)
+            # 段起点必须与上一段的步长精确相接（切点吸附下步长由静音断点决定）
+            assert start == cursor, (case["name"], item["offset"], cursor)
+            expected = reference_pcm[start * 4:(start + item["samples"]) * 4]
+            assert len(expected) == item["data_bytes"], (
+                case["name"], start, item["samples"], item["data_bytes"],
+            )
+            # 参考段不能是全零：否则这段逐字节比对会退化成恒真断言
+            assert np.abs(np.frombuffer(expected, dtype="<f4")).max() > 0.0, (
+                f"{case['name']} offset={start} 的参考段全零，逐段比对变成恒真断言",
+            )
+            assert sha256(expected).hexdigest() == item["data_sha256"], (
+                case["name"], "offset", item["offset"], "samples", item["samples"],
+                "worker", item["data_sha256"], "ffmpeg", sha256(expected).hexdigest(),
+            )
+            if item["is_final"]:
+                assert start + item["samples"] == expected_samples, (
+                    case["name"], start, item["samples"], expected_samples,
+                )
+            else:
+                # 重叠边界：下一段必须真实复用本段尾部 overlap 个采样，不能错位也不能零重叠
+                overlap_samples = round(item["overlap"] * WS_SAMPLE_RATE)
+                assert overlap_samples > 0, (case["name"], item["overlap"])
+                assert overlap_samples < item["samples"], (case["name"], item["samples"])
+                cursor = start + item["samples"] - overlap_samples
+                assert round(segments[index + 1]["offset"] * WS_SAMPLE_RATE) == cursor, (
+                    case["name"], segments[index + 1]["offset"], cursor,
+                )
 
         # 解码 argv 仍固定为 16 kHz mono f32 管道
         starts = read_ffmpeg_starts(ffmpeg_log)
