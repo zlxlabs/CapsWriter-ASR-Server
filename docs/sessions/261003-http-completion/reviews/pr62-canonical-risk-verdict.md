@@ -8,7 +8,7 @@ failure-visibility: p2-only
 - 风险等级：internal。外部 major 不因模型评级直接 P1
 - spec：`docs/sessions/261001-http-files/design.md`、`qa.md`、`docs/sessions/261003-http-completion/m4-plan.md`
 - 本卡不是第 4 个全量 cold review；只处置官方 5 条
-- 私有证据（0700/600）：`/home/zlx/.local/state/delegate/dlg-20261004-170855-24eadd/evidence/`
+- 私有证据（目录 0700 / 文件 600）：dispatch `dlg-20261004-170855-24eadd` 的 `evidence/`（不入库）
 - 主干 CI 基线：派发时刻 `gh api` 失败，继承红未能判定
 
 ## 五条对照

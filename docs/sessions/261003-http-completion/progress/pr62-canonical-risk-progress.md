@@ -19,12 +19,14 @@
 
 ## 证据
 
-- `/home/zlx/.local/state/delegate/dlg-20261004-170855-24eadd/evidence/a1-persist.json`
-- `/home/zlx/.local/state/delegate/dlg-20261004-170855-24eadd/evidence/a1-refuted.json`（整条 A1 断言物理证伪）
-- `/home/zlx/.local/state/delegate/dlg-20261004-170855-24eadd/evidence/a2-stop-reentry.json`
-- `/home/zlx/.local/state/delegate/dlg-20261004-170855-24eadd/evidence/a3-scale.json`
-- `/home/zlx/.local/state/delegate/dlg-20261004-170855-24eadd/evidence/a4-a5-probe.json`
-- 脚本：同 dispatch 目录 `scripts/run_a{1,2,3,4a5}.py`
+私有目录（不入库）=`dlg-20261004-170855-24eadd/evidence/`：
+
+- `a1-persist.json`
+- `a1-refuted.json`（整条 A1 断言物理证伪）
+- `a2-stop-reentry.json`
+- `a3-scale.json`
+- `a4-a5-probe.json`
+- 脚本：同 dispatch 的 `scripts/run_a1.py`、`run_a2.py`、`run_a3.py`、`run_a4a5.py`
 
 ## 结论摘要
 
