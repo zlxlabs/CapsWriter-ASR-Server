@@ -39,3 +39,36 @@
 - 本地日志不能证明 provider 未收到内容，也不能证明日志覆盖了所有可能的外传路径；
   因此不作“无泄漏”结论。
 - 待负责人授权后再处理撤销/轮换和消费者核实；在此之前不把本次结果标为 ready 或安全。
+
+## 4. 纠正段（一次补交，保留首次记录）
+
+首次第 2 节的「URL 型 4、API key 0、password 0」是旧 matcher 的命中计数，**不是**「文件中无 key/password」的证明，也不把那 4 条 URL 改写成已确认凭据。本节不覆盖首次 envelope，只追加纠正后的分类契约结果。
+
+纠正夹具先用假值写出真实 PI `toolCall`/`toolResult` 包装形状，并读 producer 落盘字节：旧 matcher 对 `file:line:` / `N:` 前缀与同行后续字段漏检（RED），且把普通公共仓库 URL 错归为凭据型；新 matcher 对同一字节 GREEN。历史 8 项夹具仍保留，未静默覆盖。
+
+指定会话整文件 SHA、字节、inode、mode `0600` 与首次保全一致，未再 chmod。261 条记录全部解析；工具调用与结果仍各 132 条。`toolCall.arguments` 仅抽取操作枚举：`content_grep` 18、`metadata_query` 19、`git_remote` 1、`other_bash` 70、`unknown_operation` 24。**`profile_grep` / `profile_read` 为 0**：这份会话没有可证的原 profile 读取操作，不能把首次「profile 查询」叙事改写成已证实来源。
+
+纠正后分类计数：
+
+- `credential_bearing_url` 0；`ordinary_url` 9（含旧四条 URL 记录，均无 userinfo、无凭据型 query key）
+- 非空 `api_key` 1（公开标签 **Credential-A**）；非空 `password` 0
+- `ordinary_config` 49；`placeholder` 15；`unknown` 603（扩大命中后的剩余未知，不预定全是 secret，也不证明安全）
+
+旧四条 URL 记录的纠正身份（不是四条凭据）：
+
+- 记录 13 / 19 / 251：普通代码托管 URL，来源 `other_bash`，无认证成分；251 不是 `git_remote` 操作，不能借字段名当成 Git 凭据
+- 记录 29：同一行两条普通无认证 endpoint；旧 matcher 只吃到第一条
+- 另有一次真实 `git_remote`（记录 91）：普通代码托管指针，无 userinfo，不授权轮换 Git 凭据
+
+网络 / provider 接收边界与首次相同：无 request payload、无网络字节；120 条 assistant/provider 元数据仍只证明进入本地执行链，不能证明工具 stdout 被发到 provider。
+
+## 5. 可授权事件与停点
+
+仅 **Credential-A** 构成具体可授权事件：非空 named API token，来源是 `content_grep` 的 toolResult，不是 profile 读取；消费者服务类别 **unknown**，不得用变量名猜测 provider 或扩大轮换面。建议负责人授权：按自身凭据清单核对该 named token 的真实消费者并决定是否撤销/轮换。**尚未执行。**
+
+剩余 unknown / 一次停点（不另开审计卡，不对旧四条 URL 笼统全轮换）：
+
+- 本文件不能证明原自述的 profile 读取事件
+- Credential-A 的消费者与当前有效性未知
+- `unknown` 603 未逐条证伪
+- provider 是否收到 stdout 仍为 possible / unknown

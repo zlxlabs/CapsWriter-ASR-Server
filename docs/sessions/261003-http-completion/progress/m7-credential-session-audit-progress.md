@@ -23,3 +23,16 @@
 - 在处置完成前，不把本结果解释为“无泄漏”、ready 或凭据已失效。
 
 完整字段定位、匿名角色/工具名、时间、长度、匹配次数和文件保全元数据仅在私有报告中。
+
+## 纠正补交（保留首次进度，不洗旧计数）
+
+首次「URL 型 4 / API key 0 / password 0」只记录旧 matcher；本次不把它改写成「已证无 secret」。
+
+已完成：
+
+1. 假值 PI 实际包装形状夹具：旧 parser RED（前缀漏检 + 普通 URL 错归凭据），新 parser GREEN；v1 八项夹具历史保留。
+2. 内存关联 `toolCall.arguments` → callRef → 完整 stdout。操作枚举：`content_grep` 18、`metadata_query` 19、`git_remote` 1、`other_bash` 70、`unknown_operation` 24；**无 profile 读取操作**。
+3. 分类契约改为 `ordinary_url` / `credential_bearing_url` / `api_key` / `password` 等。旧四条 URL 记录均为普通 URL；公开标签 **Credential-A** 为 1 条非空 named API token（`content_grep`，消费者 unknown）。
+4. 整文件 SHA / 525422 bytes / inode / mode `0600` 未变；未再 chmod；未网络验证、未轮换。
+
+待负责人最小核查：只针对 Credential-A 的真实消费者与是否轮换。不对旧四条 URL 授权全轮换。一次补交后停止。
