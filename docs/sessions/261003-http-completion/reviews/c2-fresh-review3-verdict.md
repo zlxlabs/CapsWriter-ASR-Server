@@ -11,9 +11,9 @@ failure-visibility: clean
 
 ## OCR
 
-status: skipped
+status: fallback
 
-reason: `ocr-review` 主腿启动后超过 10 分钟 stdout 仍 0 字节，stderr 仅 `OCR failover progress: leg=primary event=start`，没有完整 JSON envelope。skipped 不是 passed。
+reason: primary=`leg_timeout`（minimax，elapsed_s=900.016）；backup:deepseek=success（elapsed_s=320.271）。envelope `status=reviewed_fallback`，`cli_status=complete`，`coverage=complete`，`findings=[]`。`verify.verify_status=skipped`（`verifier=none`，counts.total=0）。zero-finding 且 verifier skipped 不说 passed。无 finding，故无 P1 两问条目。
 
 ## 代码结论
 
@@ -62,5 +62,5 @@ m4 §3 的 `terminal_at + 7d < now` 与 T6「满 7 天」略有文案差；实�
 - `Process.start` 真实 OS 限额失败未建立。
 - e2e 老化把全部 UPLOADING 标过期，live 未到期 partial 未在该条链路单独保留（store 单测仍覆盖）。
 - 周期测试的解码器是测试替身；进程探针与 e2e 用真实 ffmpeg。
-- OCR skipped。
+- OCR fallback（主路超时、DeepSeek 备路成功、0 finding、verifier skipped，不说 passed）。
 - 主干 CI 基线未能拉取，继承红未能判定。

@@ -135,4 +135,4 @@ m4 曾写「app.py 暂不改」针对的是清理任务挂在 `HttpServer.serve/
 
 ### OCR
 
-`ocr-review` 对冻结范围启动后 >10 min stdout 仍 0 字节，stderr 只有 `leg=primary event=start`。记 skipped，不说 passed。
+事后 envelope：`status=reviewed_fallback`（三态记 fallback）。主路 minimax `leg_timeout` 900.016s 后降级；backup:deepseek 成功 320.271s。`findings=[]`，`verify_status=skipped`（verifier=none，total=0）。zero-finding + verifier skipped 不说 passed。无 finding，无 P1 两问表。
