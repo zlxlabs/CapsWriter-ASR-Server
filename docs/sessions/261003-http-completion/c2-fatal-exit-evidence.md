@@ -160,12 +160,12 @@ wrapper 线程在 future 已取消时 `set_exception` 抛 `InvalidStateError`。
 
 ```
 core/server/app.py                                                  49 / 17
-docs/…/c2-fatal-exit-evidence.md                                   157 /  0
-docs/…/progress/c2-cleanup-progress.md                             28 /  2
+docs/…/c2-fatal-exit-evidence.md                                   266 /  2
+docs/…/progress/c2-cleanup-progress.md                             48 /  2
 tests/fixtures/__init__.py                                           2 /  0
 tests/fixtures/http_fatal_exit_probe.py                            472 /  0
-tests/test_http_cleanup.py                                         522 /  0
-                                                     合计 add=1230 / del=19，共 6 文件
+tests/test_http_cleanup.py                                         522 /  1
+                                                     合计 add=1359 / del=19，共 6 文件
 ```
 
 `tests/fixtures/__init__.py` 是 fixture 包让 `python -m tests.fixtures.http_fatal_exit_probe`
@@ -248,11 +248,16 @@ skip 身份与前文一致（ForceAligner 两项 + Silero-VAD/onnxruntime 一项
 本轮实际修掉的一处 run-to-run 干扰源：`ProbeRun.cleanup()` 在 systemd 分支不再遗留
 自己起的 `systemd-run --wait` 子进程给 pytest。
 
-### 9.6 本轮预算
+### 9.6 本轮预算（最终，已含文档提交）
 
-- 相对 `9ef0e52`：**2 文件，add=63 / del=2**（target 250 / hard 400，未超）。
-- 相对 `da854b2`（C2 累计）：**6 文件，add=1230 / del=19**。
+- 相对 `9ef0e52`：**4 文件，add=194 / del=4**（target 250 / hard 400，未超）。
+  `tests/fixtures/http_fatal_exit_probe.py` +41/−1、`tests/test_http_cleanup.py` +22/−1、
+  本文件 +111/−2、progress +20/−0。
+- 相对 `da854b2`（C2 累计）：**6 文件，add=1359 / del=19**。
 - 原报告「5 files」的记账错误在本卡按实际 6 文件更正；原报告正文保留不改写。
+- `core/server/app.py` 在本卡 diff 中为 0 行：`git diff --quiet 9ef0e52 HEAD --
+  core/server/app.py` 返回 0，确认与 `9ef0e52` 逐字一致。
+- Scope 自检：累计 6 个文件逐一比对卡面 Scope-Globs，全部 IN-SCOPE，无越界文件。
 
 ## 8. 尚属未知的部分
 
