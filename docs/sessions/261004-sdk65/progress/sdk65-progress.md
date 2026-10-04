@@ -191,6 +191,11 @@
     `34 passed in 17.82s`，EXIT=0（`/tmp/sdk65_final_narrow311_20261004_dlg-20261004-085556-e4760d.log`）；
     两环境 websockets 均解析为 17.2。
   - PR #66 标题与正文已更新至准确范围（final 收尾主路径修复 + 两个独立 review pointer + P2/3.10 未修边界 +
-    未部署未下游验收），body 写入后回读比对一致。
-- 关键决策 / 否决方案：本轮只写文档 + 验证 + PR ready；不重复 OCR、不再开独立 review。
-- 下一步唯一动作：`gh pr ready 66` 触发完整 CI/gate，用 ci-watch.sh 等待，区分 SUCCESS 与 SKIPPED。 
+    未部署未下游验收），body 写入后回读比对一致。PR #66 已 `gh pr ready`（isDraft=false），触发完整 gate。CI 结果（head `52ce538`）：CI 工作流
+    run `37190995701` 两个单测 job（含 websockets==15.0.1 下限）均 SUCCESS；gate run `37191008208`
+    全绿：primary 真实执行 2m49s SUCCESS、quality/ocr(ocr-minimax)/gate/ledger 均 SUCCESS、
+    notify SKIPPED（预期）。另一 gate run `37190996145` 是 push 时 PR 仍为 draft 的旧 run，被 ready
+    触发的同组新 run 级联取消，其 `gate (draft)` 聚合器因 `quality job result is 'cancelled'` 报
+    FAILURE（`reason_code=quality_cancelled`）——非代码红，但 rollup 中仍可见，已如实上报主脑。
+- 关键决策 / 否决方案：本轮只写文档 + 验证 + PR ready；不重复 OCR、不再开独立 review；未合并、未关 issue。
+- 下一步唯一动作：提交本段 CI 回填并 push，以 ci-watch 复核最终 head 的 gate 全绿后写完整 delegate 回执。
