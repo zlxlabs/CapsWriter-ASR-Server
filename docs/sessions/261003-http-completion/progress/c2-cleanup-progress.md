@@ -2,11 +2,37 @@
 
 ## 当前阶段
 
-implementing：C2 实现、行为证据与双版本全量验证完成；PR #62 保持 draft，等待独立审查和 C1 合入顺序。
+reviewing（最新一段见下方「2026-10-04 P1 修复」）。C2 本体实现、行为证据与双版本全量
+验证已完成；review2 提出的 P1 已在 `card/http-m4-c2-fatal-exit-v2-261003` 修复。
+PR #62 保持 draft。
 
-## 本段结论
+## 本段结论（C2 本体，已完成）
 
 真实 HTTP listener、单 I/O worker、runner 和 TCP 客户端已证明：DONE 落库后 runner 仍持有 decoder 引用时源文件保留；runner 释放后周期任务删除源文件，HTTP 结果仍可领取。七天边界、DONE/FAILED、terminal_at/任务状态、partial、未登记文件、幂等重复清理、append/commit/终态写入各五轮并发 I/O、后台 fatal 与 shutdown 在途 I/O 均有断言。定向测试 `5 passed in 1.74s`。固定 `websockets==15.0.1` 与最新 `websockets==17.1` 两轮全量均 `451 passed, 3 skipped`。
+
+## 2026-10-04 P1 修复（dispatch `dlg-20261004-020729-1b9614`，Base `da854b2`）
+
+- 新不变式：`CapsWriterServer.start()` 从拉起子进程到监听循环结束之间的任何异常
+  （启动期装配失败与运行期 fatal 同一条 root）都先按既有 `stop()` 回收识别子进程、
+  共享 Manager、ffmpeg 解码进程与 I/O 线程，再让进程以非零状态真正退出。
+- 针对的 finding：review2 的 P1「运行中 cleanup fatal 只关监听、进程与 worker 仍存活」。
+- 根因不止「异常路径没走 stop」：`_register_exit_signals()` 装的是 asyncio 的
+  `_sighandler_noop`，fork 出的识别子进程继承后 SIGTERM 失效，解释器退出时的
+  `terminate()+join()` 永久阻塞——实测 app 停在 `do_wait`、worker 停在 `do_poll`。
+- 修法：fatal 时先 `stop()`，HTTP 已装配时再回事件循环跑一次 `run_forever()`
+  （HTTP 收尾挂在 loop 的 done callback 上，不回循环就只算发起），然后**原样重抛**，
+  traceback 仍走 stderr、退出码非零。正常 SIGINT/SIGTERM 与 HTTP disabled 语义不变。
+- 真实边界 fixture 入库 `tests/fixtures/http_fatal_exit_probe.py`：自有进程跑生产
+  `CapsWriterServer`（真 SocketManager/HttpServer/HttpFileRunner/worker/Manager/ffmpeg/
+  SQLite，只 stub ASR 引擎与权重初始化），2 s 合成 WAV，systemd 瞬态 unit 与裸 shell
+  两个真实消费环境各跑一次；env 白名单逐项传入，日志只取白名单行。
+- 红：回移 `core/server/app.py` 到 `da854b2` 后 fatal 与 HTTP 初始化失败四条红
+  （parent active / worker alive / 30 s 不退出），SIGTERM 与 disabled 四条仍绿。
+- 绿：定向 `24 passed`；全量固定 `websockets==15.0.1` 与最新 `websockets==17.2`
+  各 `459 passed, 3 skipped`（skip 身份与 C2 原证据一致，HTTP decode 未 skip）。
+- 未动已接受的两条 P2（主动 stop 重入漏观察、周期重复物化历史到期行）；未新增
+  state/账本/池/retry/fallback；未改 `http_store`、runner、SDK；未部署。
+- 证据：`docs/sessions/261003-http-completion/c2-fatal-exit-evidence.md`。
 
 ## 决策与否决
 

@@ -75,18 +75,6 @@ def _cgroup_path(pid: int) -> str:
     return ""
 
 
-def _pid_alive(pid) -> bool:
-    if not pid:
-        return False
-    try:
-        os.kill(int(pid), 0)
-    except ProcessLookupError:
-        return False
-    except PermissionError:
-        return True
-    return True
-
-
 def _sha256_file(path: Path) -> dict:
     if not path.exists():
         return {"exists": False, "bytes": 0, "sha256": None}
@@ -245,8 +233,6 @@ def _store_row(app, sql: str, params: tuple):
 
 async def run_fatal_scenario(app) -> None:
     """真实 DONE + 七天老化 + 释放引用后注入具体 unlink PermissionError。"""
-    import httpx
-
     token = "probe-fatal-token"
     data_dir = Path(os.environ["CW_HTTP_DATA_DIR"])
     payload = _write_probe_wav(Path(os.environ["CW_PROBE_WAV"]))
@@ -360,43 +346,26 @@ async def run_fatal_scenario(app) -> None:
     })
 
 
-async def run_sigterm_scenario(app) -> None:
-    """正常启动后向自己发 SIGTERM：主动 stop 必须保持 0 退出。"""
-    await _wait_until(
-        lambda: app.http_server is not None and app.http_server._bound_port,
-        "HTTP listener 未在期限内就绪",
-        timeout=60,
-    )
+async def run_ready_then_sigterm(app, mode: str, wait_http: bool) -> None:
+    """正常启动后向自己发 SIGTERM：主动 stop 必须保持 0 退出。
+
+    wait_http=True 用于显式启用 HTTP 的场景（等真实 HTTP listener），
+    False 用于 HTTP disabled（只等默认 WS listener）。
+    """
+    if wait_http:
+        ready = lambda: app.http_server is not None and app.http_server._bound_port
+    else:
+        ready = lambda: app.socket_manager._server is not None
+    await _wait_until(ready, "listener 未在期限内就绪", timeout=60)
     emit({
         "phase": "ready",
-        "mode": "sigterm",
-        "app_pid": os.getpid(),
-        "worker_pid": app.state.recognize_process.pid,
-        "manager_pid": app.process_manager._manager._process.pid,
-        "app_cgroup": _cgroup_path(os.getpid()),
-        "http_port": app.http_server._bound_port,
-        "ws_port": int(os.environ["CW_PORT"]),
-        "app_argv": _proc_cmdline(os.getpid()),
-    })
-    os.kill(os.getpid(), signal.SIGTERM)
-    await asyncio.sleep(3600)
-
-
-async def run_ws_only_scenario(app) -> None:
-    """HTTP disabled：只装配默认 WS，探针同样以 SIGTERM 收尾。"""
-    await _wait_until(
-        lambda: app.socket_manager._server is not None,
-        "WebSocket listener 未在期限内就绪",
-        timeout=60,
-    )
-    emit({
-        "phase": "ready",
-        "mode": "ws_only",
+        "mode": mode,
         "app_pid": os.getpid(),
         "worker_pid": app.state.recognize_process.pid,
         "manager_pid": app.process_manager._manager._process.pid,
         "app_cgroup": _cgroup_path(os.getpid()),
         "http_server_is_none": app.http_server is None,
+        "http_port": app.http_server._bound_port if app.http_server else None,
         "ws_port": int(os.environ["CW_PORT"]),
         "app_argv": _proc_cmdline(os.getpid()),
     })
@@ -449,12 +418,12 @@ def main() -> int:
         return 0
 
     _install_stubbed_inference()
-    scenario = {
-        "fatal": run_fatal_scenario,
-        "sigterm": run_sigterm_scenario,
-        "ws_only": run_ws_only_scenario,
-    }[mode]
-    app.loop.call_soon(asyncio.ensure_future, scenario(app))
+    scenario = (
+        run_fatal_scenario(app)
+        if mode == "fatal"
+        else run_ready_then_sigterm(app, mode, mode == "sigterm")
+    )
+    app.loop.call_soon(asyncio.ensure_future, scenario)
     app.start()
     return 0
 

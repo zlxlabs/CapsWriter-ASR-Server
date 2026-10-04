@@ -1148,15 +1148,6 @@ async def _wait_gone(pids, timeout: float = 15.0) -> list:
     return alive
 
 
-def _read_probe_db(data_dir: Path, sql: str, params: tuple = ()) -> list:
-    conn = sqlite3.connect(f"file:{data_dir / 'http.sqlite3'}?mode=ro", uri=True)
-    conn.row_factory = sqlite3.Row
-    try:
-        return conn.execute(sql, params).fetchall()
-    finally:
-        conn.close()
-
-
 PROBE_LAUNCHERS = [
     pytest.param(
         "naked", id="naked-shell",
@@ -1175,6 +1166,21 @@ PROBE_LAUNCHERS = [
 ]
 
 
+def _probe_session(run: "ProbeRun", phase: str | None):
+    """启动探针 → 等指定阶段报告 → 等进程退出；无论成败都只回收自己的 unit/进程组。"""
+    import asyncio
+
+    async def scenario():
+        await run.start()
+        try:
+            report = await run.wait_report(phase) if phase else None
+            return report, await run.wait_exit()
+        finally:
+            await run.cleanup()
+
+    return asyncio.run(scenario())
+
+
 @pytest.mark.parametrize("launcher", PROBE_LAUNCHERS)
 def test_fatal_cleanup_exits_process_and_reaps_children(tmp_path, launcher):
     """运行中 cleanup fatal：进程必须真的非零退出，识别子进程/Manager 必须被回收。
@@ -1187,17 +1193,7 @@ def test_fatal_cleanup_exits_process_and_reaps_children(tmp_path, launcher):
     workdir = tmp_path / "fatal"
     workdir.mkdir()
     run = ProbeRun(workdir, "fatal", launcher)
-
-    async def scenario():
-        await run.start()
-        try:
-            pre = await run.wait_report("pre_fatal")
-            code = await run.wait_exit()
-        finally:
-            await run.cleanup()
-        return pre, code
-
-    pre, code = asyncio.run(scenario())
+    pre, code = _probe_session(run, "pre_fatal")
 
     assert run.denial_records(), (
         "周期清理没有命中被注入 PermissionError 的那条具体源；"
@@ -1218,12 +1214,9 @@ def test_fatal_cleanup_exits_process_and_reaps_children(tmp_path, launcher):
     source = data_dir / "sources" / (
         run.denial_records()[0]["path"].rsplit("/", 1)[-1]
     )
-    assert source.read_bytes() is not None
-    import hashlib as _hashlib
-
-    assert _hashlib.sha256(source.read_bytes()).hexdigest() == pre["source"]["sha256"]
+    assert hashlib.sha256(source.read_bytes()).hexdigest() == pre["source"]["sha256"]
     assert source.stat().st_size == pre["source"]["bytes"] == pre["uploaded_bytes"]
-    rows = _read_probe_db(
+    rows = _read_db(
         data_dir,
         "SELECT j.state, j.terminal_at, u.state AS upload_state,"
         " (SELECT payload FROM results WHERE job_id=j.job_id) AS payload"
@@ -1234,7 +1227,7 @@ def test_fatal_cleanup_exits_process_and_reaps_children(tmp_path, launcher):
     assert len(rows) == 1
     row = rows[0]
     assert (row["state"], row["upload_state"]) == ("DONE", "COMMITTED")
-    assert _hashlib.sha256(str(row["payload"]).encode("utf-8")).hexdigest() == (
+    assert hashlib.sha256(str(row["payload"]).encode("utf-8")).hexdigest() == (
         pre["result_sha256"]
     )
     assert json.loads(row["payload"]) == pre["result_payload"]
@@ -1280,17 +1273,8 @@ def test_normal_sigterm_still_exits_zero(tmp_path, launcher):
     workdir = tmp_path / "sigterm"
     workdir.mkdir()
     run = ProbeRun(workdir, "sigterm", launcher)
+    ready, code = _probe_session(run, "ready")
 
-    async def scenario():
-        await run.start()
-        try:
-            ready = await run.wait_report("ready")
-            code = await run.wait_exit()
-        finally:
-            await run.cleanup()
-        return ready, code
-
-    ready, code = asyncio.run(scenario())
     assert code == 0, f"正常 SIGTERM 必须 0 退出，实际 {code}：{run.log_tail()}"
     assert ready["worker_pid"] and ready["manager_pid"]
     leftover = asyncio.run(_wait_gone([ready["worker_pid"], ready["manager_pid"]]))
@@ -1305,16 +1289,8 @@ def test_http_startup_failure_exits_nonzero_without_hanging_worker(tmp_path, lau
     workdir = tmp_path / "startup"
     workdir.mkdir()
     run = ProbeRun(workdir, "http_init_failure", launcher)
+    _report, code = _probe_session(run, None)
 
-    async def scenario():
-        await run.start()
-        try:
-            code = await run.wait_exit()
-        finally:
-            await run.cleanup()
-        return code
-
-    code = asyncio.run(scenario())
     assert code != 0, f"HTTP 初始化失败必须非零退出，实际 {code}：{run.log_tail()}"
     startup_log = asyncio.run(run.wait_log("HTTP 存储初始化失败"))
     assert "HTTP 存储初始化失败" in startup_log, (
@@ -1333,17 +1309,8 @@ def test_http_disabled_keeps_default_websocket_lifecycle(tmp_path, launcher):
     workdir = tmp_path / "wsonly"
     workdir.mkdir()
     run = ProbeRun(workdir, "ws_only", launcher)
+    ready, code = _probe_session(run, "ready")
 
-    async def scenario():
-        await run.start()
-        try:
-            ready = await run.wait_report("ready")
-            code = await run.wait_exit()
-        finally:
-            await run.cleanup()
-        return ready, code
-
-    ready, code = asyncio.run(scenario())
     assert ready["http_server_is_none"], "未提供 CW_HTTP_PORT 时不得装配 HTTP listener"
     assert code == 0, f"HTTP disabled 下 SIGTERM 必须 0 退出，实际 {code}：{run.log_tail()}"
     leftover = asyncio.run(_wait_gone([ready["worker_pid"], ready["manager_pid"]]))
