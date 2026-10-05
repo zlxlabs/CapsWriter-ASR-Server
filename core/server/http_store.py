@@ -588,7 +588,11 @@ class HttpStore:
         upload_id = str(uuid.uuid4())
         source_name = f"{upload_id}.bin"
         path = self._source_path(source_name)
-        fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_RDWR, 0o600)
+        fd = os.open(
+            path,
+            os.O_CREAT | os.O_EXCL | os.O_RDWR | getattr(os, "O_BINARY", 0),
+            0o600,
+        )
         try:
             if os.name == "posix":
                 os.fchmod(fd, 0o600)
@@ -651,7 +655,7 @@ class HttpStore:
         # 待处理结果预留后不足时，不写盘、不 ACK、offset 不前进
         self._check_physical_margin()
         path = self._source_path(row["source_name"])
-        fd = os.open(path, os.O_RDWR)
+        fd = os.open(path, os.O_RDWR | getattr(os, "O_BINARY", 0))
         try:
             # 未确认尾显式恢复：先按数据库 offset 截断，再写新块，绝不以文件长度冒充确认
             os.ftruncate(fd, confirmed)
