@@ -53,4 +53,3 @@ Task09 pin 481+3+1、无效 TMPDIR 6fail、Task10 两 493 绿、Task11 skipped�
 - 回修绿：`7f97e857cd04f96215ee5d9123ae7391a702bbf3`（只包 `_mark_fatal`）；后续压缩提交见 HEAD
 - same-turn 子进程仍在，与真实 WAV→HTTP→ffmpeg→worker→SQLite→unlinkDenied→**原 listener callback** 的裸/systemd 四 mode 分开
 - 旧两套 496+3 skip 记录保留，不覆盖；本回修后 cleanup 模块须重跑，旧 496 不能替新测试内容
-
