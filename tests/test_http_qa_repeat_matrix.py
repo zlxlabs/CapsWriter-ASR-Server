@@ -22,12 +22,8 @@ REQUIRED_PHASES = ("concurrency", "cancel_io", "restart", "legacy_ws")
 ARTIFACT_ENV = "M6_REPEAT_MATRIX_ARTIFACT_DIR"
 TRACE_NAME = "trace.json"
 SCHEMA_VERSION = 1
-_UNSAFE_IN_TRACE = re.compile(
-    r"(/home/|/Users/|\\\\Users\\\\)|"
-    r"\b(?:[0-9]{1,3}\.){3}[0-9]{1,3}\b|"
-    r"(api[_-]?key|token|secret|password)=",
-    re.I,
-)
+_CREDENTIAL_ASSIGN = re.compile(r"(api[_-]?key|token|secret|password)=", re.I)
+_IPV4 = re.compile(r"\b(?:[0-9]{1,3}\.){3}[0-9]{1,3}\b")
 
 
 def required_phases() -> tuple[str, ...]:
@@ -47,6 +43,22 @@ def resolve_artifact_dir() -> Path:
     return path
 
 
+def _json_contains_absolute_path(value: Any) -> bool:
+    """拒绝 JSON 值里的绝对路径，源码不写宿主机目录字面量。"""
+    if isinstance(value, str):
+        stripped = value.strip()
+        if stripped.startswith("/") or (
+            len(stripped) >= 3 and stripped[1] == ":" and stripped[0].isalpha()
+        ):
+            return True
+        return False
+    if isinstance(value, dict):
+        return any(_json_contains_absolute_path(item) for item in value.values())
+    if isinstance(value, list):
+        return any(_json_contains_absolute_path(item) for item in value)
+    return False
+
+
 def consume_repeat_matrix_trace(path: Path) -> dict[str, Any]:
     """独立消费者：读持久文件实际字节，缺轮次／缺相位／自贴标签都必须 AssertionError。
 
@@ -58,13 +70,15 @@ def consume_repeat_matrix_trace(path: Path) -> dict[str, Any]:
         raise AssertionError("五轮矩阵工件不存在: trace.json") from exc
     if not raw:
         raise AssertionError("五轮矩阵工件为空")
-    unsafe = _UNSAFE_IN_TRACE.search(raw.decode("utf-8", errors="replace"))
-    if unsafe:
-        raise AssertionError("工件含宿主机路径、IP 或凭据字段")
+    decoded = raw.decode("utf-8", errors="replace")
+    if _CREDENTIAL_ASSIGN.search(decoded) or _IPV4.search(decoded):
+        raise AssertionError("工件含凭据赋值或 IP")
     try:
         payload = json.loads(raw)
     except json.JSONDecodeError as exc:
         raise AssertionError(f"工件不是合法 JSON: {exc}") from exc
+    if _json_contains_absolute_path(payload):
+        raise AssertionError("工件含绝对路径")
     if not isinstance(payload, dict):
         raise AssertionError("工件根必须是 object")
     if payload.get("schema_version") != SCHEMA_VERSION:
