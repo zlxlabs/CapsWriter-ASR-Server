@@ -53,3 +53,5 @@ Task09 pin 481+3+1、无效 TMPDIR 6fail、Task10 两 493 绿、Task11 skipped�
 - 回修绿：`7f97e857cd04f96215ee5d9123ae7391a702bbf3`（只包 `_mark_fatal`）；后续压缩提交见 HEAD
 - same-turn 子进程仍在，与真实 WAV→HTTP→ffmpeg→worker→SQLite→unlinkDenied→**原 listener callback** 的裸/systemd 四 mode 分开
 - 旧两套 496+3 skip 记录保留，不覆盖；本回修后 cleanup 模块须重跑，旧 496 不能替新测试内容
+
+回修后两套全量（实测 HEAD `c1b608169b68b7eccdfd120cfbb80b1dd3f4aff4`；文档本段之后另提交，不冒已检）：`env -i` cleanup **18 passed / 0 skipped**。共享锁 `~/.cache/caps-http-261005-fullsuite.lock`：ws15.0.1 queue_s=0 exec_s=233.119 **498 passed / 3 skipped**；ws-unpinned(websockets 17.2) queue_s=0 exec_s=233.877 **498 passed / 3 skipped**。具名 skip 仍为 `test_aligner_integration.py:53`、`:62`、`test_segmenter.py:208`。**不是** systemd/ffmpeg/aiohttp skip。
