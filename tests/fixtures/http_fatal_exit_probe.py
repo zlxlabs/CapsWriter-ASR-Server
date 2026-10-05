@@ -18,6 +18,7 @@
   * ``http_init_failure``   HTTP 显式启用但数据目录无法初始化，回归启动失败路径；
                              在真实装配点记录已建好的共享 Manager 的 PID 与 /proc 事实。
   * ``ws_only``             不提供 CW_HTTP_PORT，回归默认 WS 与 HTTP disabled。
+  * ``same_turn_observer``  用真实 class method 与 ``loop.stop`` 同一 turn 验写盘。
 
 无论哪种模式，进程退出码就是被测行为本身：脚本不吞异常、不代替被测代码退出。
 """
@@ -46,6 +47,8 @@ PROBE_AUDIO_SECONDS = 2.0
 PROBE_AUDIO_MAX_BYTES = 1024 * 1024
 # 清理周期缩短到探针可观测的尺度；谓词本身仍是生产的七天 terminal_at 阈值
 PROBE_CLEANUP_INTERVAL_SECONDS = 0.05
+# 共用快照：worker 早绑定 class method；source 路径在 unlink 注入时才已知。
+_FATAL_SNAPSHOT: dict = {}
 
 
 # ------------------------------------------------------------------ 白名单事实
@@ -139,6 +142,41 @@ def _shorten_cleanup_interval() -> None:
     from core.server import http_server as server_module
 
     server_module.SOURCE_CLEANUP_INTERVAL_SECONDS = PROBE_CLEANUP_INTERVAL_SECONDS
+
+
+def _install_mark_fatal_observer() -> None:
+    """worker 构造前包装 class `_mark_fatal`，保留原 cleanup callback，并在写 fatal 后同步落盘。"""
+    from core.server import http_server as server_module
+
+    if getattr(server_module.HttpServer._mark_fatal, "_cw_probe_observed", False):
+        return
+    real_mark = server_module.HttpServer._mark_fatal
+
+    def observed_mark(self, exc: BaseException) -> None:
+        already = self.fatal is not None
+        real_mark(self, exc)
+        if already:
+            return
+        stored = self.fatal
+        if stored is None:
+            raise AssertionError("HttpServer._mark_fatal 执行后 fatal 仍未存储")
+        app = getattr(self, "_app", None)
+        worker = getattr(getattr(app, "state", None), "recognize_process", None)
+        emit({
+            "phase": "post_fatal",
+            "mode": os.environ.get("CW_PROBE_MODE", "fatal"),
+            "app_pid": os.getpid(),
+            "worker_pid": worker.pid if worker is not None else _FATAL_SNAPSHOT.get("worker_pid"),
+            "worker_alive": worker.is_alive() if worker is not None else None,
+            "fatal_type": type(stored).__name__,
+            "fatal_message": str(stored),
+            "source": _sha256_file(Path(source_path)) if (source_path := _FATAL_SNAPSHOT.get("source_path")) else None,
+            "job_id": _FATAL_SNAPSHOT.get("job_id"),
+            "observer": "HttpServer._mark_fatal",
+        })
+
+    observed_mark._cw_probe_observed = True
+    server_module.HttpServer._mark_fatal = observed_mark
 
 
 def _write_probe_wav(path: Path) -> bytes:
@@ -324,27 +362,38 @@ async def run_fatal_scenario(app) -> None:
         "uploaded_bytes": len(payload),
         "uploaded_sha256": hashlib.sha256(payload).hexdigest(),
     })
-
-    # 监督链被触发后 start() 会立刻进入收尾；这里等不到也不算失败，
-    # 报告已经落盘，消费方从外部观察 unit/进程退出即可。
-    try:
-        await _wait_until(
-            lambda: app.http_server.fatal is not None,
-            "周期清理的 unlink PermissionError 没有进入 listener 监督链",
-            timeout=30,
-        )
-    except AssertionError:
-        return
-    emit({
-        "phase": "post_fatal",
-        "mode": "fatal",
-        "app_pid": os.getpid(),
+    _FATAL_SNAPSHOT.clear()
+    _FATAL_SNAPSHOT.update({
+        "job_id": job_id,
+        "source_path": str(source_path),
         "worker_pid": app.state.recognize_process.pid,
-        "worker_alive": app.state.recognize_process.is_alive(),
-        "fatal_type": type(app.http_server.fatal).__name__,
-        "fatal_message": str(app.http_server.fatal),
-        "source": _sha256_file(source_path),
     })
+
+    return
+
+
+def run_same_turn_observer_contract() -> None:
+    from types import SimpleNamespace
+
+    from core.server.http_server import HttpServer
+
+    data_dir = Path(os.environ["CW_HTTP_DATA_DIR"])
+    data_dir.mkdir(parents=True, exist_ok=True)
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    app = SimpleNamespace(loop=loop, state=SimpleNamespace(recognize_process=None))
+    _FATAL_SNAPSHOT.clear()
+    _FATAL_SNAPSHOT.update({
+        "job_id": "same-turn-job",
+        "source_path": str(data_dir / "missing-source.bin"),
+    })
+    _install_mark_fatal_observer()
+    server = HttpServer(app, "127.0.0.1", 0, data_dir)
+
+    loop.call_soon(server._mark_fatal, PermissionError("injected source unlink denial"))
+    loop.call_soon(loop.stop)
+    loop.run_forever()
+    loop.close()
 
 
 async def run_ready_then_sigterm(app, mode: str, wait_http: bool) -> None:
@@ -438,6 +487,9 @@ def main() -> int:
     mode = os.environ.get("CW_PROBE_MODE", "fatal")
     _redirect_output()
     _shorten_cleanup_interval()
+    if mode == "same_turn_observer":
+        run_same_turn_observer_contract()
+        return 0
     from core.server.app import CapsWriterServer
 
     app = CapsWriterServer()
@@ -458,6 +510,8 @@ def main() -> int:
         return 0
 
     _install_stubbed_inference()
+    if mode == "fatal":
+        _install_mark_fatal_observer()
     scenario = (
         run_fatal_scenario(app)
         if mode == "fatal"
