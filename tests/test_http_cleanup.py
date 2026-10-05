@@ -1500,3 +1500,72 @@ async def test_mark_fatal_class_wrap_covers_worker_and_cleanup_done(tmp_path, mo
     finally:
         server_module.HttpServer._mark_fatal = original_mark
         server_module.HttpServer._on_source_cleanup_done = original_done
+
+
+def _jsonl_from_bytes(path: Path) -> list:
+    if not path.exists():
+        return []
+    return [
+        json.loads(line)
+        for line in path.read_bytes().decode("utf-8").splitlines()
+        if line.strip()
+    ]
+
+
+def test_install_keeps_original_source_cleanup_done_identity():
+    """install 只能包 _mark_fatal，生产 _on_source_cleanup_done 函数对象必须不变。"""
+    from tests.fixtures.http_fatal_exit_probe import _install_mark_fatal_observer
+
+    original_done = server_module.HttpServer._on_source_cleanup_done
+    original_mark = server_module.HttpServer._mark_fatal
+    try:
+        _install_mark_fatal_observer()
+        assert server_module.HttpServer._on_source_cleanup_done is original_done, (
+            "不得替换生产 _on_source_cleanup_done；"
+            f"install 前={original_done} 后={server_module.HttpServer._on_source_cleanup_done}"
+        )
+    finally:
+        server_module.HttpServer._mark_fatal = original_mark
+        server_module.HttpServer._on_source_cleanup_done = original_done
+
+
+@pytest.mark.asyncio
+async def test_original_cleanup_done_late_hook_does_not_write_jsonl(tmp_path, monkeypatch):
+    """原 callback 查 self._mark_fatal。实例晚绑成空操作时，JSONL 必须仍空。
+
+    若 install 把 done 换成 type(self)._mark_fatal，晚绑会被绕过、这里会写出 post_fatal 而红。
+    """
+    from tests.fixtures.http_fatal_exit_probe import (
+        _FATAL_SNAPSHOT,
+        _install_mark_fatal_observer,
+    )
+
+    report_path = tmp_path / "cleanup-late-hook.jsonl"
+    monkeypatch.setenv("CW_PROBE_REPORT", str(report_path))
+    original_mark = server_module.HttpServer._mark_fatal
+    original_done = server_module.HttpServer._on_source_cleanup_done
+    try:
+        _FATAL_SNAPSHOT.clear()
+        _FATAL_SNAPSHOT.update({"mode": "fatal", "job_id": "job-late-hook"})
+        _install_mark_fatal_observer()
+        server = HttpServer(_StubApp(), "127.0.0.1", 0, tmp_path / "httpdata-late").prepare()
+        assert server.fatal is None
+        server._mark_fatal = lambda exc: None
+
+        async def fail_cleanup():
+            raise PermissionError("injected source unlink denial")
+
+        task = asyncio.create_task(fail_cleanup())
+        with pytest.raises(PermissionError, match="injected source unlink denial"):
+            await task
+        server_module.HttpServer._on_source_cleanup_done(server, task)
+        producer = report_path.read_bytes() if report_path.exists() else b""
+        assert producer == b"", (
+            "原 callback 被换掉后仍能绕过实例晚绑写出 JSONL："
+            f"{producer!r}"
+        )
+        await server.stop()
+    finally:
+        _FATAL_SNAPSHOT.clear()
+        server_module.HttpServer._mark_fatal = original_mark
+        server_module.HttpServer._on_source_cleanup_done = original_done
