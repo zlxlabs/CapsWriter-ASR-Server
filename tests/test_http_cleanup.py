@@ -853,7 +853,6 @@ def _user_bus_env() -> dict:
 
 
 def _systemd_usable() -> bool:
-    """真实消费环境：本机 user systemd 能否拉起瞬态 unit。"""
     bus = _user_bus_env()
     if not bus:
         return False
@@ -937,10 +936,8 @@ class ProbeRun:
             argv += [f"--setenv={key}={value}" for key, value in self.env.items()]
             argv += [sys.executable, "-m", PROBE_MODULE]
             self._log = open(self.log_path, "wb")
-            parent_env = dict(os.environ)
-            parent_env.update(_user_bus_env())
             self._process = subprocess.Popen(
-                argv, cwd=REPO_ROOT, env=parent_env, stdout=self._log,
+                argv, cwd=REPO_ROOT, env={**os.environ, **_user_bus_env()}, stdout=self._log,
                 stderr=subprocess.STDOUT,
             )
             # `systemd-run --wait` 返回时 unit 已被回收，且它的退出码就是被测行为。
@@ -1045,12 +1042,11 @@ class ProbeRun:
     def log_tail(self, limit: int = 3000) -> str:
         chunks = []
         if self.launcher == "systemd":
-            import subprocess
-
             probe = subprocess.run(
                 ["journalctl", "--user", "-u", self._unit, "-n", "60",
                  "--no-pager", "--output=cat"],
                 capture_output=True, timeout=30,
+                env={**os.environ, **_user_bus_env()},
             )
             chunks.append(probe.stdout.decode("utf-8", errors="replace"))
         for path in (self.process_log_path, self.log_path):
@@ -1064,15 +1060,18 @@ class ProbeRun:
 
     async def cleanup(self) -> None:
         """只回收本探针自己创建的 unit / 进程组。"""
-        import subprocess
-
         try:
             if self.launcher == "systemd" and self._unit is not None:
+                env = {**os.environ, **_user_bus_env()}
                 for verb in ("stop", "reset-failed"):
-                    subprocess.run(
+                    probe = subprocess.run(
                         ["systemctl", "--user", verb, self._unit],
-                        capture_output=True, timeout=30,
+                        capture_output=True, timeout=30, env=env,
                     )
+                    if probe.returncode != 0 and "not loaded" not in probe.stderr.decode("utf-8", errors="replace"):
+                        raise AssertionError(
+                            f"systemctl --user {verb} 无法消费 user bus：exit={probe.returncode} stderr_len={len(probe.stderr)}"
+                        )
                 # `systemd-run --wait` 是本进程起的子进程：unit 停掉后它会自己返回，
                 # 但必须显式回收，否则 pytest 会攒下一串 run-to-run 的干扰源。
                 await asyncio.to_thread(self._process.wait, 10)
@@ -1101,14 +1100,17 @@ class ProbeRun:
         )
 
     def _unit_properties(self) -> dict:
-        import subprocess
-
         probe = subprocess.run(
             ["systemctl", "--user", "show", self._unit,
              "-p", "LoadState", "-p", "ActiveState", "-p", "ExecMainStatus",
              "-p", "ControlGroup"],
-            capture_output=True, timeout=30,
+            capture_output=True, timeout=30, env={**os.environ, **_user_bus_env()},
         )
+        if probe.returncode != 0:
+            raise AssertionError(
+                f"systemctl --user show 无法消费 user bus：exit={probe.returncode} "
+                f"stdout_len={len(probe.stdout)} stderr_len={len(probe.stderr)}"
+            )
         properties = {}
         for line in probe.stdout.decode("utf-8", errors="replace").splitlines():
             key, _, value = line.partition("=")
@@ -1167,7 +1169,6 @@ async def _wait_gone(pids, timeout: float = 15.0) -> list:
 
 
 def _require_specific_unlink_fatal(entries, *, source_sha=None, job_id=None):
-    """消费 JSONL：必须是具体 unlink PermissionError 的 post_fatal。已知否输入见负例测试。"""
     assert isinstance(entries, list), entries
     post = [entry for entry in entries if entry.get("phase") == "post_fatal"]
     assert post, "没有观察到 listener 监督链上的具体 unlink PermissionError"
