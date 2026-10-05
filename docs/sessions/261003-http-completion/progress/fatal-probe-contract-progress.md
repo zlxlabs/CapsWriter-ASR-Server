@@ -58,3 +58,7 @@ Task09 pin 481+3+1、无效 TMPDIR 6fail、Task10 两 493 绿、Task11 skipped�
 
 ## 回修（Task16：env -i manager 须同 bus）
 Codex 当时 18 collected / 14 pass / 4 fail（query 未传 bus）。红 `f22b9e2c900bb8adb4dc6b418197b2098f576e3d` 绿 `6ffaed573c3f78d3dbc522e13d984a7e3c080392`。本轮 env -i 无 XDG/DBUS：cleanup **19 passed / 0 skipped**。两套全量（父进程未注入 bus）：ws15.0.1 queue_s=0 exec_s=245.688 **499 passed / 3 skipped**；ws-unpinned(17.2) queue_s=0 exec_s=257.14 **499 passed / 3 skipped**。skip 仍为 aligner :53/:62、segmenter:208。文档本段后另提交。
+## Task13 Codex 减法收口（dlg-20261005-074741-9b84c5）
+- 原卡纠正：`492fe191e3f9568ea178b61970c732c9d37c4e29..7106df62a906f45eaaf9d13dc5b8493b04ab0ac2` 三路径实数 `450 add + 41 delete = 491`，超过 450 hard 41；旧履历与误报原样保留。
+- 本次实数：`7106..最终提交头` 三路径 `48 add + 92 delete = 140/220`；原整卡范围 `492..最终提交头` 为 `407 add + 42 delete = 449/450`（来源均为 `git:numstat`）。
+- 验证：env-i cleanup `19 passed/0 skipped`；pinned 15.0.1 与 unpinned 17.2 全量各 `499 passed/3 skipped`；4 种生命周期 × 2 launcher 通过，明细见派发报告。

@@ -18,8 +18,7 @@
   * ``http_init_failure``   HTTP 显式启用但数据目录无法初始化，回归启动失败路径；
                              在真实装配点记录已建好的共享 Manager 的 PID 与 /proc 事实。
   * ``ws_only``             不提供 CW_HTTP_PORT，回归默认 WS 与 HTTP disabled。
-  * ``same_turn_observer``  不启动完整 App：真实 ``HttpServer._mark_fatal`` 与
-                             ``loop.stop`` 同一调度 turn，用来锁死 10ms 轮询契约。
+  * ``same_turn_observer``  用真实 class method 与 ``loop.stop`` 同一 turn 验写盘。
 
 无论哪种模式，进程退出码就是被测行为本身：脚本不吞异常、不代替被测代码退出。
 """
@@ -48,8 +47,7 @@ PROBE_AUDIO_SECONDS = 2.0
 PROBE_AUDIO_MAX_BYTES = 1024 * 1024
 # 清理周期缩短到探针可观测的尺度；谓词本身仍是生产的七天 terminal_at 阈值
 PROBE_CLEANUP_INTERVAL_SECONDS = 0.05
-# 跨 _mark_fatal 包装与 scenario 的只读快照：worker 构造期绑定的是 class 方法，
-# 实例晚绑覆盖不了 I/O callback；source 路径在 unlink 注入时才知道。
+# 共用快照：worker 早绑定 class method；source 路径在 unlink 注入时才已知。
 _FATAL_SNAPSHOT: dict = {}
 
 
@@ -146,37 +144,8 @@ def _shorten_cleanup_interval() -> None:
     server_module.SOURCE_CLEANUP_INTERVAL_SECONDS = PROBE_CLEANUP_INTERVAL_SECONDS
 
 
-def _emit_post_fatal(server, stored: BaseException) -> None:
-    """在原 _mark_fatal 已经写入 self.fatal 之后同步落盘；失败必须 fail-loud。"""
-    app = getattr(server, "_app", None)
-    worker = getattr(getattr(app, "state", None), "recognize_process", None)
-    source = _FATAL_SNAPSHOT.get("source")
-    source_path = _FATAL_SNAPSHOT.get("source_path")
-    if source is None and source_path:
-        source = _sha256_file(Path(source_path))
-    emit({
-        "phase": "post_fatal",
-        "mode": _FATAL_SNAPSHOT.get("mode") or os.environ.get("CW_PROBE_MODE", "fatal"),
-        "app_pid": os.getpid(),
-        "worker_pid": (
-            worker.pid if worker is not None else _FATAL_SNAPSHOT.get("worker_pid")
-        ),
-        "worker_alive": worker.is_alive() if worker is not None else None,
-        "fatal_type": type(stored).__name__,
-        "fatal_message": str(stored),
-        "source": source,
-        "job_id": _FATAL_SNAPSHOT.get("job_id"),
-        "observer": "HttpServer._mark_fatal",
-    })
-
-
 def _install_mark_fatal_observer() -> None:
-    """把观察点绑到 HttpServer._mark_fatal：真实存储 fatal 之后、loop 停之前落盘。
-
-    必须在 HttpServer 实例化 / HttpIoWorker(self._mark_fatal) 之前包到 class：
-    I/O worker 构造器保存当时的 bound method；生产 ``_on_source_cleanup_done``
-    本来就通过 ``self._mark_fatal`` 查到 class 包装，不得替换该回调函数。
-    """
+    """worker 构造前包装 class `_mark_fatal`，保留原 cleanup callback，并在写 fatal 后同步落盘。"""
     from core.server import http_server as server_module
 
     if getattr(server_module.HttpServer._mark_fatal, "_cw_probe_observed", False):
@@ -191,7 +160,20 @@ def _install_mark_fatal_observer() -> None:
         stored = self.fatal
         if stored is None:
             raise AssertionError("HttpServer._mark_fatal 执行后 fatal 仍未存储")
-        _emit_post_fatal(self, stored)
+        app = getattr(self, "_app", None)
+        worker = getattr(getattr(app, "state", None), "recognize_process", None)
+        emit({
+            "phase": "post_fatal",
+            "mode": os.environ.get("CW_PROBE_MODE", "fatal"),
+            "app_pid": os.getpid(),
+            "worker_pid": worker.pid if worker is not None else _FATAL_SNAPSHOT.get("worker_pid"),
+            "worker_alive": worker.is_alive() if worker is not None else None,
+            "fatal_type": type(stored).__name__,
+            "fatal_message": str(stored),
+            "source": _sha256_file(Path(source_path)) if (source_path := _FATAL_SNAPSHOT.get("source_path")) else None,
+            "job_id": _FATAL_SNAPSHOT.get("job_id"),
+            "observer": "HttpServer._mark_fatal",
+        })
 
     observed_mark._cw_probe_observed = True
     server_module.HttpServer._mark_fatal = observed_mark
@@ -382,23 +364,15 @@ async def run_fatal_scenario(app) -> None:
     })
     _FATAL_SNAPSHOT.clear()
     _FATAL_SNAPSHOT.update({
-        "mode": "fatal",
         "job_id": job_id,
         "source_path": str(source_path),
-        "source": _sha256_file(source_path),
         "worker_pid": app.state.recognize_process.pid,
     })
 
-    # post_fatal 由 class 上的 _mark_fatal 观察点在真实存储之后同步写入，
-    # 不再用 10ms 轮询和 loop 收尾抢调度。
     return
 
 
 def run_same_turn_observer_contract() -> None:
-    """真实子进程：_mark_fatal 与 loop.stop 安排在同一调度 turn。
-
-    观察点必须在原方法写入 fatal 之后、stop 之前落盘；不能再靠 10ms 轮询。
-    """
     from types import SimpleNamespace
 
     from core.server.http_server import HttpServer
@@ -407,24 +381,17 @@ def run_same_turn_observer_contract() -> None:
     data_dir.mkdir(parents=True, exist_ok=True)
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
-    app = SimpleNamespace(
-        loop=loop,
-        state=SimpleNamespace(recognize_process=None),
-    )
+    app = SimpleNamespace(loop=loop, state=SimpleNamespace(recognize_process=None))
     _FATAL_SNAPSHOT.clear()
     _FATAL_SNAPSHOT.update({
-        "mode": "same_turn_observer",
         "job_id": "same-turn-job",
         "source_path": str(data_dir / "missing-source.bin"),
     })
     _install_mark_fatal_observer()
     server = HttpServer(app, "127.0.0.1", 0, data_dir)
 
-    def fire() -> None:
-        server._mark_fatal(PermissionError("injected source unlink denial"))
-        loop.stop()
-
-    loop.call_soon(fire)
+    loop.call_soon(server._mark_fatal, PermissionError("injected source unlink denial"))
+    loop.call_soon(loop.stop)
     loop.run_forever()
     loop.close()
 

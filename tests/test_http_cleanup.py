@@ -1068,9 +1068,9 @@ class ProbeRun:
                         ["systemctl", "--user", verb, self._unit],
                         capture_output=True, timeout=30, env=env,
                     )
-                    if probe.returncode != 0 and "not loaded" not in probe.stderr.decode("utf-8", errors="replace"):
+                    if probe.returncode != 0 and self._unit_properties().get("LoadState") != "not-found":
                         raise AssertionError(
-                            f"systemctl --user {verb} 无法消费 user bus：exit={probe.returncode} stderr_len={len(probe.stderr)}"
+                            f"systemctl --user {verb} 失败：exit={probe.returncode} stderr_len={len(probe.stderr)}"
                         )
                 # `systemd-run --wait` 是本进程起的子进程：unit 停掉后它会自己返回，
                 # 但必须显式回收，否则 pytest 会攒下一串 run-to-run 的干扰源。
@@ -1371,11 +1371,9 @@ def test_http_disabled_keeps_default_websocket_lifecycle(tmp_path, launcher):
 
 
 def test_post_fatal_predicate_rejects_known_negatives():
-    """先喂已知为否的 JSONL，确认消费判据会红，而不是空集恒真。"""
     source = {"exists": True, "bytes": 4, "sha256": "abc"}
     valid = {
-        "phase": "post_fatal", "fatal_type": "PermissionError",
-        "fatal_message": "injected source unlink denial",
+        "phase": "post_fatal", "fatal_type": "PermissionError", "fatal_message": "injected source unlink denial",
         "source": source, "job_id": "job-a",
     }
     cases = (
@@ -1393,21 +1391,12 @@ def test_post_fatal_predicate_rejects_known_negatives():
 
 
 def test_same_turn_loop_stop_records_post_fatal_on_disk(tmp_path):
-    """真实子进程：_mark_fatal 与 loop.stop 同一 turn 也必须把 post_fatal 写入 JSONL。"""
     import asyncio
 
     workdir = tmp_path / "same-turn"
     workdir.mkdir()
     run = ProbeRun(workdir, "same_turn_observer", "naked")
-
-    async def scenario():
-        await run.start()
-        try:
-            return await run.wait_exit()
-        finally:
-            await run.cleanup()
-
-    code = asyncio.run(scenario())
+    _, code = _probe_session(run, None)
     assert code == 0, f"same-turn 观察子进程必须正常退出：{run.log_tail()}"
     producer_bytes = run.report_path.read_bytes() if run.report_path.exists() else b""
     entries = [
@@ -1422,11 +1411,10 @@ def _jsonl_from_bytes(path: Path) -> list:
     return [json.loads(line) for line in path.read_bytes().decode().splitlines() if line.strip()]
 
 
-def _observer_restore(mark, done):
+def _observer_restore(mark):
     from tests.fixtures.http_fatal_exit_probe import _FATAL_SNAPSHOT
     _FATAL_SNAPSHOT.clear()
     server_module.HttpServer._mark_fatal = mark
-    server_module.HttpServer._on_source_cleanup_done = done
 
 
 def _begin_observer(monkeypatch, tmp_path, report_name, job_id):
@@ -1435,7 +1423,7 @@ def _begin_observer(monkeypatch, tmp_path, report_name, job_id):
     monkeypatch.setenv("CW_PROBE_REPORT", str(report))
     mark, done = server_module.HttpServer._mark_fatal, server_module.HttpServer._on_source_cleanup_done
     _FATAL_SNAPSHOT.clear()
-    _FATAL_SNAPSHOT.update({"mode": "fatal", "job_id": job_id})
+    _FATAL_SNAPSHOT.update({"job_id": job_id})
     _install_mark_fatal_observer()
     server = HttpServer(_StubApp(), "127.0.0.1", 0, tmp_path / f"data-{report_name}").prepare()
     return report, mark, done, server
@@ -1451,22 +1439,8 @@ async def _failed_task(exc: BaseException):
     return task
 
 
-def test_install_keeps_original_source_cleanup_done_identity():
-    """install 只能包 _mark_fatal，生产 _on_source_cleanup_done 函数对象必须不变。"""
-    from tests.fixtures.http_fatal_exit_probe import _install_mark_fatal_observer
-
-    done = server_module.HttpServer._on_source_cleanup_done
-    mark = server_module.HttpServer._mark_fatal
-    try:
-        _install_mark_fatal_observer()
-        assert server_module.HttpServer._on_source_cleanup_done is done
-    finally:
-        _observer_restore(mark, done)
-
-
 @pytest.mark.asyncio
 async def test_io_worker_bound_mark_fatal_and_disconnect_negative(tmp_path, monkeypatch):
-    """独立 JSONL：worker 构造期绑定写出 PermissionError；断开 on_failure 则空文件。"""
     report, mark, done, server = _begin_observer(
         monkeypatch, tmp_path, "worker-only.jsonl", "job-io-worker",
     )
@@ -1495,12 +1469,11 @@ async def test_io_worker_bound_mark_fatal_and_disconnect_negative(tmp_path, monk
         assert (disconnected.read_bytes() if disconnected.exists() else b"") == b""
         await other.stop()
     finally:
-        _observer_restore(mark, done)
+        _observer_restore(mark)
 
 
 @pytest.mark.asyncio
 async def test_original_cleanup_done_fresh_jsonl_and_negatives(tmp_path, monkeypatch):
-    """独立空 JSONL + 原 callback：fatal 为 None 时落盘；错 job/错类型/晚绑各红或空。"""
     report, mark, done, server = _begin_observer(
         monkeypatch, tmp_path, "cleanup-done-only.jsonl", "job-cleanup-done",
     )
@@ -1534,12 +1507,11 @@ async def test_original_cleanup_done_fresh_jsonl_and_negatives(tmp_path, monkeyp
         assert (late.read_bytes() if late.exists() else b"") == b""
         await hooked.stop()
     finally:
-        _observer_restore(mark, done)
+        _observer_restore(mark)
 
 
 @pytest.mark.skipif(not _systemd_usable(), reason="需要可用的 user systemd")
-def test_user_manager_consumers_share_helper_bus(tmp_path, monkeypatch):
-    """父进程 bus 长度为 0 时所有 --user spawn 须收到 helper 字节；抽掉 show 按通信错误红。"""
+def test_user_manager_consumers_share_helper_bus(tmp_path, monkeypatch, request):
     monkeypatch.delenv("XDG_RUNTIME_DIR", raising=False)
     monkeypatch.delenv("DBUS_SESSION_BUS_ADDRESS", raising=False)
     assert len(os.environ.get("XDG_RUNTIME_DIR") or "") == 0
@@ -1565,7 +1537,8 @@ def test_user_manager_consumers_share_helper_bus(tmp_path, monkeypatch):
         name = phase(argv)
         if name:
             src = os.environ if env is None else env
-            captured.append((name, src.get("XDG_RUNTIME_DIR") or "", src.get("DBUS_SESSION_BUS_ADDRESS") or ""))
+            captured.append((name, src.get("XDG_RUNTIME_DIR") or "",
+                             src.get("DBUS_SESSION_BUS_ADDRESS") or "", tuple(argv), request.node.nodeid))
 
     monkeypatch.setattr(subprocess, "run", lambda *a, **k: (note(a[0] if a else k.get("args"), k.get("env")), real_run(*a, **k))[1])
     monkeypatch.setattr(subprocess, "Popen", lambda *a, **k: (note(a[0] if a else k.get("args"), k.get("env")), real_popen(*a, **k))[1])
@@ -1583,7 +1556,8 @@ def test_user_manager_consumers_share_helper_bus(tmp_path, monkeypatch):
     asyncio.run(scenario())
     seen = {item[0]: item for item in captured}
     for name in ("preflight", "launch", "query", "stop", "reset", "log"):
-        _, xdg, bus = seen[name]
+        _, xdg, bus, argv, node = seen[name]
+        assert node == request.node.nodeid and phase(argv) == name
         assert xdg == want["XDG_RUNTIME_DIR"] and bus == want["DBUS_SESSION_BUS_ADDRESS"], name
 
     def stripped(*args, **kwargs):
@@ -1598,3 +1572,14 @@ def test_user_manager_consumers_share_helper_bus(tmp_path, monkeypatch):
     with pytest.raises(AssertionError, match="无法消费 user bus") as caught:
         run._unit_properties()
     assert "not-found" not in str(caught.value)
+
+
+@pytest.mark.asyncio
+async def test_cleanup_rejects_unknown_error_with_not_loaded_text(tmp_path, monkeypatch):
+    run = ProbeRun(tmp_path, "same_turn_observer", "systemd")
+    run._unit, run._process = "cw-not-loaded-check.service", SimpleNamespace(wait=lambda timeout: 0)
+    command = lambda argv, **_: subprocess.CompletedProcess(
+        argv, int("stop" in argv), b"LoadState=loaded\n", b"unrelated error: not loaded")
+    monkeypatch.setattr(subprocess, "run", command)
+    with pytest.raises(AssertionError, match="stop 失败"):
+        await run.cleanup()
