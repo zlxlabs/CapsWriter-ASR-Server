@@ -97,3 +97,33 @@ python3 <runtime-release>/scripts/delegate/accept_precheck.py --dispatch-id dlg-
 重开旧资格、旧 09 或旧 unknown；不部署、不新 PR、不改默认分支。报告同时记录
 首次独立 source probe 因 `/tmp` 脚本未注入 repo path 的启动失败，以及修正后唯一有效
 probe 的通过结果。
+
+## 6. 预检记录与提交身份纠正（不重刷 suite）
+
+本节只纠正记录，不重跑两套 476 测试、不重跑主干 CI run 37252990501、不补历史
+trailer、不把父轮 JSON 改写成 green。
+
+- **生产 merge 对象**仍是 `4de4a7ffa44dfb50b48c252510927c4b2166cc77`。
+  **文档分支当时 HEAD**是 `22ff58665499bf1bf8907a107d1d2538a2f09d9c`，只含本卡文档，
+  不是生产 merge，也不能把文档 HEAD 说成已验证产品树。
+- 实际 git 显示两个文档提交均已带正确 trailer，不是缺失：
+  `521698a51534efdddf73e80830eed7611aa63c33` 与
+  `22ff58665499bf1bf8907a107d1d2538a2f09d9c` 正文均含
+  `Dispatch-Id: dlg-20261005-015734-7ed447` 和
+  `Task-Id: CapsWriter-Offline-with-AI-20261005-05`。旧提交未 amend。
+- 父轮 `accept_precheck.json` 白名单仍为：`status=red`、
+  `head_sha=858c6b975d8bdd2be0e47ac5a36483119894c529`、
+  `main_sha_at_check=4de4a7ffa44dfb50b48c252510927c4b2166cc77`、
+  `identity_source` 空、`commit_set` 空、`scope=red`
+  （detail：未找到执行器提交：未匹配 Dispatch-Id 或 Task-Id trailer）、
+  `verify_on_merged_main=green` 且 detail 为 `no-signal-lines`、`ci=unknown`。
+  该 JSON 不能当 green；其 `head_sha` 也不等于当时文档 HEAD `22ff586`。
+  **原调用实际对象仍未知**，本卡不补历史 argv/env，也不把未知解释成工具默认旧
+  head 或 CLI 损坏。该 red 与当前应用/CI 已核过的 green 分开：产品/suite 绿不
+  能洗掉这份预检记录。
+- **SDK watchdog 定位纠正**：公式 `_auto_budget` 在
+  `sdk/capswriter_asr/client.py`（`return duration * 4 + 120`），不是
+  `http_client.py`。锁定测试为 `tests/test_sdk_deadline_stage.py`（从 `client`
+  导入 `_auto_budget`）与 `tests/test_sdk_no_wait_for.py`（扫描整个
+  `sdk/capswriter_asr`）。`http_client.py` 仍是 HTTP TCP producer 入口，与
+  watchdog 公式不是同一文件。

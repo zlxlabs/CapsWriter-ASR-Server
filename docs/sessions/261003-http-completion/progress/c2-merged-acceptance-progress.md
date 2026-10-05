@@ -33,3 +33,21 @@
   代码形状或旧私有 JSON 当作证据。
 - 首次独立 source probe 因临时脚本路径未加入 repo `sys.path` 启动失败；修正后
   `source_probe=pass files=6`。该非 suite 失败不改产品，不隐藏在 suite 绿里。
+
+---
+
+# 预检记录纠正（dlg-20261005-024351-d915d8）
+
+## 当前阶段
+
+tests-docs 记录纠正；不重刷 suite/CI，不改产品。
+
+## 本段结论
+
+- `521698a` 与 `22ff586` 均已含父轮 `Dispatch-Id`/`Task-Id` trailer；父轮
+  `accept_precheck.json` 仍是 `status=red`、空 identity、head 为 `858c6b...`，
+  不能当 green。原调用对象未知，与当前 App/CI 已核 green 分开。
+- 文档 HEAD `22ff586` ≠ 生产 merge `4de4a7f`。watchdog 公式在
+  `sdk/capswriter_asr/client.py`，不是 `http_client.py`。
+- 下一步：本纠正文档提交并 push 后，用本轮 dispatch 对
+  `4de4a7f..<本纠正提交>` 只跑一次 native precheck，写入本轮自己的 JSON。
