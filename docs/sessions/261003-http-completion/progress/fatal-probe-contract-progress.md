@@ -44,3 +44,13 @@ Task09 pin 481+3+1、无效 TMPDIR 6fail、Task10 两 493 绿、Task11 skipped�
 - 主干基线作业名：派发时刻 `gh api request failed`，继承红 **未能判定**。
 - 本机 `is-system-running=degraded`：preflight 仍 0，四 mode unit 实测通过；不把 degraded 写成 running。
 - transient `--collect` 后 unit 名不保留；pass 数按 pytest nodeid，不编造 journal 里的旧 unit。
+
+## 回修（Task13：不得替换生产 cleanup done）
+
+纠正第 19 行：把 `_on_source_cleanup_done` 换成 `type(self)._mark_fatal` 是影子实现，会让「实例晚绑仍绿」变成人为契约。install 只能包 `_mark_fatal`；生产 done 函数 identity 必须不变。worker 与 cleanup done 各用独立空 JSONL；`>=1` 同一文件恒真已删。
+
+- 回修红：`641195da23c88e0ced7b2f84bf891bed9dc7f423`（identity + 晚绑仍写出 JSONL）
+- 回修绿：`7f97e857cd04f96215ee5d9123ae7391a702bbf3`（只包 `_mark_fatal`）；后续压缩提交见 HEAD
+- same-turn 子进程仍在，与真实 WAV→HTTP→ffmpeg→worker→SQLite→unlinkDenied→**原 listener callback** 的裸/systemd 四 mode 分开
+- 旧两套 496+3 skip 记录保留，不覆盖；本回修后 cleanup 模块须重跑，旧 496 不能替新测试内容
+
