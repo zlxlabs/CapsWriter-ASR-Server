@@ -10,6 +10,7 @@ import queue
 import shutil
 import signal
 import sqlite3
+import subprocess
 import sys
 import threading
 import time
@@ -843,24 +844,16 @@ def _free_port() -> int:
 
 
 def _user_bus_env() -> dict:
-    """只按 UID + 已知同属主 bus 插座是否存在组装调用环境；原值不进断言文本。"""
     uid = os.getuid()
     runtime = f"/run/user/{uid}"
     bus = os.path.join(runtime, "bus")
-    if not os.path.isdir(runtime) or not os.path.exists(bus):
+    if not os.path.isdir(runtime) or not os.path.exists(bus) or os.stat(bus).st_uid != uid:
         return {}
-    if os.stat(bus).st_uid != uid:
-        return {}
-    return {
-        "XDG_RUNTIME_DIR": runtime,
-        "DBUS_SESSION_BUS_ADDRESS": f"unix:path={bus}",
-    }
+    return {"XDG_RUNTIME_DIR": runtime, "DBUS_SESSION_BUS_ADDRESS": f"unix:path={bus}"}
 
 
 def _systemd_usable() -> bool:
-    """真实消费环境判定：本机 user systemd 能否拉起并观察一个瞬态 unit。"""
-    import subprocess
-
+    """真实消费环境：本机 user systemd 能否拉起瞬态 unit。"""
     bus = _user_bus_env()
     if not bus:
         return False
@@ -1174,10 +1167,7 @@ async def _wait_gone(pids, timeout: float = 15.0) -> list:
 
 
 def _require_specific_unlink_fatal(entries, *, source_sha=None, job_id=None):
-    """消费 JSONL 字节：必须是具体 unlink PermissionError 的 post_fatal。
-
-    判据写完先用已知为否的输入转红（见 test_post_fatal_predicate_rejects_known_negatives）。
-    """
+    """消费 JSONL：必须是具体 unlink PermissionError 的 post_fatal。已知否输入见负例测试。"""
     assert isinstance(entries, list), entries
     post = [entry for entry in entries if entry.get("phase") == "post_fatal"]
     assert post, "没有观察到 listener 监督链上的具体 unlink PermissionError"
@@ -1382,49 +1372,23 @@ def test_http_disabled_keeps_default_websocket_lifecycle(tmp_path, launcher):
 def test_post_fatal_predicate_rejects_known_negatives():
     """先喂已知为否的 JSONL，确认消费判据会红，而不是空集恒真。"""
     source = {"exists": True, "bytes": 4, "sha256": "abc"}
-    with pytest.raises(AssertionError):
-        _require_specific_unlink_fatal([])
-    with pytest.raises(AssertionError):
-        _require_specific_unlink_fatal([{"phase": "pre_fatal", "job_id": "job-a"}])
-    with pytest.raises(AssertionError):
-        _require_specific_unlink_fatal([{
-            "phase": "post_fatal",
-            "fatal_type": "OSError",
-            "fatal_message": "injected source unlink denial",
-            "source": source,
-            "job_id": "job-a",
-        }], source_sha="abc", job_id="job-a")
-    with pytest.raises(AssertionError):
-        _require_specific_unlink_fatal([{
-            "phase": "post_fatal",
-            "fatal_type": "PermissionError",
-            "fatal_message": "other denial",
-            "source": source,
-            "job_id": "job-a",
-        }], source_sha="abc", job_id="job-a")
-    with pytest.raises(AssertionError):
-        _require_specific_unlink_fatal([{
-            "phase": "post_fatal",
-            "fatal_message": "injected source unlink denial",
-            "source": source,
-            "job_id": "job-a",
-        }], source_sha="abc", job_id="job-a")
-    with pytest.raises(AssertionError):
-        _require_specific_unlink_fatal([{
-            "phase": "post_fatal",
-            "fatal_type": "PermissionError",
-            "fatal_message": "injected source unlink denial",
-            "source": {"exists": True, "bytes": 4, "sha256": "wrong"},
-            "job_id": "job-a",
-        }], source_sha="abc", job_id="job-a")
-    with pytest.raises(AssertionError):
-        _require_specific_unlink_fatal([{
-            "phase": "post_fatal",
-            "fatal_type": "PermissionError",
-            "fatal_message": "injected source unlink denial",
-            "source": source,
-            "job_id": "wrong-job",
-        }], source_sha="abc", job_id="job-a")
+    valid = {
+        "phase": "post_fatal", "fatal_type": "PermissionError",
+        "fatal_message": "injected source unlink denial",
+        "source": source, "job_id": "job-a",
+    }
+    cases = (
+        [],
+        [{"phase": "pre_fatal", "job_id": "job-a"}],
+        [{**valid, "fatal_type": "OSError"}],
+        [{**valid, "fatal_message": "other denial"}],
+        [{k: v for k, v in valid.items() if k != "fatal_type"}],
+        [{**valid, "source": {**source, "sha256": "wrong"}}],
+        [{**valid, "job_id": "wrong-job"}],
+    )
+    for entries in cases:
+        with pytest.raises(AssertionError):
+            _require_specific_unlink_fatal(entries, source_sha="abc", job_id="job-a")
 
 
 def test_same_turn_loop_stop_records_post_fatal_on_disk(tmp_path):
@@ -1454,37 +1418,25 @@ def test_same_turn_loop_stop_records_post_fatal_on_disk(tmp_path):
 def _jsonl_from_bytes(path: Path) -> list:
     if not path.exists():
         return []
-    return [
-        json.loads(line)
-        for line in path.read_bytes().decode("utf-8").splitlines()
-        if line.strip()
-    ]
+    return [json.loads(line) for line in path.read_bytes().decode().splitlines() if line.strip()]
 
 
 def _observer_restore(mark, done):
     from tests.fixtures.http_fatal_exit_probe import _FATAL_SNAPSHOT
-
     _FATAL_SNAPSHOT.clear()
     server_module.HttpServer._mark_fatal = mark
     server_module.HttpServer._on_source_cleanup_done = done
 
 
 def _begin_observer(monkeypatch, tmp_path, report_name, job_id):
-    from tests.fixtures.http_fatal_exit_probe import (
-        _FATAL_SNAPSHOT,
-        _install_mark_fatal_observer,
-    )
-
+    from tests.fixtures.http_fatal_exit_probe import _FATAL_SNAPSHOT, _install_mark_fatal_observer
     report = tmp_path / report_name
     monkeypatch.setenv("CW_PROBE_REPORT", str(report))
-    mark = server_module.HttpServer._mark_fatal
-    done = server_module.HttpServer._on_source_cleanup_done
+    mark, done = server_module.HttpServer._mark_fatal, server_module.HttpServer._on_source_cleanup_done
     _FATAL_SNAPSHOT.clear()
     _FATAL_SNAPSHOT.update({"mode": "fatal", "job_id": job_id})
     _install_mark_fatal_observer()
-    server = HttpServer(
-        _StubApp(), "127.0.0.1", 0, tmp_path / f"data-{report_name}",
-    ).prepare()
+    server = HttpServer(_StubApp(), "127.0.0.1", 0, tmp_path / f"data-{report_name}").prepare()
     return report, mark, done, server
 
 
@@ -1582,3 +1534,66 @@ async def test_original_cleanup_done_fresh_jsonl_and_negatives(tmp_path, monkeyp
         await hooked.stop()
     finally:
         _observer_restore(mark, done)
+
+
+@pytest.mark.skipif(not _systemd_usable(), reason="需要可用的 user systemd")
+def test_user_manager_consumers_share_helper_bus(tmp_path, monkeypatch):
+    """父进程 bus 长度为 0 时所有 --user spawn 须收到 helper 字节；抽掉 show 按通信错误红。"""
+    monkeypatch.delenv("XDG_RUNTIME_DIR", raising=False)
+    monkeypatch.delenv("DBUS_SESSION_BUS_ADDRESS", raising=False)
+    assert len(os.environ.get("XDG_RUNTIME_DIR") or "") == 0
+    assert len(os.environ.get("DBUS_SESSION_BUS_ADDRESS") or "") == 0
+    want, real_run, real_popen = _user_bus_env(), subprocess.run, subprocess.Popen
+    assert want
+    captured = []
+
+    def phase(argv):
+        if not argv or "--user" not in argv:
+            return None
+        if argv[0] == "systemd-run":
+            return "preflight" if "/bin/true" in argv else "launch"
+        if argv[0] == "journalctl":
+            return "log"
+        if argv[0] == "systemctl" and "show" in argv:
+            return "query"
+        if argv[0] == "systemctl" and "stop" in argv:
+            return "stop"
+        return "reset" if argv[0] == "systemctl" and "reset-failed" in argv else None
+
+    def note(argv, env):
+        name = phase(argv)
+        if name:
+            src = os.environ if env is None else env
+            captured.append((name, src.get("XDG_RUNTIME_DIR") or "", src.get("DBUS_SESSION_BUS_ADDRESS") or ""))
+
+    monkeypatch.setattr(subprocess, "run", lambda *a, **k: (note(a[0] if a else k.get("args"), k.get("env")), real_run(*a, **k))[1])
+    monkeypatch.setattr(subprocess, "Popen", lambda *a, **k: (note(a[0] if a else k.get("args"), k.get("env")), real_popen(*a, **k))[1])
+    assert _systemd_usable()
+    workdir = tmp_path / "bus-spawn"
+    workdir.mkdir()
+    run = ProbeRun(workdir, "same_turn_observer", "systemd")
+    run._wait_unit_loaded = lambda timeout=20.0: asyncio.sleep(0)
+    async def scenario():
+        await run.start()
+        try:
+            run._unit_properties(); run.log_tail()
+        finally:
+            await run.cleanup()
+    asyncio.run(scenario())
+    seen = {item[0]: item for item in captured}
+    for name in ("preflight", "launch", "query", "stop", "reset", "log"):
+        _, xdg, bus = seen[name]
+        assert xdg == want["XDG_RUNTIME_DIR"] and bus == want["DBUS_SESSION_BUS_ADDRESS"], name
+
+    def stripped(*args, **kwargs):
+        argv = args[0] if args else kwargs.get("args")
+        if argv and argv[0] == "systemctl" and "show" in argv:
+            env = dict(kwargs.get("env") or os.environ)
+            env.pop("XDG_RUNTIME_DIR", None)
+            env.pop("DBUS_SESSION_BUS_ADDRESS", None)
+            kwargs = {**kwargs, "env": env}
+        return real_run(*args, **kwargs)
+    monkeypatch.setattr(subprocess, "run", stripped)
+    with pytest.raises(AssertionError, match="无法消费 user bus") as caught:
+        run._unit_properties()
+    assert "not-found" not in str(caught.value)
