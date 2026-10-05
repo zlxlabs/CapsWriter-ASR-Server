@@ -31,6 +31,27 @@ TERMINAL_STATUSES = frozenset({'DONE', 'FAILED'})
 # max_tasks - WS_RESERVED_SLOTS。默认 max_tasks=8 → HTTP 最多同时占 6 个名额。
 WS_RESERVED_SLOTS = 2
 
+# WS 任务「进展」的四处打点。缺任何一处，看门狗都会在正常推进的任务上误判停滞，
+# 或在真正停滞的任务上永不触发。
+PROGRESS_UPLOAD = 'upload'      # 读到一帧上行数据
+PROGRESS_DECODE = 'decode'      # 解码器吐出一块 PCM
+PROGRESS_SUBMIT = 'submit'      # 提交一个片段
+PROGRESS_RESULT = 'result'      # 确认一个片段结果
+
+PROGRESS_LABELS = {
+    PROGRESS_UPLOAD: '上传',
+    PROGRESS_DECODE: '解码',
+    PROGRESS_SUBMIT: '片段提交',
+    PROGRESS_RESULT: '结果回传',
+}
+
+# 任务当前所处的处理阶段（与上面「最后一次进展的阶段」是两个事实）。
+# 压缩任务的解码器一旦启动就整个任务都处于解码阶段：此时若看门狗到点，
+# 停滞点在服务端解码链路还是客户端没继续发，只看时间戳区分不出来。
+PHASE_UPLOAD = 'upload'
+PHASE_DECODE = 'decode'
+PHASE_LABELS = {PHASE_UPLOAD: '上传', PHASE_DECODE: '解码'}
+
 
 class CounterUnavailable(RuntimeError):
     """共享预算的 DB 侧计数来源已失效（HTTP listener 正在停机）。
@@ -136,11 +157,14 @@ class TaskLifecycle:
     status: str = 'RECEIVING'
     segment_slots: asyncio.Semaphore | None = None
     terminal_event: asyncio.Event = field(default_factory=asyncio.Event)
-    idle_state_condition: asyncio.Condition = field(default_factory=asyncio.Condition)
-    idle_state_version: int = 0
-    idle_deadline: float | None = None
-    backpressured: bool = False
     started_at: float = field(default_factory=time.monotonic)
+    # WS 上行进展看门狗的唯一时钟来源（全仓统一 time.monotonic，不用 loop.time）：
+    # last_progress_at 是「最近一次进展」的时刻，progress_stage 是那次进展的
+    # 阶段，phase 是任务当前所处的处理阶段。三者只对 WS 路径维护，
+    # 巡检判据按 key[0] == 'ws' 限定。
+    last_progress_at: float = field(default_factory=time.monotonic)
+    progress_stage: str = PROGRESS_UPLOAD
+    phase: str = PHASE_UPLOAD
     samples_total: int = 0
     segments: int = 0
     declared_encoding: str | None = None
@@ -190,6 +214,10 @@ class ServerState:
     connection_tasks: Dict[str, TaskKey] = field(default_factory=dict)
     out_queues: Dict[str, asyncio.Queue] = field(default_factory=dict)
     sender_tasks: Dict[str, asyncio.Task] = field(default_factory=dict)
+    # ws_recv 接收协程本体（按 socket_id 登记）。进展看门狗到点时必须 cancel
+    # 它，而不是只关 socket：关 socket 解不开解码阶段的互等，会留下泄漏的
+    # 协程与 ffmpeg 子进程。
+    handler_tasks: Dict[str, asyncio.Task] = field(default_factory=dict)
     pending_segments: Dict[TaskKey, deque] = field(default_factory=dict)
     # HTTP runner 注册的稳定 job_id；由 Manager().list() 跨进程共享。
     active_http_jobs: Optional[ListProxy] = None
@@ -275,6 +303,7 @@ def ensure_server_runtime(state) -> None:
         'connection_tasks': {},
         'out_queues': {},
         'sender_tasks': {},
+        'handler_tasks': {},
         'pending_segments': {},
         'active_http_jobs': None,
         'http_result_sink': None,
@@ -370,9 +399,31 @@ def transition_terminal(state, key: TaskKey, status: str, code: str | None = Non
     return True
 
 
+def note_ws_progress(state, key: TaskKey, stage: str) -> None:
+    """登记 WS 任务的一次进展（看门狗四处打点之一）。
+
+    刻意不做「阶段是否合法」「是否为终态」的防御判断：四个打点都是本仓内部
+    调用点，写错阶段属于编程错误，让它在 message 拼装处显形，而不是被静默吞掉。
+    """
+    record = state.tasks.get(key)
+    if record is None:
+        return
+    record.last_progress_at = time.monotonic()
+    record.progress_stage = stage
+
+
+def set_ws_phase(state, key: TaskKey, phase: str) -> None:
+    """登记 WS 任务当前所处的处理阶段（与进展时刻无关，不刷新时间戳）。"""
+    record = state.tasks.get(key)
+    if record is not None:
+        record.phase = phase
+
+
 def register_segment_submission(state, key: TaskKey, submitted_at: float) -> None:
     ensure_server_runtime(state)
     state.pending_segments.setdefault(key, deque()).append(submitted_at)
+    if key[0] == 'ws':
+        note_ws_progress(state, key, PROGRESS_SUBMIT)
 
 
 def acknowledge_segment_result(state, key: TaskKey) -> None:
@@ -385,6 +436,8 @@ def acknowledge_segment_result(state, key: TaskKey) -> None:
             record.segment_slots.release()
         if not pending:
             state.pending_segments.pop(key, None)
+    if key[0] == 'ws':
+        note_ws_progress(state, key, PROGRESS_RESULT)
 
 
 def release_terminal_task(state, key: TaskKey) -> None:

@@ -193,9 +193,15 @@ async def test_compressed_disconnect_reaps_ffmpeg_within_five_seconds(
 
 
 @pytest.mark.asyncio
-async def test_compressed_consumer_backpressure_pauses_upload_idle(
+async def test_compressed_backpressure_does_not_extend_any_deadline(
     monkeypatch,
 ):
+    """#76-2 回归：等段名额不再记账，也不再推迟任何截止时间。
+
+    「有在途片段」本身就决定该任务由段推理看门狗负责（I-owner 交接），因此
+    背压期间 last_progress_at 必须保持不动——一旦有代码把它往后推，空闲看门狗
+    就会被无限期推迟，退回修复前的挂死形态。
+    """
     samples = np.random.default_rng(19).uniform(-0.8, 0.8, 20 * 16000).astype(np.float32)
     flac = _encode_flac(samples)
     monkeypatch.setattr(ServerConfig, "seg_cut_snap", False)
@@ -213,10 +219,15 @@ async def test_compressed_consumer_backpressure_pauses_upload_idle(
                 assert time.monotonic() < deadline
                 await asyncio.sleep(0.01)
             record = next(iter(server.state.tasks.values()))
-            while not record.backpressured:
+            while not record.segment_slots._waiters:
                 assert time.monotonic() < deadline
                 await asyncio.sleep(0.01)
+            frozen_at = record.last_progress_at
             await asyncio.sleep(1.2)
+            assert record.last_progress_at == frozen_at, (
+                f"背压期间不得推迟看门狗截止时间；实际从 {frozen_at} 变成 "
+                f"{record.last_progress_at}"
+            )
             await client.send(_frame(
                 task_id, flac[split:], encoding="flac", samples_total=samples.size
             ))

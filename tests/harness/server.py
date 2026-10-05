@@ -65,7 +65,7 @@ class FakeServerHarness:
 
 def run_managed_fake_server(
     info_queue, options, calls, observed, queue_in, queue_out, stall_first_send,
-    monitor_interval,
+    monitor_interval, server_config,
 ):
     """在独立主进程中运行真 websocket、真 worker 和真实存活监控。"""
     from config_server import ServerConfig
@@ -73,6 +73,10 @@ def run_managed_fake_server(
         from core.server.worker import process_manager as process_manager_module
         process_manager_module.PROCESS_MONITOR_INTERVAL_SECONDS = monitor_interval
 
+    # fork 会继承父进程已导入的 config_server，改 env 对子进程无效：
+    # 需要改配置值的测试必须在这里显式传。
+    for name, value in dict(server_config or {}).items():
+        setattr(ServerConfig, name, value)
     ServerConfig.seg_cut_snap = False
     manager = multiprocessing.Manager()
     state = ServerState(queue_in=queue_in, queue_out=queue_out)
@@ -154,7 +158,8 @@ class ManagedFakeServerHarness:
     """跨进程监控验收用服务端句柄。"""
     @classmethod
     async def start(
-        cls, options=None, *, stall_first_send=False, monitor_interval=None
+        cls, options=None, *, stall_first_send=False, monitor_interval=None,
+        server_config=None,
     ):
         self = cls()
         self.manager = multiprocessing.Manager()
@@ -174,6 +179,7 @@ class ManagedFakeServerHarness:
                 self.queue_out,
                 stall_first_send,
                 monitor_interval,
+                dict(server_config or {}),
             ),
         )
         self.process.start()

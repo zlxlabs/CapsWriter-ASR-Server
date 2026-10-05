@@ -60,6 +60,7 @@ PROTOCOL_ERROR_CODES = frozenset({
     "bad_request",
     "unsupported_encoding",
     "decode_failed",
+    "decode_stalled",
     "task_conflict",
     "audio_too_long",
     "inference_failed",
