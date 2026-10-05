@@ -41,7 +41,7 @@ REQUIRED_PHASES = ("concurrency", "cancel_io", "restart", "legacy_ws")
 
 ## 工件与两个消费者
 
-调用方必须设置已存在目录 `M6_REPEAT_MATRIX_ARTIFACT_DIR`。测试不得在 env 为空时自选路径。主入口每轮行为断言通过后追加写入 `trace.json`（先写字节再 `replace`）。
+调用方设置已存在目录 `M6_REPEAT_MATRIX_ARTIFACT_DIR` 时，测试与 CI importlib 都读该路径。未设置时普通 pytest 写入 `tmp_path`（见 H1）。测试不得在 env 为空时另造仓库内固定路径。主入口每轮行为断言通过后追加写入 `trace.json`（先写字节再 `replace`）。
 
 字段只含匿名计数 / 角色 / round / phase / pass-fail / 0 skip / `source_runtime` / `source_sha`（40 位）/ producer roles。禁止 credential、token、media hash、私有 env、宿主机路径、IP。
 
@@ -57,3 +57,39 @@ py3.11 两维仍只跑 `tests/test_sdk_*.py`，不计五轮。CI 只给 3.12 维
 ## 明确不做
 
 不新增产品状态、第二账簿、重试、fallback、任务调度框架、pytest 插件、新依赖。不改 App / SDK / 旧 tests / 配置 / Goal。Win 在飞交付无本矩阵接口依赖；若 master 合入新 App flag 则先 merge 再测，不用旧计数冒充共同源。
+
+## H1 源身份与契约缺口收口
+
+审查 `03e8e48` 登记五条契约缺口。H1 只补测试行为，不改 Goal、不改产品、不把 H0 五轮/Hosted 工件判成假证。
+
+### 实例身份（真实组件，不是角色标签）
+
+| 角色 | 真实对象 | 参数如何传到 store | 读者 |
+|---|---|---|---|
+| dataDir | 五轮共用 `tmp_path/httpdata` | `HttpServer(..., data_dir)` / `ManagedHttpServerHarness.start(data_dir=)` | `harness.data_dir.resolve()` 等于该实参 |
+| 并发/取消 launcher | `running_runner_server` 同 dataDir | 同进程 `HttpServer` + recording worker | SDK / handler.cancel / mailbox |
+| 重启 first/second | `ManagedHttpServerHarness` 子进程 | 同一 dataDir 再 `start`；PID 可变 | `raw_job` / `GET /result` / `received` |
+| HTTP listener | 子进程 `HttpServer.serve` port 0 | info_queue 二元组 `(http_port, worker_pid)` | SDK / httpx |
+| WS listener | 同 second 子进程内真实 `ws_recv`（`enable_ws=True`） | `published['ws_port']`，不改旧二元组 | `websockets.connect(second.ws_url)` 且 `second.process.is_alive()` |
+| queues / worker | 该 child 的 `queue_in/out` + `run_recording_worker` | TaskHandler 原方法 | `second.received` / `second.calls` |
+| store | `data_dir/http.sqlite3` | `HttpStore` 读写 | GET 全 payload、`read_db` |
+
+重启后旧 WS **禁止** `stop(second)` 再 `running_runner_server` 新 state。并发/取消仍走 in-process 是因为 handler.cancel 与 threading 屏障必须同 mailbox 进程；HTTP 默认契约未改。
+
+### 持久结果
+
+`GET /result` 返回 store 里整份 JSON。协议未列出 body 内非持久字段，比较重启前后**整个 payload**（`excludeKeys` 空集）。pending 重启失败不自动重跑：`second.received` known-empty 且 `engine_calls_after_restart==0`。
+
+### 每轮字节与 ffmpeg
+
+- SDK 落盘：`source.read_bytes() == disk.read_bytes()`（不只 `stat.size`）。
+- PCM：跨 Queue 的 `Task.data` SHA 对独立真 ffmpeg 16k mono f32 oracle 逐段（切段/重叠/末段）。
+- ffmpeg：每轮开始记下日志事件下标 `ffmpeg_log_offset`，只消费该下标之后的新 start；argv 为真实 list，env_marker 来自 shim。工件只记 count/offset/bool，不写媒体 hash、路径、argv。
+
+### mailbox 真值
+
+cancel-first：pending=1、mailbox=31、slot_held=true。io-first：pending=0、mailbox=32、slot_held=false。消费者读这两份现场数字，不另造第二账簿，不改 worker 释放时机。
+
+### 工件目录
+
+普通 `pytest` 未设 `M6_REPEAT_MATRIX_ARTIFACT_DIR` 时写入 `tmp_path`（文档约定默认，不是吞错）。CI 与裸环境**必须**显式设置该 env，且 importlib 消费者读同一路径；缺文件 fail-loud。

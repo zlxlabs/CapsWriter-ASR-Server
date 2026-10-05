@@ -31,16 +31,19 @@ def required_phases() -> tuple[str, ...]:
     return REQUIRED_PHASES
 
 
-def resolve_artifact_dir() -> Path:
+def resolve_artifact_dir(tmp_path: Path | None = None) -> Path:
+    """CI / 裸环境必须显式设置 ARTIFACT_ENV 并读同一路径；普通 pytest 默认 tmp_path。"""
     raw = os.environ.get(ARTIFACT_ENV)
-    if not raw:
-        raise AssertionError(
-            f"调用方必须设置 {ARTIFACT_ENV} 为已存在目录，禁止测试自报路径"
-        )
-    path = Path(raw)
-    if not path.is_dir():
-        raise AssertionError(f"{ARTIFACT_ENV} 必须是已存在目录")
-    return path
+    if raw:
+        path = Path(raw)
+        if not path.is_dir():
+            raise AssertionError(f"{ARTIFACT_ENV} 必须是已存在目录")
+        return path
+    if tmp_path is not None:
+        return Path(tmp_path)
+    raise AssertionError(
+        f"{ARTIFACT_ENV} 未设置，且调用方未提供 tmp_path"
+    )
 
 
 def _json_contains_absolute_path(value: Any) -> bool:
@@ -98,6 +101,7 @@ def consume_repeat_matrix_trace(path: Path) -> dict[str, Any]:
         raise AssertionError(f"rounds 必须恰好 {REPEAT_COUNT} 条，实际={len(rounds) if isinstance(rounds, list) else type(rounds)}")
     seen: set[int] = set()
     job_ids: set[str] = set()
+    prev_ffmpeg_offset = -1
     for index, round_row in enumerate(rounds, start=1):
         if not isinstance(round_row, dict):
             raise AssertionError(f"round[{index}] 必须是 object")
@@ -140,6 +144,8 @@ def consume_repeat_matrix_trace(path: Path) -> dict[str, Any]:
         _assert_cancel_evidence(round_id, phases["cancel_io"])
         _assert_restart_evidence(round_id, phases["restart"])
         _assert_ws_evidence(round_id, phases["legacy_ws"])
+        _assert_ffmpeg_round(round_id, round_row, prev_ffmpeg_offset)
+        prev_ffmpeg_offset = int(round_row["ffmpeg_log_offset"])
     if seen != set(range(1, REPEAT_COUNT + 1)):
         raise AssertionError(f"rounds 未覆盖 1..{REPEAT_COUNT}: {seen}")
     return payload
@@ -156,9 +162,15 @@ def _assert_concurrency_evidence(round_id: int, phase: dict) -> None:
         raise AssertionError(f"round {round_id} 未证明断连 WS")
     if int(phase.get("http_task_count") or 0) < 1 or int(phase.get("ws_task_count") or 0) < 1:
         raise AssertionError(f"round {round_id} worker 未同时收到 HTTP 与 WS Task")
+    if phase.get("http_source_bytes_match") is not True:
+        raise AssertionError(f"round {round_id} 未证明源文件与落盘字节一致")
+    if phase.get("pcm_segment_oracle_ok") is not True:
+        raise AssertionError(f"round {round_id} 未证明每段 PCM 对独立 ffmpeg oracle")
 
 
 def _assert_cancel_evidence(round_id: int, phase: dict) -> None:
+    from core.server.http_store import IO_MAILBOX
+
     for order in ("cancel_first", "io_first"):
         row = phase.get(order)
         if not isinstance(row, dict):
@@ -167,8 +179,27 @@ def _assert_cancel_evidence(round_id: int, phase: dict) -> None:
             raise AssertionError(f"round {round_id} {order} 未记录 confirmed_offset")
         if int(row.get("disk_bytes") or -1) < 1:
             raise AssertionError(f"round {round_id} {order} 未记录磁盘字节")
-        if row.get("slot_held_before_release") is not True:
-            raise AssertionError(f"round {round_id} {order} 未证明槽位在 write 完成前占用")
+        pending = row.get("pending_at_cancel")
+        mailbox = row.get("mailbox_at_cancel")
+        held = row.get("slot_held_before_release")
+        if order == "cancel_first":
+            if held is not True:
+                raise AssertionError(f"round {round_id} cancel_first 取消时槽位必须仍占用")
+            if int(pending if pending is not None else -1) != 1:
+                raise AssertionError(f"round {round_id} cancel_first pending 必须为 1，实际={pending!r}")
+            if int(mailbox if mailbox is not None else -1) != IO_MAILBOX - 1:
+                raise AssertionError(
+                    f"round {round_id} cancel_first mailbox 必须为 {IO_MAILBOX - 1}，实际={mailbox!r}"
+                )
+        else:
+            if held is not False:
+                raise AssertionError(f"round {round_id} io_first I/O 完成后槽位必须已归还")
+            if int(pending if pending is not None else -1) != 0:
+                raise AssertionError(f"round {round_id} io_first pending 必须为 0，实际={pending!r}")
+            if int(mailbox if mailbox is not None else -1) != IO_MAILBOX:
+                raise AssertionError(
+                    f"round {round_id} io_first mailbox 必须为 {IO_MAILBOX}，实际={mailbox!r}"
+                )
 
 
 def _assert_restart_evidence(round_id: int, phase: dict) -> None:
@@ -186,6 +217,11 @@ def _assert_restart_evidence(round_id: int, phase: dict) -> None:
         raise AssertionError(f"round {round_id} 缺少已确认 prefix offset")
     if int(phase.get("suffix_offset") or 0) <= int(phase.get("prefix_offset") or 0):
         raise AssertionError(f"round {round_id} 未显式补 suffix")
+    if phase.get("result_payload_equal") is not True:
+        raise AssertionError(f"round {round_id} 重启前后 GET /result 全 payload 必须相等")
+    engine_calls = phase.get("engine_calls_after_restart")
+    if not isinstance(engine_calls, int) or engine_calls != 0:
+        raise AssertionError(f"round {round_id} 重启后不得自动识别")
 
 
 def _assert_ws_evidence(round_id: int, phase: dict) -> None:
@@ -193,6 +229,23 @@ def _assert_ws_evidence(round_id: int, phase: dict) -> None:
         raise AssertionError(f"round {round_id} 重启后 WS 未收到 is_final")
     if not phase.get("ws_task_id"):
         raise AssertionError(f"round {round_id} 缺少 WS task_id")
+    if phase.get("ws_on_restarted_instance") is not True:
+        raise AssertionError(f"round {round_id} WS 必须连在仍存活的重启后实例上")
+
+
+def _assert_ffmpeg_round(round_id: int, round_row: dict, prev_offset: int) -> None:
+    offset = round_row.get("ffmpeg_log_offset")
+    count = round_row.get("ffmpeg_start_count")
+    if not isinstance(offset, int) or offset < 0:
+        raise AssertionError(f"round {round_id} 缺少本轮 ffmpeg 日志偏移")
+    if prev_offset >= 0 and offset <= prev_offset:
+        raise AssertionError(
+            f"round {round_id} ffmpeg_log_offset={offset} 必须大于前轮 {prev_offset}，禁止借用累计日志"
+        )
+    if not isinstance(count, int) or count < 1:
+        raise AssertionError(f"round {round_id} 本轮必须有新的 ffmpeg start，实际={count!r}")
+    if round_row.get("ffmpeg_argv_real") is not True:
+        raise AssertionError(f"round {round_id} 未证明本轮 ffmpeg argv/env 来自真实 shim")
 
 
 def _require_runtime() -> None:
@@ -227,22 +280,28 @@ def _complete_round(round_id: int) -> dict[str, Any]:
         "round": round_id,
         "pass": True,
         "data_dir_role": "persistent-httpdata",
+        "ffmpeg_start_count": 1,
+        "ffmpeg_log_offset": (round_id - 1) * 2,
+        "ffmpeg_argv_real": True,
         "phases": {
             "concurrency": _minimal_phase(
                 round_id, "concurrency",
                 http_owner_kind="http", ws_owner_kind="ws",
                 idle_socket_http_done=True, ws_disconnected=True,
                 http_task_count=1, ws_task_count=1,
+                http_source_bytes_match=True, pcm_segment_oracle_ok=True,
             ),
             "cancel_io": _minimal_phase(
                 round_id, "cancel_io",
                 cancel_first={
                     "confirmed_offset": 4, "disk_bytes": 4,
                     "slot_held_before_release": True,
+                    "pending_at_cancel": 1, "mailbox_at_cancel": 31,
                 },
                 io_first={
                     "confirmed_offset": 4, "disk_bytes": 4,
-                    "slot_held_before_release": True,
+                    "slot_held_before_release": False,
+                    "pending_at_cancel": 0, "mailbox_at_cancel": 32,
                 },
             ),
             "restart": _minimal_phase(
@@ -250,10 +309,12 @@ def _complete_round(round_id: int) -> dict[str, Any]:
                 pid_old=1000 + round_id, pid_new=2000 + round_id,
                 known_empty_received=True, done_replay=True,
                 prefix_offset=2, suffix_offset=4,
+                result_payload_equal=True, engine_calls_after_restart=0,
             ),
             "legacy_ws": _minimal_phase(
                 round_id, "legacy_ws",
                 ws_final=True, ws_task_id=f"ws-r{round_id}",
+                ws_on_restarted_instance=True,
             ),
         },
     }
@@ -320,6 +381,62 @@ def test_trace_consumer_accepts_complete_five_rounds(tmp_path):
     assert [row["round"] for row in payload["rounds"]] == list(range(1, 6))
 
 
+def test_trace_consumer_rejects_io_first_slot_still_held(tmp_path):
+    """反例：io-first 仍写 slot_held=true，与真实 mailbox 归还相反。"""
+    rounds = [_complete_round(n) for n in range(1, 6)]
+    rounds[2]["phases"]["cancel_io"]["io_first"]["slot_held_before_release"] = True
+    path = tmp_path / TRACE_NAME
+    path.write_bytes(json.dumps(_envelope(rounds)).encode("utf-8"))
+    _write_fault_marker(tmp_path, "io-first-slot-held")
+    assert (tmp_path / "FAULT_INJECTION_REACHED").read_text(encoding="utf-8") == "io-first-slot-held"
+    with pytest.raises(AssertionError, match="io_first I/O 完成后槽位必须已归还"):
+        consume_repeat_matrix_trace(path)
+
+
+def test_trace_consumer_rejects_ws_not_on_restarted_instance(tmp_path):
+    rounds = [_complete_round(n) for n in range(1, 6)]
+    rounds[4]["phases"]["legacy_ws"]["ws_on_restarted_instance"] = False
+    path = tmp_path / TRACE_NAME
+    path.write_bytes(json.dumps(_envelope(rounds)).encode("utf-8"))
+    with pytest.raises(AssertionError, match="仍存活的重启后实例"):
+        consume_repeat_matrix_trace(path)
+
+
+def test_trace_consumer_rejects_reused_ffmpeg_log_offset(tmp_path):
+    rounds = [_complete_round(n) for n in range(1, 6)]
+    rounds[3]["ffmpeg_log_offset"] = rounds[2]["ffmpeg_log_offset"]
+    path = tmp_path / TRACE_NAME
+    path.write_bytes(json.dumps(_envelope(rounds)).encode("utf-8"))
+    with pytest.raises(AssertionError, match="禁止借用累计日志"):
+        consume_repeat_matrix_trace(path)
+
+
+def test_trace_consumer_rejects_unequal_done_payload(tmp_path):
+    rounds = [_complete_round(n) for n in range(1, 6)]
+    rounds[1]["phases"]["restart"]["result_payload_equal"] = False
+    path = tmp_path / TRACE_NAME
+    path.write_bytes(json.dumps(_envelope(rounds)).encode("utf-8"))
+    with pytest.raises(AssertionError, match="全 payload 必须相等"):
+        consume_repeat_matrix_trace(path)
+
+
+@pytest.mark.asyncio
+async def test_legacy_ws_fails_if_restarted_instance_has_no_ws(tmp_path):
+    """关闭重启后实例的 WS listener：必须 AssertionError，不是缺 fixture。"""
+    from tests.harness.server import ManagedHttpServerHarness
+    from tests.test_http_file_runner import FAKE_ENGINE
+
+    harness = await ManagedHttpServerHarness.start(
+        data_dir=tmp_path / "httpdata", options=FAKE_ENGINE, enable_ws=False,
+    )
+    try:
+        with pytest.raises(AssertionError, match="未暴露真实 WS"):
+            await _phase_legacy_ws(harness, 1)
+    finally:
+        await harness.stop()
+        await harness.cleanup()
+
+
 def _source_sha() -> str:
     import subprocess
 
@@ -351,6 +468,45 @@ async def _wait_until(predicate, what: str, timeout: float = 30.0):
         if loop.time() >= deadline:
             raise AssertionError(f"等待「{what}」超时 ({timeout}s)")
         await asyncio.sleep(0.005)
+
+
+def _decoded_pcm_bytes(path: Path) -> bytes:
+    import shutil
+    import subprocess
+
+    ffmpeg = shutil.which("ffmpeg")
+    if ffmpeg is None:
+        raise AssertionError("测试环境缺少 ffmpeg：具名五轮矩阵必须失败而不是 skip")
+    process = subprocess.run(
+        [ffmpeg, "-nostdin", "-hide_banner", "-loglevel", "error",
+         "-i", str(path), "-ar", "16000", "-ac", "1", "-f", "f32le", "pipe:1"],
+        check=True, capture_output=True,
+    )
+    pcm = process.stdout
+    if not pcm or len(pcm) % 4 != 0:
+        raise AssertionError("独立 ffmpeg oracle 未产出 16k mono f32")
+    return pcm
+
+
+def _assert_pcm_segments_match_oracle(segments: list[dict], reference: bytes) -> None:
+    from hashlib import sha256
+
+    expected_samples = len(reference) // 4
+    cursor = 0
+    assert segments and segments[-1].get("is_final") is True
+    for index, item in enumerate(segments):
+        start = round(item["offset"] * 16000)
+        assert start == cursor, (item["offset"], cursor)
+        expected = reference[start * 4:(start + item["samples"]) * 4]
+        assert len(expected) == item["data_bytes"]
+        assert expected != b"\x00" * len(expected)
+        assert sha256(expected).hexdigest() == item["data_sha256"]
+        if item["is_final"]:
+            assert start + item["samples"] == expected_samples
+        else:
+            overlap_samples = round(item["overlap"] * 16000)
+            assert 0 < overlap_samples < item["samples"]
+            cursor = start + item["samples"] - overlap_samples
 
 
 def _ws_tone(seconds: float):
@@ -525,12 +681,18 @@ async def _phase_concurrency(harness, source: Path, round_id: int, tmp_path: Pat
         reader_task.cancel()
         await asyncio.gather(reader_task, return_exceptions=True)
         await live.close()
-        source_bytes = source.stat().st_size
+        source_bytes = source.read_bytes()
         row = harness.read_db(
             "SELECT source_name FROM uploads WHERE job_id=?", (handle.job_id,),
         )[0]
-        disk_bytes = (harness.data_dir / "sources" / row["source_name"]).stat().st_size
-        assert disk_bytes == source_bytes and disk_bytes > 0
+        disk = (harness.data_dir / "sources" / row["source_name"]).read_bytes()
+        assert disk == source_bytes and disk
+        http_segments = [
+            entry for entry in harness.received
+            if entry.get("event") == "task" and entry.get("owner_kind") == "http"
+            and entry.get("task_id") == handle_b.job_id
+        ]
+        _assert_pcm_segments_match_oracle(http_segments, _decoded_pcm_bytes(source))
         return {
             "pass": True,
             "round_job_id": f"r{round_id}-concurrency-{handle.job_id[:8]}",
@@ -541,7 +703,9 @@ async def _phase_concurrency(harness, source: Path, round_id: int, tmp_path: Pat
             "ws_disconnected": True,
             "http_task_count": len(http_records),
             "ws_task_count": len(ws_records),
-            "http_source_bytes": disk_bytes,
+            "http_source_bytes": len(disk),
+            "http_source_bytes_match": True,
+            "pcm_segment_oracle_ok": True,
             "engine_calls": len(list(harness.calls)),
             "recovery": str(recovery.name),
             "_recovery_path": recovery,
@@ -615,8 +779,10 @@ async def _phase_cancel(harness, round_id: int) -> dict:
                 assert isinstance(cancelled[0], asyncio.CancelledError)
                 pending_after = 1 if order == "cancel-first" else 0
                 await _wait_for_worker_pending(server._worker, pending_after)
-                held = server._worker._mailbox._value
-                assert held == (IO_MAILBOX - 1 if order == "cancel-first" else IO_MAILBOX)
+                mailbox_at_cancel = server._worker._mailbox._value
+                expected_mailbox = IO_MAILBOX - 1 if order == "cancel-first" else IO_MAILBOX
+                assert mailbox_at_cancel == expected_mailbox
+                slot_held = mailbox_at_cancel < IO_MAILBOX
                 try:
                     await asyncio.wait_for(first_request, timeout=5)
                 except httpx.HTTPError:
@@ -673,7 +839,9 @@ async def _phase_cancel(harness, round_id: int) -> dict:
                 evidence[field] = {
                     "confirmed_offset": 4,
                     "disk_bytes": len(disk),
-                    "slot_held_before_release": True,
+                    "slot_held_before_release": slot_held,
+                    "pending_at_cancel": pending_after,
+                    "mailbox_at_cancel": mailbox_at_cancel,
                 }
             finally:
                 io_release.set()
@@ -689,7 +857,7 @@ async def _phase_cancel(harness, round_id: int) -> dict:
 
 
 async def _phase_restart(tmp_path: Path, data_dir: Path, recovery: Path, source: Path,
-                         round_id: int, ffmpeg_shim: Path) -> dict:
+                         round_id: int, ffmpeg_shim: Path):
     import signal
     from hashlib import sha256
 
@@ -740,11 +908,16 @@ async def _phase_restart(tmp_path: Path, data_dir: Path, recovery: Path, source:
 
     second = await ManagedHttpServerHarness.start(
         data_dir=data_dir, options=FAKE_ENGINE, ffmpeg_shim=str(ffmpeg_shim),
+        enable_ws=True,
     )
     try:
         pid_new = second.process.pid
         assert pid_new != pid_old
+        assert second.process.is_alive()
+        assert second.ws_url, "重启后实例必须暴露真实 ws_recv 端口"
         assert list(second.received) == [], f"重启后不得自动重跑: {list(second.received)!r}"
+        engine_calls_after_restart = len(list(second.calls))
+        assert engine_calls_after_restart == 0
         running = await raw_job(second, running_recovery)
         assert running["state"] == "FAILED"
         assert running["error_code"] == "server_restarted"
@@ -752,7 +925,7 @@ async def _phase_restart(tmp_path: Path, data_dir: Path, recovery: Path, source:
         assert done_again["state"] == "DONE"
         replay_again = await raw_get(second, recovery, "/result")
         assert replay_again.status_code == 200, replay_again.text
-        assert replay_again.json().get("is_final") is True
+        assert replay_again.json() == replay
         row = second.read_db(
             "SELECT confirmed_offset, source_name FROM uploads WHERE upload_id=?",
             (upload_id,),
@@ -786,7 +959,7 @@ async def _phase_restart(tmp_path: Path, data_dir: Path, recovery: Path, source:
         assert row2["confirmed_offset"] == 4
         disk2 = (second.data_dir / "sources" / row["source_name"]).read_bytes()
         assert disk2 == prefix
-        return {
+        evidence = {
             "pass": True,
             "round_job_id": f"r{round_id}-restart-{pid_old}-{pid_new}",
             "producer_roles": ["managed-http-subprocess", "http-sdk"],
@@ -794,12 +967,16 @@ async def _phase_restart(tmp_path: Path, data_dir: Path, recovery: Path, source:
             "pid_new": pid_new,
             "known_empty_received": True,
             "done_replay": True,
+            "result_payload_equal": True,
+            "engine_calls_after_restart": engine_calls_after_restart,
             "prefix_offset": 2,
             "suffix_offset": 4,
         }
-    finally:
+    except BaseException:
         await second.stop()
         await second.cleanup()
+        raise
+    return evidence, second
 
 
 async def _phase_legacy_ws(harness, round_id: int) -> dict:
@@ -808,46 +985,48 @@ async def _phase_legacy_ws(harness, round_id: int) -> dict:
 
     import websockets
 
+    assert harness.process.is_alive(), "重启后实例在 WS 相位必须仍存活"
+    ws_url = harness.ws_url
+    if not ws_url:
+        raise AssertionError("重启后实例未暴露真实 WS listener，禁止另起 stub")
     samples = _ws_tone(2.0)
     ws_id = f"ws-after-r{round_id}"
-    ws_server, ws_url = await _start_ws(harness.state)
-    try:
-        conn = await websockets.connect(ws_url, max_size=None, ping_interval=None)
-        messages: list[dict] = []
+    conn = await websockets.connect(ws_url, max_size=None, ping_interval=None)
+    messages: list[dict] = []
 
-        async def reader():
-            try:
-                async for raw in conn:
-                    messages.append(json.loads(raw))
-            except websockets.ConnectionClosed:
-                pass
+    async def reader():
+        try:
+            async for raw in conn:
+                messages.append(json.loads(raw))
+        except websockets.ConnectionClosed:
+            pass
 
-        reader_task = asyncio.create_task(reader())
-        chunk = round(0.5 * 16000)
-        for start in range(0, len(samples), chunk):
-            await conn.send(_ws_frame(samples[start:start + chunk], ws_id, is_final=False))
-        await conn.send(_ws_frame(samples[len(samples):], ws_id, is_final=True))
-        await _wait_until(
-            lambda: any(item.get("is_final") and item.get("task_id") == ws_id for item in messages),
-            "重启后 WS 收到 is_final",
-        )
-        finals = [item for item in messages if item.get("is_final") and item.get("task_id") == ws_id]
-        assert len(finals) == 1
-        for field in ("task_id", "is_final"):
-            assert field in finals[0]
-        reader_task.cancel()
-        await asyncio.gather(reader_task, return_exceptions=True)
-        await conn.close()
-        return {
-            "pass": True,
-            "round_job_id": f"r{round_id}-legacy_ws",
-            "producer_roles": ["ws-frame", "recording-worker"],
-            "ws_final": True,
-            "ws_task_id": ws_id,
-        }
-    finally:
-        ws_server.close()
-        await ws_server.wait_closed()
+    reader_task = asyncio.create_task(reader())
+    chunk = round(0.5 * 16000)
+    for start in range(0, len(samples), chunk):
+        await conn.send(_ws_frame(samples[start:start + chunk], ws_id, is_final=False))
+    await conn.send(_ws_frame(samples[len(samples):], ws_id, is_final=True))
+    await _wait_until(
+        lambda: any(item.get("is_final") and item.get("task_id") == ws_id for item in messages),
+        "重启后同实例 WS 收到 is_final",
+    )
+    finals = [item for item in messages if item.get("is_final") and item.get("task_id") == ws_id]
+    assert len(finals) == 1
+    for field in ("task_id", "is_final"):
+        assert field in finals[0]
+    assert _tasks(harness, ws_id)
+    assert harness.process.is_alive()
+    reader_task.cancel()
+    await asyncio.gather(reader_task, return_exceptions=True)
+    await conn.close()
+    return {
+        "pass": True,
+        "round_job_id": f"r{round_id}-legacy_ws",
+        "producer_roles": ["ws-frame", "recording-worker", "restarted-managed-http"],
+        "ws_final": True,
+        "ws_task_id": ws_id,
+        "ws_on_restarted_instance": True,
+    }
 
 
 @pytest.mark.asyncio
@@ -856,10 +1035,13 @@ async def test_five_round_same_service_concurrency_cancel_restart_ws(tmp_path, m
     import sys
 
     _require_runtime()
-    artifact_dir = resolve_artifact_dir()
+    artifact_dir = resolve_artifact_dir(tmp_path)
     repo_root = Path(__file__).resolve().parents[1]
     sys.path.insert(0, str(repo_root / "sdk"))
-    from tests.test_http_file_runner import install_recording_ffmpeg, make_container, running_runner_server
+    from tests.test_http_file_runner import (
+        install_recording_ffmpeg, make_container, read_ffmpeg_invocations,
+        running_runner_server,
+    )
 
     ffmpeg_log = install_recording_ffmpeg(tmp_path, monkeypatch)
     source = make_container(tmp_path, "speech.mp3", seconds=8.0)
@@ -879,27 +1061,38 @@ async def test_five_round_same_service_concurrency_cancel_restart_ws(tmp_path, m
     }
     _dump_trace(trace_path, payload)
     for round_id in range(1, REPEAT_COUNT + 1):
+        invocations_before = read_ffmpeg_invocations(ffmpeg_log) if ffmpeg_log.exists() else []
+        log_offset = len(invocations_before)
         async with running_runner_server(tmp_path) as harness:
             assert harness.data_dir.resolve() == data_dir.resolve()
             concurrency = await _phase_concurrency(harness, source, round_id, tmp_path)
             cancel_io = await _phase_cancel(harness, round_id)
             recovery = concurrency.pop("_recovery_path")
             concurrency.pop("_done_job", None)
-        restart = await _phase_restart(
+        restart, second = await _phase_restart(
             tmp_path, data_dir, recovery, source, round_id, shim,
         )
-        async with running_runner_server(tmp_path) as harness:
-            legacy_ws = await _phase_legacy_ws(harness, round_id)
-        starts = []
-        if ffmpeg_log.exists():
-            from tests.test_http_file_runner import read_ffmpeg_starts
-            starts = read_ffmpeg_starts(ffmpeg_log)
-        assert starts, "ffmpeg shim 没有记录到真实 argv"
+        try:
+            assert second.process.is_alive()
+            legacy_ws = await _phase_legacy_ws(second, round_id)
+        finally:
+            await second.stop()
+            await second.cleanup()
+        round_events = read_ffmpeg_invocations(ffmpeg_log)[log_offset:] if ffmpeg_log.exists() else []
+        round_starts = [entry for entry in round_events if entry.get("event") == "start"]
+        assert round_starts, f"round {round_id} 没有新的 ffmpeg start"
+        for entry in round_starts:
+            argv = entry.get("argv")
+            assert isinstance(argv, list) and len(argv) >= 2
+            assert entry.get("env_marker") == "runner-env-marker"
+            assert isinstance(entry.get("path_head"), str) and entry["path_head"]
         payload["rounds"].append({
             "round": round_id,
             "pass": True,
             "data_dir_role": "persistent-httpdata",
-            "ffmpeg_start_count": len(starts),
+            "ffmpeg_start_count": len(round_starts),
+            "ffmpeg_log_offset": log_offset,
+            "ffmpeg_argv_real": True,
             "phases": {
                 "concurrency": concurrency,
                 "cancel_io": cancel_io,

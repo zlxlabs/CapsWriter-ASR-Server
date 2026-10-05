@@ -37,3 +37,17 @@ Hosted CI 尚未跑齐，不能用 Draft 检查绿代替 artifact 五轮。
 ## 主干
 
 `git ls-remote origin refs/heads/master` → `6aa76f6`（相对基线 902 只多 `docs/maintainers/project-memory.md`，无 Win App flag）。已 `with-merge-lease.sh --record-merge` 合入本分支。
+
+## H1 续修（dispatch `dlg-20261005-121000-45baf4`）
+
+只读 verdict `03e8e48`：`failure-visibility: skipped`，M6 未达，无应用 P1。H0 裸环境与 Hosted run `37302715605` / artifact `11342646375` 仍是真实五轮记录，不是假证；缺的是同服务完整循环。
+
+H1 补测试契约，不改 App/SDK/旧 tests/原 verdict 正文：
+
+1. `ManagedHttpServerHarness` 最小真实 `ws_recv`（opt-in `enable_ws`，info_queue 仍二元组）。
+2. `legacy_ws` 连仍存活的 second，不再 stop 后另起 `running_runner_server`。
+3. 重启前后 `GET /result` 全 payload 相等；`engine_calls_after_restart==0`。
+4. 源文件与落盘逐字节；PCM SHA 对独立 ffmpeg oracle。
+5. io-first 记真实 mailbox/pending（槽已归还）；每轮 `ffmpeg_log_offset` + 本轮 start 数。
+
+普通 pytest 工件默认 `tmp_path`；CI/裸环境仍必须显式 `M6_REPEAT_MATRIX_ARTIFACT_DIR`。H1 全量计数见本续修验证段（未跑完前不改上方 H0 的 505/3）。

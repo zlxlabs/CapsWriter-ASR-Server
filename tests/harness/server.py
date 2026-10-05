@@ -252,7 +252,7 @@ def _apply_fault(fault):
 
 def run_managed_http_server(
     info_queue, options, calls, received, queue_in, queue_out, data_dir,
-    fault=None, ffmpeg_shim=None, env=None,
+    fault=None, ffmpeg_shim=None, env=None, published=None,
 ):
     """独立主进程：真 HTTP listener + 真文件 runner + 真 ws_send + 真识别子进程。
 
@@ -358,6 +358,19 @@ def run_managed_http_server(
                 file=sys.stderr, flush=True,
             )
             raise listener.exception()
+        ws_server = None
+        if os.environ.get("CW_TEST_ENABLE_HTTP_WS") == "1":
+            ws_server = await websockets.serve(
+                functools.partial(ws_recv, app=app),
+                "127.0.0.1",
+                0,
+                max_size=None,
+                ping_interval=None,
+                process_request=functools.partial(health_process_request, app=app),
+            )
+            if published is not None:
+                published["ws_port"] = ws_server.sockets[0].getsockname()[1]
+        # 旧消费者仍只解包 (http_port, worker_pid)；WS 端口走 published，不改二元组。
         info_queue.put((http_server._bound_port, worker.pid))
 
         done, _ = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
@@ -373,6 +386,9 @@ def run_managed_http_server(
         await asyncio.wait_for(
             asyncio.gather(*tasks, return_exceptions=True), timeout=15
         )
+        if ws_server is not None:
+            ws_server.close()
+            await asyncio.wait_for(ws_server.wait_closed(), timeout=5)
         if stopping.is_set():
             await shutdown()
         if error is not None:
@@ -409,7 +425,7 @@ class ManagedHttpServerHarness:
 
     @classmethod
     async def start(cls, *, data_dir, options=None, fault=None, ffmpeg_shim=None,
-                    stderr_path=None, env=None):
+                    stderr_path=None, env=None, enable_ws=False):
         self = cls()
         self.manager = multiprocessing.Manager()
         self.calls = self.manager.list()
@@ -417,17 +433,21 @@ class ManagedHttpServerHarness:
         self.info_queue = multiprocessing.Queue()
         self.queue_in = self.manager.Queue()
         self.queue_out = self.manager.Queue()
+        self.published = self.manager.dict()
         self.stderr_path = stderr_path or (Path(data_dir).parent / "server-stderr.log")
         self.data_dir = Path(data_dir)
         self.stderr_path.parent.mkdir(parents=True, exist_ok=True)
         self._stderr_handle = open(self.stderr_path, "wb")
+        child_env = dict(env or {})
+        if enable_ws:
+            child_env["CW_TEST_ENABLE_HTTP_WS"] = "1"
         self.process = multiprocessing.Process(
             target=_child_with_stderr,
             args=(
                 (
                     self.info_queue, options or {}, self.calls, self.received,
                     self.queue_in, self.queue_out, Path(data_dir), fault, ffmpeg_shim,
-                    dict(env or {}),
+                    child_env, self.published,
                 ),
                 self._stderr_handle.fileno(),
             ),
@@ -442,6 +462,17 @@ class ManagedHttpServerHarness:
             ) from exc
         self.port = port
         self.base_url = f"http://127.0.0.1:{port}"
+        self.ws_port = None
+        self.ws_url = None
+        if enable_ws:
+            ws_port = self.published.get("ws_port")
+            if not isinstance(ws_port, int) or ws_port <= 0:
+                await self.cleanup()
+                raise AssertionError(
+                    f"managed HTTP 未发布真实 ws_port：{self.stderr_tail()}"
+                )
+            self.ws_port = ws_port
+            self.ws_url = f"ws://127.0.0.1:{ws_port}"
         return self
 
     def read_db(self, sql: str, params: tuple = ()):
