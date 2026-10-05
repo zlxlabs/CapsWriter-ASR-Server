@@ -51,3 +51,15 @@ H1 补测试契约，不改 App/SDK/旧 tests/原 verdict 正文：
 5. io-first 记真实 mailbox/pending（槽已归还）；每轮 `ffmpeg_log_offset` + 本轮 start 数。
 
 普通 pytest 工件默认 `tmp_path`；CI/裸环境仍必须显式 `M6_REPEAT_MATRIX_ARTIFACT_DIR`。H1 全量计数见本续修验证段（未跑完前不改上方 H0 的 505/3）。
+
+## H1 验证（HEAD `d5b5717323eac858b95cdfacec125cfc9ee0012f`）
+
+| 环境 | 命令要点 | 计数 | 新模块 skip |
+|---|---|---|---|
+| 无会话 `env -i` 具名入口 | 白名单 HOME/PATH/TMPDIR/工件目录，无 DELEGATE_* | 11 passed / 31.87 s；消费 rounds `[1,2,3,4,5]` sha=`d5b5717…`；ffmpeg_offsets `[0,6,13,19,25]` 递增；io_first slot_held 全 false；WS 全 `ws_on_restarted_instance` | 0 |
+| 全量 pin `websockets==15.0.1` | flock 600 + timeout 900 | **510 passed, 3 skipped** / 292.87 s | 0 |
+| 全量 unpin（解析到 17.2） | 同上 | **510 passed, 3 skipped** / 303.28 s | 0 |
+
+相对 H0 的 505：本模块从 6 条加到 11 条消费者/变异锁。3 个 skip 身份未变（aligner ×2、segmenter silero）。没有 HTTP/ffmpeg/aiohttp 类 skip。
+
+Hosted CI 新 head 待读取，不把 H0 run `37302715605` 当本 head 证据。master 仍 `6aa76f6`，无 Win82 合入。
