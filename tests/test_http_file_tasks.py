@@ -322,6 +322,77 @@ async def test_resume_after_failed_patch_only_sends_unconfirmed_suffix(tmp_path)
 
 
 @pytest.mark.asyncio
+async def test_http_binary_payload_survives_append_recovery_and_commit_replay(tmp_path):
+    """实际 HTTP producer 的二进制字节经过 ACK、未确认尾恢复和 commit 重放后仍逐字节不变。"""
+    payload = b"\x00A\nB\r\nC\x1aD\xff" + bytes(range(1, 32))
+    source = tmp_path / "producer.bin"
+    source.write_bytes(payload)
+    token = "binary-payload-token"
+
+    async with running_server(tmp_path, inference=True) as (server, base_url):
+        async with httpx.AsyncClient(trust_env=False, follow_redirects=False) as client:
+            created = await _create_upload_json(
+                client, base_url, token, source.read_bytes(), "binary-payload"
+            )
+            upload_id = created["upload_id"]
+            auth = {"Authorization": f"Bearer {token}"}
+            patch_headers = {
+                **auth,
+                "Content-Type": "application/octet-stream",
+            }
+            first = await client.patch(
+                f"{base_url}/v1/uploads/{upload_id}",
+                headers={**patch_headers, "Content-Length": "7", "Upload-Offset": "0"},
+                content=payload[:7],
+            )
+            assert first.status_code == 204
+            assert first.headers["Upload-Offset"] == "7"
+
+            disk_path = server.data_dir / "sources" / f"{upload_id}.bin"
+            assert disk_path.read_bytes() == payload[:7]
+            with disk_path.open("ab") as stream:
+                stream.write(b"unacknowledged-tail")
+
+            second = await client.patch(
+                f"{base_url}/v1/uploads/{upload_id}",
+                headers={
+                    **patch_headers,
+                    "Content-Length": str(len(payload) - 7),
+                    "Upload-Offset": "7",
+                },
+                content=payload[7:],
+            )
+            assert second.status_code == 204
+            assert second.headers["Upload-Offset"] == str(len(payload))
+            assert disk_path.read_bytes() == source.read_bytes()
+            assert sha256(disk_path.read_bytes()).hexdigest() == created["sha256"]
+
+            commit = await client.post(
+                f"{base_url}/v1/uploads/{upload_id}/commit",
+                headers=auth,
+                content=b"",
+            )
+            assert commit.status_code == 202
+            job_id = commit.json()["job_id"]
+            replay = await client.post(
+                f"{base_url}/v1/uploads/{upload_id}/commit",
+                headers=auth,
+                content=b"",
+            )
+            assert replay.status_code == 200
+            assert replay.json()["job_id"] == job_id
+
+        row = _read_db(
+            server.data_dir,
+            "SELECT confirmed_offset, size_bytes, sha256 FROM uploads WHERE upload_id=?",
+            (upload_id,),
+        )[0]
+        assert row["confirmed_offset"] == row["size_bytes"] == len(payload)
+        assert row["sha256"] == sha256(source.read_bytes()).hexdigest()
+        assert len(_read_db(server.data_dir, "SELECT job_id FROM jobs")) == 1
+
+
+@pytest.mark.asyncio
 async def test_http_admission_shares_ws_budget(tmp_path):
     """R7：HTTP 准入与 WS 共用 max_tasks=8 的共享总量，且恒定预留 2 个名额给 WS。
 
