@@ -61,6 +61,9 @@ def received_task_record(task) -> dict:
         "time_start": task.time_start,
         "time_submit": task.time_submit,
         "data_sha256_prefix": hashlib.sha256(task.data).hexdigest()[:16],
+        # 完整摘要：段内容的唯一证据。只留前缀时，「同长度全零 PCM」会与真实段
+        # 算出同样的长度/sample_count，逐段内容比对必须能区分二者。
+        "data_sha256": hashlib.sha256(task.data).hexdigest(),
     }
 
 
