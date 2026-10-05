@@ -842,15 +842,35 @@ def _free_port() -> int:
         return probe.getsockname()[1]
 
 
+def _user_bus_env() -> dict:
+    """只按 UID + 已知同属主 bus 插座是否存在组装调用环境；原值不进断言文本。"""
+    uid = os.getuid()
+    runtime = f"/run/user/{uid}"
+    bus = os.path.join(runtime, "bus")
+    if not os.path.isdir(runtime) or not os.path.exists(bus):
+        return {}
+    if os.stat(bus).st_uid != uid:
+        return {}
+    return {
+        "XDG_RUNTIME_DIR": runtime,
+        "DBUS_SESSION_BUS_ADDRESS": f"unix:path={bus}",
+    }
+
+
 def _systemd_usable() -> bool:
     """真实消费环境判定：本机 user systemd 能否拉起并观察一个瞬态 unit。"""
     import subprocess
 
+    bus = _user_bus_env()
+    if not bus:
+        return False
+    env = dict(os.environ)
+    env.update(bus)
     try:
         probe = subprocess.run(
             ["systemd-run", "--user", "--quiet", "--wait", "--collect",
              "--service-type=exec", "/bin/true"],
-            capture_output=True, timeout=30,
+            capture_output=True, timeout=30, env=env,
         )
     except (OSError, subprocess.SubprocessError):
         return False
@@ -924,8 +944,10 @@ class ProbeRun:
             argv += [f"--setenv={key}={value}" for key, value in self.env.items()]
             argv += [sys.executable, "-m", PROBE_MODULE]
             self._log = open(self.log_path, "wb")
+            parent_env = dict(os.environ)
+            parent_env.update(_user_bus_env())
             self._process = subprocess.Popen(
-                argv, cwd=REPO_ROOT, stdout=self._log,
+                argv, cwd=REPO_ROOT, env=parent_env, stdout=self._log,
                 stderr=subprocess.STDOUT,
             )
             # `systemd-run --wait` 返回时 unit 已被回收，且它的退出码就是被测行为。
@@ -1151,6 +1173,26 @@ async def _wait_gone(pids, timeout: float = 15.0) -> list:
     return alive
 
 
+def _require_specific_unlink_fatal(entries, *, source_sha=None, job_id=None):
+    """消费 JSONL 字节：必须是具体 unlink PermissionError 的 post_fatal。
+
+    判据写完先用已知为否的输入转红（见 test_post_fatal_predicate_rejects_known_negatives）。
+    """
+    assert isinstance(entries, list), entries
+    post = [entry for entry in entries if entry.get("phase") == "post_fatal"]
+    assert post, "没有观察到 listener 监督链上的具体 unlink PermissionError"
+    report = post[0]
+    assert "fatal_type" in report, f"post_fatal 缺少 fatal_type：{report}"
+    assert (report["fatal_type"], report.get("fatal_message")) == (
+        "PermissionError", "injected source unlink denial",
+    )
+    if source_sha is not None:
+        assert report.get("source", {}).get("sha256") == source_sha, report.get("source")
+    if job_id is not None:
+        assert report.get("job_id") == job_id, report
+    return report
+
+
 PROBE_LAUNCHERS = [
     pytest.param(
         "naked", id="naked-shell",
@@ -1244,16 +1286,12 @@ def test_fatal_cleanup_exits_process_and_reaps_children(tmp_path, launcher):
     assert _port_refused(pre["http_port"])
     assert _port_refused(pre["ws_port"])
     fatal_report = [
-        entry for entry in run.reports() if entry.get("phase") == "post_fatal"
+        _require_specific_unlink_fatal(
+            run.reports(),
+            source_sha=pre["source"]["sha256"],
+            job_id=pre["job_id"],
+        )
     ]
-    assert fatal_report, (
-        "没有观察到 listener 监督链上的具体 unlink PermissionError；"
-        f"探针日志：{run.log_tail()}"
-    )
-    assert (fatal_report[0]["fatal_type"], fatal_report[0]["fatal_message"]) == (
-        "PermissionError", "injected source unlink denial",
-    )
-    assert fatal_report[0]["source"]["sha256"] == pre["source"]["sha256"]
     fatal_log = asyncio.run(run.wait_log("HTTP 未知 operation 失败"))
     assert "HTTP 未知 operation 失败" in fatal_log, (
         f"日志里没有 listener 监督链的 fatal 记录：{fatal_log}"
@@ -1282,6 +1320,7 @@ def test_normal_sigterm_still_exits_zero(tmp_path, launcher):
     assert ready["worker_pid"] and ready["manager_pid"]
     leftover = asyncio.run(_wait_gone([ready["worker_pid"], ready["manager_pid"]]))
     assert leftover == [], f"主动 stop 后这些子进程仍然存活：{leftover}"
+    assert all(entry.get("phase") != "post_fatal" for entry in run.reports()), run.reports()
 
 
 @pytest.mark.parametrize("launcher", PROBE_LAUNCHERS)
@@ -1320,6 +1359,7 @@ def test_http_startup_failure_exits_nonzero_without_hanging_worker(tmp_path, lau
     assert run.cgroup_pids() == [], (
         f"unit cgroup 里仍残留进程：{run.cgroup_pids()}"
     )
+    assert all(entry.get("phase") != "post_fatal" for entry in run.reports()), run.reports()
 
 
 @pytest.mark.parametrize("launcher", PROBE_LAUNCHERS)
@@ -1336,3 +1376,127 @@ def test_http_disabled_keeps_default_websocket_lifecycle(tmp_path, launcher):
     assert code == 0, f"HTTP disabled 下 SIGTERM 必须 0 退出，实际 {code}：{run.log_tail()}"
     leftover = asyncio.run(_wait_gone([ready["worker_pid"], ready["manager_pid"]]))
     assert leftover == [], f"HTTP disabled 收尾后这些子进程仍然存活：{leftover}"
+    assert all(entry.get("phase") != "post_fatal" for entry in run.reports()), run.reports()
+
+
+def test_post_fatal_predicate_rejects_known_negatives():
+    """先喂已知为否的 JSONL，确认消费判据会红，而不是空集恒真。"""
+    source = {"exists": True, "bytes": 4, "sha256": "abc"}
+    with pytest.raises(AssertionError):
+        _require_specific_unlink_fatal([])
+    with pytest.raises(AssertionError):
+        _require_specific_unlink_fatal([{"phase": "pre_fatal", "job_id": "job-a"}])
+    with pytest.raises(AssertionError):
+        _require_specific_unlink_fatal([{
+            "phase": "post_fatal",
+            "fatal_type": "OSError",
+            "fatal_message": "injected source unlink denial",
+            "source": source,
+            "job_id": "job-a",
+        }], source_sha="abc", job_id="job-a")
+    with pytest.raises(AssertionError):
+        _require_specific_unlink_fatal([{
+            "phase": "post_fatal",
+            "fatal_type": "PermissionError",
+            "fatal_message": "other denial",
+            "source": source,
+            "job_id": "job-a",
+        }], source_sha="abc", job_id="job-a")
+    with pytest.raises(AssertionError):
+        _require_specific_unlink_fatal([{
+            "phase": "post_fatal",
+            "fatal_message": "injected source unlink denial",
+            "source": source,
+            "job_id": "job-a",
+        }], source_sha="abc", job_id="job-a")
+    with pytest.raises(AssertionError):
+        _require_specific_unlink_fatal([{
+            "phase": "post_fatal",
+            "fatal_type": "PermissionError",
+            "fatal_message": "injected source unlink denial",
+            "source": {"exists": True, "bytes": 4, "sha256": "wrong"},
+            "job_id": "job-a",
+        }], source_sha="abc", job_id="job-a")
+    with pytest.raises(AssertionError):
+        _require_specific_unlink_fatal([{
+            "phase": "post_fatal",
+            "fatal_type": "PermissionError",
+            "fatal_message": "injected source unlink denial",
+            "source": source,
+            "job_id": "wrong-job",
+        }], source_sha="abc", job_id="job-a")
+
+
+def test_same_turn_loop_stop_records_post_fatal_on_disk(tmp_path):
+    """真实子进程：_mark_fatal 与 loop.stop 同一 turn 也必须把 post_fatal 写入 JSONL。"""
+    import asyncio
+
+    workdir = tmp_path / "same-turn"
+    workdir.mkdir()
+    run = ProbeRun(workdir, "same_turn_observer", "naked")
+
+    async def scenario():
+        await run.start()
+        try:
+            return await run.wait_exit()
+        finally:
+            await run.cleanup()
+
+    code = asyncio.run(scenario())
+    assert code == 0, f"same-turn 观察子进程必须正常退出：{run.log_tail()}"
+    producer_bytes = run.report_path.read_bytes() if run.report_path.exists() else b""
+    entries = [
+        json.loads(line) for line in producer_bytes.decode("utf-8").splitlines() if line.strip()
+    ]
+    _require_specific_unlink_fatal(entries, job_id="same-turn-job")
+
+
+@pytest.mark.asyncio
+async def test_mark_fatal_class_wrap_covers_worker_and_cleanup_done(tmp_path, monkeypatch):
+    """class 包装必须覆盖 I/O worker 构造期绑定与 sourceCleanupDone；实例晚绑不能冒覆盖。"""
+    from tests.fixtures.http_fatal_exit_probe import _install_mark_fatal_observer
+
+    report_path = tmp_path / "probe-report.jsonl"
+    monkeypatch.setenv("CW_PROBE_REPORT", str(report_path))
+    original_mark = server_module.HttpServer._mark_fatal
+    original_done = server_module.HttpServer._on_source_cleanup_done
+    try:
+        _install_mark_fatal_observer()
+        server = HttpServer(_StubApp(), "127.0.0.1", 0, tmp_path / "httpdata").prepare()
+        worker_callback = server._worker._on_failure
+        assert getattr(worker_callback, "__func__", None) is type(server)._mark_fatal
+        server._mark_fatal = lambda exc: (_ for _ in ()).throw(
+            AssertionError("实例晚绑不得覆盖 I/O worker 已绑定的 class 观察点")
+        )
+
+        def boom():
+            raise PermissionError("injected source unlink denial")
+
+        with pytest.raises(PermissionError, match="injected source unlink denial"):
+            await server._worker.run(boom)
+        await _wait_until(
+            lambda: report_path.exists() and report_path.stat().st_size > 0,
+            "I/O worker 走 class _mark_fatal 之后 JSONL 仍为空",
+        )
+        first = _require_specific_unlink_fatal([
+            json.loads(line) for line in report_path.read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        ])
+        assert first["fatal_type"] == "PermissionError"
+
+        async def fail_cleanup():
+            raise PermissionError("injected source unlink denial")
+
+        task = asyncio.create_task(fail_cleanup())
+        with pytest.raises(PermissionError, match="injected source unlink denial"):
+            await task
+        type(server)._on_source_cleanup_done(server, task)
+        entries = [
+            json.loads(line) for line in report_path.read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        ]
+        assert len([e for e in entries if e.get("phase") == "post_fatal"]) >= 1
+        await server.stop()
+    finally:
+        server_module.HttpServer._mark_fatal = original_mark
+        server_module.HttpServer._on_source_cleanup_done = original_done

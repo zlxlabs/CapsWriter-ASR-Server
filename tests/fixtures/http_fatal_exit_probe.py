@@ -18,6 +18,8 @@
   * ``http_init_failure``   HTTP 显式启用但数据目录无法初始化，回归启动失败路径；
                              在真实装配点记录已建好的共享 Manager 的 PID 与 /proc 事实。
   * ``ws_only``             不提供 CW_HTTP_PORT，回归默认 WS 与 HTTP disabled。
+  * ``same_turn_observer``  不启动完整 App：真实 ``HttpServer._mark_fatal`` 与
+                             ``loop.stop`` 同一调度 turn，用来锁死 10ms 轮询契约。
 
 无论哪种模式，进程退出码就是被测行为本身：脚本不吞异常、不代替被测代码退出。
 """
@@ -46,6 +48,9 @@ PROBE_AUDIO_SECONDS = 2.0
 PROBE_AUDIO_MAX_BYTES = 1024 * 1024
 # 清理周期缩短到探针可观测的尺度；谓词本身仍是生产的七天 terminal_at 阈值
 PROBE_CLEANUP_INTERVAL_SECONDS = 0.05
+# 跨 _mark_fatal 包装与 scenario 的只读快照：worker 构造期绑定的是 class 方法，
+# 实例晚绑覆盖不了 I/O callback；source 路径在 unlink 注入时才知道。
+_FATAL_SNAPSHOT: dict = {}
 
 
 # ------------------------------------------------------------------ 白名单事实
@@ -139,6 +144,15 @@ def _shorten_cleanup_interval() -> None:
     from core.server import http_server as server_module
 
     server_module.SOURCE_CLEANUP_INTERVAL_SECONDS = PROBE_CLEANUP_INTERVAL_SECONDS
+
+
+def _install_mark_fatal_observer() -> None:
+    """把观察点绑到 HttpServer._mark_fatal：真实存储 fatal 之后同步落盘。
+
+    必须在 HttpServer 实例化 / HttpIoWorker(self._mark_fatal) 之前包到 class。
+    红阶段此函数先占位；绿阶段才包装，否则同一 turn 的 loop.stop 会抢走 10ms 轮询。
+    """
+    return
 
 
 def _write_probe_wav(path: Path) -> bytes:
@@ -324,6 +338,14 @@ async def run_fatal_scenario(app) -> None:
         "uploaded_bytes": len(payload),
         "uploaded_sha256": hashlib.sha256(payload).hexdigest(),
     })
+    _FATAL_SNAPSHOT.clear()
+    _FATAL_SNAPSHOT.update({
+        "mode": "fatal",
+        "job_id": job_id,
+        "source_path": str(source_path),
+        "source": _sha256_file(source_path),
+        "worker_pid": app.state.recognize_process.pid,
+    })
 
     # 监督链被触发后 start() 会立刻进入收尾；这里等不到也不算失败，
     # 报告已经落盘，消费方从外部观察 unit/进程退出即可。
@@ -344,7 +366,67 @@ async def run_fatal_scenario(app) -> None:
         "fatal_type": type(app.http_server.fatal).__name__,
         "fatal_message": str(app.http_server.fatal),
         "source": _sha256_file(source_path),
+        "job_id": job_id,
     })
+
+
+def run_same_turn_observer_contract() -> None:
+    """真实子进程：_mark_fatal 与 loop.stop 安排在同一调度 turn。
+
+    观察者沿用原 probe 的 10ms ``_wait_until``。fatal 存盘后立刻停 loop 时，
+    轮询还在 sleep，JSONL 不会有 post_fatal——这是当前 producer 契约红。
+    """
+    from types import SimpleNamespace
+
+    from core.server.http_server import HttpServer
+
+    data_dir = Path(os.environ["CW_HTTP_DATA_DIR"])
+    data_dir.mkdir(parents=True, exist_ok=True)
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    app = SimpleNamespace(
+        loop=loop,
+        state=SimpleNamespace(recognize_process=None),
+    )
+    server = HttpServer(app, "127.0.0.1", 0, data_dir)
+    _FATAL_SNAPSHOT.clear()
+    _FATAL_SNAPSHOT.update({
+        "mode": "same_turn_observer",
+        "job_id": "same-turn-job",
+        "source_path": str(data_dir / "missing-source.bin"),
+    })
+    _install_mark_fatal_observer()
+
+    async def observer() -> None:
+        try:
+            await _wait_until(
+                lambda: server.fatal is not None,
+                "同一调度 turn 里 loop 已停，10ms 轮询没看到 listener fatal",
+                timeout=30,
+            )
+        except AssertionError:
+            return
+        fatal = server.fatal
+        emit({
+            "phase": "post_fatal",
+            "mode": "same_turn_observer",
+            "app_pid": os.getpid(),
+            "worker_pid": None,
+            "worker_alive": None,
+            "fatal_type": type(fatal).__name__,
+            "fatal_message": str(fatal),
+            "source": _sha256_file(Path(_FATAL_SNAPSHOT["source_path"])),
+            "job_id": _FATAL_SNAPSHOT["job_id"],
+        })
+
+    def fire() -> None:
+        server._mark_fatal(PermissionError("injected source unlink denial"))
+        loop.stop()
+
+    loop.create_task(observer())
+    loop.call_soon(fire)
+    loop.run_forever()
+    loop.close()
 
 
 async def run_ready_then_sigterm(app, mode: str, wait_http: bool) -> None:
@@ -438,6 +520,9 @@ def main() -> int:
     mode = os.environ.get("CW_PROBE_MODE", "fatal")
     _redirect_output()
     _shorten_cleanup_interval()
+    if mode == "same_turn_observer":
+        run_same_turn_observer_contract()
+        return 0
     from core.server.app import CapsWriterServer
 
     app = CapsWriterServer()
