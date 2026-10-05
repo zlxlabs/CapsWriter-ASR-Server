@@ -27,7 +27,16 @@
 - 本地新增 HTTP listener 测试因开发环境缺少 `aiohttp` 被跳过，未将该跳过计作通过；Windows 原生已实际执行同一测试。Windows 仓库 pytest 配置另有插件导入失配，已用 `--noconftest` 执行该测试，失败原因仍是业务断言而非导入或环境空跑。
 - `git diff --check`、限定文件 `compileall` 通过。
 
+## 本轮补验收（dlg-20261005-074250-f6b02e）
+
+- Linux 全量 CI 栈两套顺序执行：`uv run --no-project --python 3.12`，pytest 9.1.1 / pytest-asyncio 1.4.0 / aiohttp 3.14.3 / httpx 0.28.1，另加 numpy/rich/colorama/soundfile；共享 `flock --timeout 600` + `timeout 900`；每套先 `mkdir` 独立 `TMPDIR`；失败即停、未重跑。套件 1 钉 `websockets==15.0.1`：`490 passed, 7 skipped, 163 warnings in 244.35s`，rc=0。套件 2 不钉 websockets，实际解析 `17.2`：`490 passed, 7 skipped, 163 warnings in 261.55s`，rc=0。七条 skip 均为依赖/环境缺项（ForceAligner 两项、本机 ffmpeg+user systemd 四项、silero-VAD/onnxruntime 一项），不是缺 aiohttp 空跑。Python 实际为 3.12.3。原本地 36 passed 与 HTTP filetasks 1 skip（缺 aiohttp）事实保留，未回填。
+- Windows 隔离 cached CPython 3.12.12 新建专属 venv，pytest 9.1.1 / pytest-asyncio 1.4.0 / aiohttp 3.14.3 / httpx 0.28.1 / websockets 15.0.1，加载项目 conftest（未使用 `--noconftest`）。旧实现 `492fe191e3f9568ea178b61970c732c9d37c4e29` 叠加新测试：`1 failed in 2.18s`，真实 `AssertionError`，落盘前缀 `b"\x00A\r\nB\r\r\nC"` 与 producer `b"\x00A\nB\r\nC"` 在 index 2 处 `b"\r" != b"\n"`；无 ImportError/INTERNALERROR。候选 `0bb836e37eab8314e1e5fb29681a7d10ece7ce4d`：`1 passed in 0.73s`。Python 3.11.7 + `--noconftest` 的历史红绿仍作独立事实保留，不改写成 3.12。
+- 第一枚 PID 探针按启动后进程树记录 launcher 24008、server 17692、两个 multiprocessing 子进程 2504/28384；CTRL_BREAK 后四者精确 PID+创建时间均 gone，退出码 3221225786，`server_forced=false`。日志未能解析识别子进程 PID。第二枚必要小探针用候选目录私有 helper 在真实 `ProcessManager.start()` 之后写出身份：launcher 24832 ≠ server 7628，recognizer 14456（parent 7628，启动前存活），manager 13704（parent 7628，启动前存活）；health `ok` / paraformer / `worker_alive=true`。CTRL_BREAK 后四者精确身份均 gone，退出码仍为 3221225786，未强杀。旧 Task15 子进程身份保持 unknown，不用本轮数字回填。
+- 字节对照链只报告相等布尔：真实 SDK `rb` PATCH 为 TCP producer；handler 以 204/`Upload-Offset` 确认；磁盘物理长度与源相等；声明 size/SHA 与磁盘 readback/SHA 相等。tiny gold 137036 与 77 秒 WAV 2469966 两任务均为 `source_byte_equal=true`、`sha_equal=true`，commit 202 / replay 200，独立 SQLite 重开 `uploads=2 COMMITTED`、`jobs=2 DONE`、`results=2`。摘要不写私有 hex。`getattr(os, "O_BINARY", 0)` 是 POSIX 无该常量时为 0、NT 上为真实二进制位的接口选项，不是业务 fallback。旧 8 个 UPLOADING 损坏源未截断、清理或修复。
+- 本轮只追加本文档；实现与测试文件未再改。未开 PR、未标 ready、未 merge、未重跑 Gate、未部署生产。
+
 ## 未能判定项
 
 - 派发时主干基线查询不可用，继承红与新红无法按同名 CI 步骤区分；本地未运行 Gate，不声称 CI 结果。
 - 本卡未执行生产部署、旧损坏上传自动修复或全平台完整质量矩阵。
+- 旧 Task15 启动记录里 launcher 之外的子进程身份仍 unknown。
