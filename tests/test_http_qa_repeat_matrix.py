@@ -63,9 +63,11 @@ def _json_contains_absolute_path(value: Any) -> bool:
 
 
 def consume_repeat_matrix_trace(path: Path) -> dict[str, Any]:
-    """独立消费者：读持久文件实际字节，缺轮次／缺相位／自贴标签都必须 AssertionError。
+    """独立消费者：读持久文件实际字节，校验 schema 结构与字段一致性。
 
-    FileNotFoundError 会转成 AssertionError，避免「文件不存在」冒充行为红验。
+    结构通过不认证五轮真实执行。缺轮次／缺相位／只改 round 号而 round_job_id
+    不含本轮 r{n} 仍 AssertionError。完整重标且字段自洽的副本会被接受，
+    不能当真实执行证明。FileNotFoundError 转成 AssertionError，避免缺文件冒充行为红验。
     """
     try:
         raw = path.read_bytes()
@@ -131,8 +133,8 @@ def consume_repeat_matrix_trace(path: Path) -> dict[str, Any]:
             evidence_id = phase.get("round_job_id")
             if not isinstance(evidence_id, str) or f"r{round_id}" not in evidence_id:
                 raise AssertionError(
-                    f"round {round_id} 相位 {name} 的 round_job_id 必须含本轮 r{{n}}，"
-                    "禁止借旧事件贴标签"
+                    f"round {round_id} 相位 {name} 的 round_job_id 必须含本轮 r{{n}}"
+                    "（字段一致性，不认证事件来源）"
                 )
             if evidence_id in job_ids:
                 raise AssertionError(f"round_job_id 跨轮或跨相位重复: {evidence_id}")
@@ -240,7 +242,7 @@ def _assert_ffmpeg_round(round_id: int, round_row: dict, prev_offset: int) -> No
         raise AssertionError(f"round {round_id} 缺少本轮 ffmpeg 日志偏移")
     if prev_offset >= 0 and offset <= prev_offset:
         raise AssertionError(
-            f"round {round_id} ffmpeg_log_offset={offset} 必须大于前轮 {prev_offset}，禁止借用累计日志"
+            f"round {round_id} ffmpeg_log_offset={offset} 必须大于前轮 {prev_offset}"
         )
     if not isinstance(count, int) or count < 1:
         raise AssertionError(f"round {round_id} 本轮必须有新的 ffmpeg start，实际={count!r}")
@@ -356,7 +358,7 @@ def test_trace_consumer_rejects_missing_cancel_or_restart_phase(tmp_path):
 
 
 def test_trace_consumer_rejects_relabeled_round_without_unique_job(tmp_path):
-    """反例：把同一轮证据复制五份只改 round 号，round_job_id 不含对应 r{n}。"""
+    """反例：复制五份只改 round 号、IDs 仍属旧相位；字段一致性仍拒。"""
     clone = _complete_round(1)
     rounds = []
     for n in range(1, 6):
@@ -407,8 +409,25 @@ def test_trace_consumer_rejects_reused_ffmpeg_log_offset(tmp_path):
     rounds[3]["ffmpeg_log_offset"] = rounds[2]["ffmpeg_log_offset"]
     path = tmp_path / TRACE_NAME
     path.write_bytes(json.dumps(_envelope(rounds)).encode("utf-8"))
-    with pytest.raises(AssertionError, match="禁止借用累计日志"):
+    with pytest.raises(AssertionError, match="必须大于前轮"):
         consume_repeat_matrix_trace(path)
+
+
+def test_trace_consumer_accepts_fully_relabeled_clone_is_not_execution_proof(tmp_path):
+    """结构有效的全重标副本会被接受；这不能当真实五轮执行证明。"""
+    clone = _complete_round(1)
+    rounds = []
+    for n in range(1, 6):
+        row = json.loads(json.dumps(clone))
+        row["round"] = n
+        row["ffmpeg_log_offset"] = (n - 1) * 2
+        for name, phase in row["phases"].items():
+            phase["round_job_id"] = f"r{n}-{name}-clone"
+        rounds.append(row)
+    path = tmp_path / TRACE_NAME
+    path.write_bytes(json.dumps(_envelope(rounds)).encode("utf-8"))
+    payload = consume_repeat_matrix_trace(path)
+    assert [row["round"] for row in payload["rounds"]] == list(range(1, 6))
 
 
 def test_trace_consumer_rejects_unequal_done_payload(tmp_path):

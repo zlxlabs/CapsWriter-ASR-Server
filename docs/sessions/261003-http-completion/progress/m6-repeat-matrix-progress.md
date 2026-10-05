@@ -10,12 +10,12 @@ CI 3.12 与无会话 `env -i` 各消费一份工件；**不是** 12 组各 5 遍
 - 测试：`tests/test_http_qa_repeat_matrix.py::test_five_round_same_service_concurrency_cancel_restart_ws`
 - 循环：`REPEAT_COUNT = 5`，`REQUIRED_PHASES = (concurrency, cancel_io, restart, legacy_ws)`
 - 同服务：五轮共用一个 `httpdata`；重启只换 PID，不换目录。
-- 复用 `running_runner_server` + `ws_recv`（QA）与 `ManagedHttpServerHarness`（supervision），未改 harness / App / SDK / 旧 tests。
+- 复用 `running_runner_server` + `ws_recv`（QA）与 `ManagedHttpServerHarness`（supervision），未改 harness / App / SDK / 旧 tests。（H0 当时事实。H1 最小授权改 harness WS，见 H1 节；不是把本句改成「H0 已经改过」。）
 
 ## 工件消费者
 
 - `M6_REPEAT_MATRIX_ARTIFACT_DIR` 必须由调用方给出已存在目录。
-- `consume_repeat_matrix_trace` 读文件字节：缺第 5 轮、缺 cancel/restart、自贴 round 标签均 `AssertionError`。
+- `consume_repeat_matrix_trace` 读文件字节：缺第 5 轮、缺 cancel/restart、只改 round 号而 IDs 仍属旧相位均 `AssertionError`。结构通过不认证真实执行。
 - CI 3.12：同一次 `pytest tests/` 写出工件 → `importlib` 再读同一函数 → `upload-artifact`（`if-no-files-found: error`）。不第二次跑该模块。
 - py3.11 仍只跑 SDK，不计五轮。
 
@@ -63,3 +63,7 @@ H1 补测试契约，不改 App/SDK/旧 tests/原 verdict 正文：
 相对 H0 的 505：本模块从 6 条加到 11 条消费者/变异锁。3 个 skip 身份未变（aligner ×2、segmenter silero）。没有 HTTP/ffmpeg/aiohttp 类 skip。
 
 Hosted CI 新 head 待读取，不把 H0 run `37302715605` 当本 head 证据。master 仍 `6aa76f6`，无 Win82 合入。
+
+## H2 证明边界（schema-only）
+
+独立审计：same JSON 可全面重写，消费者不能单独认证执行次数。已删「自贴标签都必须拒」强承诺；只改 round 号、IDs 仍属旧相位仍拒。`test_trace_consumer_accepts_fully_relabeled_clone_is_not_execution_proof` 记录结构有效副本≠真实五轮。不改 producer 循环/相位断言。CI 结构校验不自证真实性。

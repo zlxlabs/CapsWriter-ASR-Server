@@ -28,7 +28,7 @@ REQUIRED_PHASES = ("concurrency", "cancel_io", "restart", "legacy_ws")
 
 ## 每轮相位（缺一轴即该轮无效）
 
-复用现有 `tests/harness/fake_engine.py`、`tests/harness/worker.py`、`running_runner_server`（QA）与 `ManagedHttpServerHarness`（supervision）。不复制生产方法，不新 Fake HTTP listener，不改 harness。假引擎只证明边界，不是 ASR 质量。
+复用现有 `tests/harness/fake_engine.py`、`tests/harness/worker.py`、`running_runner_server`（QA）与 `ManagedHttpServerHarness`（supervision）。不复制生产方法，不新 Fake HTTP listener。**H0 当时**不改 harness。H1 卡面另授权 `tests/harness/server.py` 最小真实 `ws_recv`（opt-in `enable_ws`）；上句是 H0 当时事实，不是「H0 已经改过」。假引擎只证明边界，不是 ASR 质量。
 
 | 相位 | 真实行为 | 证据必须来自 |
 |---|---|---|
@@ -37,7 +37,7 @@ REQUIRED_PHASES = ("concurrency", "cancel_io", "restart", "legacy_ws")
 | `restart` | 同 `data_dir` 上至少一次受控 SIGTERM；新 PID 核对已确认 prefix／未 ACK tail；显式补 suffix（不自动重发 prefix）；已 DONE 新连接领同一 full payload；在途 job → `FAILED[server_restarted]` 且 `received` 已知为空 | 新旧 PID；磁盘 prefix 字节；PATCH offset；`raw_job` / result payload；`list(received)==[]` 作为 known-empty |
 | `legacy_ws` | 重启窗口之后 WS 仍能收到对应 `is_final` 结果 | WS 客户端实际收到的 JSON 字段（`task_id`/`is_final`），不是测试手造 dict |
 
-每轮 round/job/idempotency key 必须带 `r{n}`，禁止借上一轮事件用 `>= 1` 通过。
+每轮 round/job/idempotency key 必须带 `r{n}`，禁止借上一轮事件用 `>= 1` 通过（producer 循环约束）。消费者只校验字段含 `r{n}` 且文件内不重复，**结构通过不认证执行次数**。
 
 ## 工件与两个消费者
 
@@ -50,7 +50,7 @@ REQUIRED_PHASES = ("concurrency", "cancel_io", "restart", "legacy_ws")
 1. 测试内 `consume_repeat_matrix_trace(path)`（主入口写完后立刻调）。
 2. CI 3.12 job 在 `pytest tests/` **一次**跑完后，用 `importlib` 加载同一函数再读同一路径；不第二次跑该模块（避免 10 轮）。
 
-抽掉第 5 轮、删 `cancel_io` 或 `restart` 相位、或只改 round 标签而不含该轮独特 job id，消费者必须以 `AssertionError` 拒绝。缺 ffmpeg / aiohttp / worker 启动失败：本具名入口 **fail**，禁止 `pytest.skip` / `importorskip`。
+抽掉第 5 轮、删 `cancel_io` 或 `restart` 相位、或只改 round 标签而不含该轮独特 job id，消费者必须以 `AssertionError` 拒绝。这是 schema 字段一致性，未承诺抵抗完整 JSON 重写；结构有效副本不能当真实执行证明。缺 ffmpeg / aiohttp / worker 启动失败：本具名入口 **fail**，禁止 `pytest.skip` / `importorskip`。真实五轮仍由 producer 循环与 Hosted／裸环境证明，不能只上传假 JSON。
 
 py3.11 两维仍只跑 `tests/test_sdk_*.py`，不计五轮。CI 只给 3.12 维加 artifact 目录 env、结构校验与 `upload-artifact`（`if-no-files-found: error`）。测试红可保留部分真实工件；setup 没写出文件则 artifact 步骤 fail-loud。
 
