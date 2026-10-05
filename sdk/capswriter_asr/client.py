@@ -356,38 +356,89 @@ async def _transcribe_connected(
                     context=context,
                     model=model,
                 )
+                # 用 asyncio.wait 而不是 asyncio.wait_for：后者在 Python ≤3.11 上会在
+                # 「Future 完成与 task.cancel() 落在同一 tick」时吞掉取消
+                # （asyncio/tasks.py：except CancelledError: if fut.done(): return fut.result()），
+                # 本协程吞掉这一轮取消后会带着已发送的帧进入下一帧全新等待，而那次取消
+                # 已被消费，于是外层 gather 永久挂起（issue #67）。
+                # asyncio.wait 的内部 _wait 没有这个分支，取消一定向上抛。
+                sender = asyncio.ensure_future(ws.send(frame))
                 try:
-                    await asyncio.wait_for(ws.send(frame), timeout=idle_timeout)
-                except TimeoutError as exc:
-                    raise AsrError("timeout", "发送音频帧超过 idle_timeout") from exc
+                    done, _ = await asyncio.wait({sender}, timeout=idle_timeout)
+                    if sender in done:
+                        # 发送失败仍通过 Future 的结果上抛，不在这里另开异常通道。
+                        sender.result()
+                    else:
+                        raise AsrError("timeout", "发送音频帧超过 idle_timeout")
+                finally:
+                    # 与 idle_watch 的 getter 同构：超时分支只 cancel 不额外 await，
+                    # 回收由外层 finally 的 gather 把事件循环驱动到收尾。
+                    sender.cancel()
             upload_done.set()
 
         async def idle_watch() -> None:
             await upload_done.wait()
             while True:
+                # 用 asyncio.wait 而不是 asyncio.wait_for：后者在 Python ≤3.11 上会在
+                # 「令牌到达与 task.cancel() 落在同一 tick」时吞掉取消
+                # （asyncio/tasks.py：except CancelledError: if fut.done(): return fut.result()），
+                # 于是本协程吞掉这一轮取消后又进入下一轮全新等待，而那次取消已被消费，
+                # 永远等不到新的取消 —— finally 里的 gather 便永久挂起（issue #65）。
+                # asyncio.wait 的内部 _wait 没有这个分支，取消一定向上抛。
+                getter = asyncio.ensure_future(idle_messages.get())
                 try:
-                    await asyncio.wait_for(idle_messages.get(), timeout=idle_timeout)
-                except TimeoutError as exc:
-                    raise AsrError("timeout", "上传结束后等待服务端消息超时") from exc
+                    done, _ = await asyncio.wait({getter}, timeout=idle_timeout)
+                    if not done:
+                        raise AsrError("timeout", "上传结束后等待服务端消息超时")
+                finally:
+                    # 实测：只 cancel 不 await 在本代码结构下也不会留下可观测的 pending
+                    # getter（外层 finally 的 gather 会把事件循环驱动到它收尾），因此不额外
+                    # 加一次 await；证据见 docs/sessions/261004-sdk65/root-cause.md 第 4 节。
+                    getter.cancel()
 
         upload_task = asyncio.create_task(upload())
         receive_task = asyncio.create_task(
             _receive(ws, on_progress=on_progress, idle_messages=idle_messages)
         )
         idle_task = asyncio.create_task(idle_watch())
-        tasks = {upload_task, receive_task, idle_task}
+        # ordered 决定多个任务同时完成时的上抛顺序；tasks 只交给 asyncio.wait。
+        ordered = (upload_task, receive_task, idle_task)
+        tasks = set(ordered)
         try:
             while True:
                 done, _ = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
-                for task in done:
-                    result = task.result()
-                    tasks.remove(task)
-                    if task is receive_task:
-                        return result
+                # 同时完成时的裁决：任一已完成的子任务带异常，就先按 upload → receive → idle
+                # 的固定顺序上抛。上传失败/idle 超时不能因为同轮收到了 final 就被改判成成功；
+                # set 的遍历顺序不定，用 ordered 消掉这个不确定性。
+                for task in ordered:
+                    if task not in done:
+                        continue
+                    if task.cancelled():
+                        raise asyncio.CancelledError
+                    error = task.exception()
+                    if error is not None:
+                        raise error
+                if receive_task in done:
+                    return receive_task.result()
+                tasks.difference_update(done)
         finally:
             for task in tasks:
                 task.cancel()
             await asyncio.gather(*tasks, return_exceptions=True)
+
+
+def _auto_budget(duration: float) -> float:
+    """远端转录阶段的自动预算（秒）。
+
+    这是 **watchdog**（挂死检测），不是识别时限 SLA：它唯一的职责是在服务端不再推进
+    时把调用救回来，正常识别远快于它，所以必须按实测耗时留足余量。93 秒音频的一次
+    真实识别约需 306 秒（~3.3× 实时因子），旧公式 ``max(120, 时长 + 60)`` 给到的
+    153 秒会在识别仍在跑时就误杀（issue #69），故改为时长 4 倍 + 120 秒。
+
+    ``+ 120`` 同时覆盖了旧公式 ``max(120, …)`` 的下限语义：时长为 0 或短音频时
+    仍不低于 120 秒，无需双分支。
+    """
+    return duration * 4 + 120
 
 
 async def _operation(
@@ -415,7 +466,7 @@ async def _operation(
     else:
         samples_total = await _count_decoded_samples(audio, encoding)
     duration = samples_total / _RAW_SAMPLE_RATE
-    set_deadline(max(120.0, duration + 60.0))
+    set_deadline(_auto_budget(duration), duration=duration)
     try:
         return await _transcribe_connected(
             url,
@@ -455,10 +506,21 @@ async def transcribe_file(
     # 阶段标记：本地准备（健康检查/转码/样本计数）结束后由 set_deadline 翻到远端转录，
     # 只用于让 timeout 消息能区分卡在哪一段，不对外暴露。
     stage = {"name": "本地准备"}
+    # 被超过的预算快照：显式传参时是入口的 deadline_total，默认路径在本地准备结束后
+    # 由 set_deadline 改写成自动预算的秒数；duration 为 None 表示音频时长还没算出来。
+    budget = {
+        "seconds": 120.0 if deadline_total is None else float(deadline_total),
+        "duration": None,
+    }
 
-    def set_deadline(seconds: float) -> None:
+    def set_deadline(seconds: float, *, duration: float | None = None) -> None:
         stage["name"] = "远端转录"
+        if duration is not None:
+            # 超时消息要能对照「预算多少秒 / 音频多长」，duration 由 _operation 算出后
+            # 随预算一起回传，不走全局变量。
+            budget["duration"] = duration
         if deadline_total is None:
+            budget["seconds"] = seconds
             # 默认时限：本地准备阶段结束后重新锚定，转码耗时不再算进远端转录预算。
             deadline["at"] = time.monotonic() + seconds
             deadline_changed.set()
@@ -466,8 +528,11 @@ async def transcribe_file(
     def timeout_error() -> AsrError:
         # 默认路径下调用方从未传过 deadline_total，被超过的是自动预算；写错名字会让人
         # 误以为自己把预算设太紧了。
-        budget = "自动预算" if deadline_total is None else "deadline_total"
-        return AsrError("timeout", f"转录超过{budget}：{stage['name']}阶段超时")
+        name = "自动预算" if deadline_total is None else "deadline_total"
+        detail = f"{budget['seconds']:.0f} 秒"
+        if budget["duration"] is not None:
+            detail += f"（音频 {budget['duration']:.1f} 秒）"
+        return AsrError("timeout", f"转录超过{name} {detail}：{stage['name']}阶段超时")
 
     async def operation() -> Transcript:
         return await _operation(
@@ -489,13 +554,22 @@ async def transcribe_file(
             remaining = deadline["at"] - time.monotonic()
             if remaining <= 0:
                 raise timeout_error()
+            # 用 asyncio.wait 而不是 asyncio.wait_for：后者在 Python ≤3.11 上会在
+            # 「deadline_changed.set() 与 task.cancel() 落在同一 tick」时吞掉取消，
+            # 本协程吞掉这一轮取消后又进入下一轮全新等待，而那次取消已被消费，
+            # transcribe_file 的 finally 里的 gather 便永久挂起（issue #67）。
+            waiter = asyncio.ensure_future(deadline_changed.wait())
             try:
-                await asyncio.wait_for(deadline_changed.wait(), timeout=remaining)
-            except TimeoutError:
+                done, _ = await asyncio.wait({waiter}, timeout=remaining)
+                if waiter in done:
+                    deadline_changed.clear()
+                    continue
+                # 等待超时：只有确实越过预算才上抛，计时器与 set_deadline 同 tick 时
+                # 以真实时钟为准（asyncio.wait 的计时器精度不保证先于事件投递）。
                 if deadline["at"] <= time.monotonic():
                     raise timeout_error()
-            else:
-                deadline_changed.clear()
+            finally:
+                waiter.cancel()
 
     operation_task = asyncio.create_task(operation())
     timer_task = asyncio.create_task(deadline_watch())
