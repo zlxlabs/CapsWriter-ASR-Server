@@ -29,3 +29,17 @@ partial，**不能声称 M7Done**。Linux 与 Mac 已在独立目录用 492fe �
 - 工作树 `card/http-m7-final-three-platform-261005`，起点即 492fe。
 - 无交接单。巡检存活探针不可用；memory 命中多设备与部署条目，只用来理解已有 prep 路径，未读 profile。
 - 本仓仍开 #72/#69/#68/#67/#65 等，不在本卡范围。
+
+## 本派发新 bootstrap 记录（2026-10-05）
+
+- 本派发 `dlg-20261005-054600-e8f4a5` 从 f705 新工作树启动；运行源仍为
+  `492fe191e3f9568ea178b61970c732c9d37c4e29`，本轮只追加文档证据。
+- Windows 原生 SSH 只读连接成功；prep 根存在，Python、`numpy`、
+  `sherpa_onnx`、`soundfile` 初验成功。精确成功 runner、correction 指针和
+  三条授权 231 秒文件均不存在，未使用相邻脚本或通用目录名替代，Windows
+  完整服务/两协议/PID/PeakWorkingSet64 保持未测。
+- WeNet/AISHELL manifest 三行在私有进程内解码，data-list/text 参考字段
+  36 字节逐字节一致并以 `0600` 私有文件保存；唯一匿名 GET 的 31 字节响应
+  不是 RIFF WAV，未重试，故 gold/CER 与四 codec 不成立。
+- 231 长样本、可信 gold、四 codec 和 explicit weaknet 没有真实 producer
+  输入，保持 `blocked/not run`；本阶段仍 `partial`，不声称 M7Done。

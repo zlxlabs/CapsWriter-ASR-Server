@@ -74,3 +74,33 @@ Mac `ps` RSS（测量结束瞬时，**不是** `ru_maxrss` / 全时峰）：主�
 - 弱网手工 reconnect 未做（Goal 仅要求显式弱网时才做）。
 - #72 recovery 落盘顺序不修；fresh ID 不是修复。
 - 派发时主干 CI 基线 `gh api` 不可用，继承红未能判定。
+
+## 7. 新 bootstrap 未测矩阵核验（2026-10-05，f705 → 本轮）
+
+本节只记录本派发 `dlg-20261005-054600-e8f4a5` 的新增核验，运行源仍固定为
+`492fe191e3f9568ea178b61970c732c9d37c4e29`；不把旧 Linux/Mac 采集或两套
+`493 passed` 重新计入本轮，也不改写上面的历史结论。
+
+- 私有上下文由拥有者权限 `0600` 的 Python 进程加载；target、prep 根和精确文件
+  字段只作为原生参数/探针输入，未打印私有路径、主机、音频或参考正文。三条
+  231 秒授权文件在 Windows 目标上的 `Path.Exists` 均为 false；没有拼接、重建、
+  重识别或把相邻文件当替代。
+- Windows 原生只读 SSH 连接返回成功；prep 根是目录，Python 可执行文件存在，
+  `numpy`、`sherpa_onnx`、`soundfile` 导入初验均成功。精确的
+  `successfulrun-windows.ps1` 与 `correction-161729-pointers.json` 不在该根；
+  根下虽然有其他脚本名，但按续卡约束不把它们当成功路径 fallback。因此没有
+  启动 Windows 服务、没有声称 Windows launcher/probe PID、PeakWorkingSet64、
+  两协议或停止语义已测。
+- WeNet/AISHELL fixture 的清单行由私有 Python 进程分别解码：data-list 167
+  字节、wav.scp 99 字节、text 84 字节，data-list 与 text 的参考字段均为
+  36 字节且逐字节一致，绑定校验成立；参考正文仍只落在私有 `0600` 文件。
+  这证明材料绑定，不证明音频可消费。
+- 对固定 revision `d17059667d6afe0680d19b3a4948ab825ef25105` 的唯一匿名 GET
+  已落盘为私有 `0600` 文件，实际响应体 31 字节且不是 RIFF WAV；首次探针在
+  未保存 HTTP 状态前解析失败，未重试、未补凭据。故没有真实 WAV、没有人工
+  gold 消费、没有 CER，也没有从该失败响应派生 MP3/AAC/M4A/Opus。
+- 因授权 231 秒文件和可消费 gold 都缺失，三平台 231 长样本、同源四 codec、
+  可信质量基线及 explicit weaknet（真实服务首次失败、owner 新 SDK 进程
+  offset 恢复）本轮均保持 `not run / blocked`；没有 synthetic listener、
+  synthetic response、自动重试或伪造续传数据。新阶段结论仍为
+  `partial / failed`，不能声称 M7Done。
