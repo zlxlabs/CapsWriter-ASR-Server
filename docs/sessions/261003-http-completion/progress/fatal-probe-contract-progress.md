@@ -55,3 +55,6 @@ Task09 pin 481+3+1、无效 TMPDIR 6fail、Task10 两 493 绿、Task11 skipped�
 - 旧两套 496+3 skip 记录保留，不覆盖；本回修后 cleanup 模块须重跑，旧 496 不能替新测试内容
 
 回修后两套全量（实测 HEAD `c1b608169b68b7eccdfd120cfbb80b1dd3f4aff4`；文档本段之后另提交，不冒已检）：`env -i` cleanup **18 passed / 0 skipped**。共享锁 `~/.cache/caps-http-261005-fullsuite.lock`：ws15.0.1 queue_s=0 exec_s=233.119 **498 passed / 3 skipped**；ws-unpinned(websockets 17.2) queue_s=0 exec_s=233.877 **498 passed / 3 skipped**。具名 skip 仍为 `test_aligner_integration.py:53`、`:62`、`test_segmenter.py:208`。**不是** systemd/ffmpeg/aiohttp skip。
+
+## 回修（Task16：env -i manager 须同 bus）
+Codex 当时 18 collected / 14 pass / 4 fail（query 未传 bus）。红 `f22b9e2c900bb8adb4dc6b418197b2098f576e3d` 绿 `6ffaed573c3f78d3dbc522e13d984a7e3c080392`。本轮 env -i 无 XDG/DBUS：cleanup **19 passed / 0 skipped**。两套全量（父进程未注入 bus）：ws15.0.1 queue_s=0 exec_s=245.688 **499 passed / 3 skipped**；ws-unpinned(17.2) queue_s=0 exec_s=257.14 **499 passed / 3 skipped**。skip 仍为 aligner :53/:62、segmenter:208。文档本段后另提交。
