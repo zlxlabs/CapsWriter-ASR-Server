@@ -50,8 +50,13 @@ async def _error(url, *frames):
 
 
 def _encode_flac(samples):
+    # design.md 关键不变式 3 锁死协议截断与 samples_total 校验（#43/#75）：
+    # 依赖真实 ffmpeg 编码 FLAC，缺少 ffmpeg 必须明确失败而非静默 skip。
     if shutil.which("ffmpeg") is None:
-        pytest.skip("测试环境没有 ffmpeg")
+        pytest.fail(
+            "测试环境缺少 ffmpeg：_encode_flac 锁定 design.md 关键不变式 3，缺 ffmpeg 必须失败而非 skip",
+            pytrace=False,
+        )
     result = subprocess.run(
         ["ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error",
          "-f", "f32le", "-ar", "16000", "-ac", "1", "-i", "pipe:0",

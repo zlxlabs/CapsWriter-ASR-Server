@@ -21,10 +21,14 @@ from sdk.capswriter_asr import Transcript, transcribe_file
 from sdk.capswriter_asr import client as sdk_client
 
 
-pytestmark = pytest.mark.skipif(
-    shutil.which("ffmpeg") is None,
-    reason="测试环境没有真实 ffmpeg",
-)
+# 关键不变式 1、6（docs/sessions/261001-samples-total-source/design.md）依赖真实 ffmpeg 锁定：
+# 缺少 ffmpeg 时必须明确失败，禁止静默 skip 导致不变式未被真正验证（#75）。
+if shutil.which("ffmpeg") is None:
+    pytest.fail(
+        "测试环境缺少 ffmpeg：本文件锁定 design.md 关键不变式 1/6，缺 ffmpeg 必须失败而非 skip",
+        pytrace=False,
+    )
+
 
 
 def _run_ffmpeg(*args: str) -> None:

@@ -20,10 +20,14 @@ from sdk.capswriter_asr import AsrError
 from sdk.capswriter_asr import client as sdk_client
 
 
-pytestmark = pytest.mark.skipif(
-    shutil.which("ffmpeg") is None,
-    reason="测试环境没有真实 ffmpeg",
-)
+# 本文件锁定转码选轨契约（#52）与 design.md 相关不变式：
+# 依赖真实 ffmpeg 构造多轨输入与断言 argv，缺少 ffmpeg 时必须明确失败而非静默 skip（#75）。
+if shutil.which("ffmpeg") is None:
+    pytest.fail(
+        "测试环境缺少 ffmpeg：本文件锁定选轨契约（#52），缺 ffmpeg 必须失败而非 skip",
+        pytrace=False,
+    )
+
 
 _TRACK_SPEC = "0:a:0"  # 契约：只转录第一条音轨
 
