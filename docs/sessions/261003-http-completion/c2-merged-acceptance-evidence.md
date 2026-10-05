@@ -31,7 +31,7 @@
 
 ## 2. 本卡预算内的实际 suite
 
-每套独立使用 `/home/zlx/.cache/caps-http-261005-fullsuite.lock`；排队最多 600 秒，
+每套独立使用既定共享 flock 路径 `caps-http-261005-fullsuite.lock`；排队最多 600 秒，
 取得锁后 `timeout 900s`，一套结束立即释放锁。排队和执行分别计时，没有把排队算入
 900 秒，也没有对已执行的 pytest 自动重试。
 
@@ -89,7 +89,7 @@ A1 的旧正常/PermissionError 证据不重新读取受限私有 JSON，也不�
 文档提交后只执行一次：
 
 ```text
-python3 /home/zlx/.local/lib/agent-config-runtime/releases/31de0709a6c1dcb218d2ade655d09e3f5e1e6cab/scripts/delegate/accept_precheck.py --dispatch-id dlg-20261005-015734-7ed447 --repo-path <本工作树> --commit-range 4de4a7ffa44dfb50b48c252510927c4b2166cc77..HEAD --timeout-sec 900 --verify-timeout-sec 1200
+python3 <runtime-release>/scripts/delegate/accept_precheck.py --dispatch-id dlg-20261005-015734-7ed447 --repo-path <本工作树> --commit-range 4de4a7ffa44dfb50b48c252510927c4b2166cc77..HEAD --timeout-sec 900 --verify-timeout-sec 1200
 ```
 
 其 `scope` 只验证本卡两条文档，不替代 suite；`accept_precheck.json` 的
