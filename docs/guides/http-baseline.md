@@ -2,6 +2,14 @@
 
 `scripts/_baseline_http_ws.py` 使用仓库 SDK 的实际 producer，测量 HTTP 文件任务与默认 WebSocket v2 的本机应用层 payload、完成耗时和 token/timestamp 事实，并可与一份显式参考稿比较。它只连接 loopback 地址；服务必须在同一隔离主机运行。`status=ok` 表示采集和结果落盘完成，不是识别质量通过。
 
+## 实际实验范围
+
+本工具是本批**可信所有者操作的短素材基线实验采集**，不是「通用任意长媒体」采集器，也不保证「各种输入、任意大小」失败都受控。
+
+已指定并完成容器/解码元数据实测的样本：约 77.184 秒 WAV 与同长 MP4，以及约 231.552 秒三倍 WAV。当前最大 decoded PCM 为 14 819 328 字节（约 231.552 秒、16 kHz 单声道 float32）。任意大媒体在有限内存下的可靠性不属本轮已验范围。
+
+这不是代码强制时长上限：CLI `--input` 没有机械上限，工具也没有拒绝超限、流式解码或内存上界保护。不能把上述观测写成「已保障 ≤240 秒」或「服务端 / SDK 文件任务协议只支持约 232 秒」。协议与 SDK API 未因本实验收窄。整段 PCM 只用于 decoded 帧字节事实计量，与 SDK WebSocket 分段和线上 wire bytes 不同；源文件字节、PCM、FLAC/应用 payload 的计量定义见下一节，保持不变。
+
 ## 测量口径
 
 - HTTP 输入是原始文件。分别记录源文件字节、以本机 ffmpeg/soundfile 解码为 16 kHz 单声道 `f32le` 后的 PCM 字节、SDK 实际发出的 PATCH body 累计字节和 create 控制 JSON 字节。
@@ -10,7 +18,7 @@
 - 以上是应用 payload，不含 HTTP headers、TCP、TLS、WebSocket frame 或链路层开销。传输层 TCP 重发对 SDK `send()` 不可见。
 - 每个协议单独执行一个任务。MP4 与 WAV 用不同匿名 fixture ID、分开记录；比较时两协议必须使用同一源文件、同一服务模型、同一 `seg_duration` 和 `seg_overlap`。
 - 工具校验 `/health` 的 `status`、`worker_alive`、模型、协议版本和运行 `git_sha`。健康端点目前返回短 SHA；要求它是指定完整 server SHA 的至少 7 位前缀。结果同时记 benchmark tool SHA 和 SDK 版本，不把工具提交 SHA 说成服务版本。
-- 私有 JSON 保存源绝对路径和哈希、参考稿、完整 final 文本/token/timestamp、请求体摘要及模型与工具信息，要求仓库外目录权限为 `0700`，文件权限为 `0600`。stdout 仅含匿名 ID、字节数和指标；失败写 `BASELINE_FAILED` 到 stderr 并非零退出。
+- 私有 JSON 保存源绝对路径和哈希、参考稿、完整 final 文本/token/timestamp、请求体摘要及模型与工具信息，要求仓库外目录权限为 `0700`，文件权限为 `0600`。stdout 仅含匿名 ID、字节数和指标。CLI 捕获的普通 Exception（含当前观测到的 `MemoryError`）写 `BASELINE_FAILED` 到 stderr 并非零退出；这是 fail-loud，不能证明内核 OOM 受控。未知大型输入上的内核 OOM 可能直接杀死进程，从而绕过 `BASELINE_FAILED`。
 
 ## Linux 隔离运行
 
@@ -76,6 +84,8 @@ print(status.state, status.result_available, status.source_available, status.err
 ```
 
 不要自动删除 recovery 或结果文件，也不要自动重试、恢复或取消任务。只有用户明确开始一次新测量时才使用新的匿名 fixture ID；这会创建可能重复计算的新上传/任务，不是对原任务的恢复。已有结果文件以独占创建方式写入，不会覆盖。此处的权限要求针对 Linux `0700` 目录和 `0600` 文件；Windows ACL 未在本指南的实测范围内。
+
+上述独占落盘、fresh fixture ID，以及 recovery 在结果校验/写入前先删，是当前操作契约与已知限制，不是对本仓 #72 的行为修复。#72 仍 OPEN，后续扩大到超大媒体时再定义输入边界/计数与「结果写完再清 recovery」的验收。数据可再生成不等于零损失：同 ID 冲突时可能丢掉这一次新采集结果；旧用户媒体与旧结果不被覆盖。
 
 ## 回归验证
 

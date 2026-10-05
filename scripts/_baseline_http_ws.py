@@ -1,5 +1,12 @@
 # coding: utf-8
-"""真实 SDK HTTP 与协议 v2 WebSocket 基线采集器。"""
+"""真实 SDK HTTP 与协议 v2 WebSocket 基线采集器。
+
+本脚本是本批可信所有者操作的短素材基线实验采集工具，不是通用任意长媒体采集器。
+已指定实验样本约 77.184 秒 WAV/MP4 与约 231.552 秒三倍 WAV；任意大媒体在有限内存下的可靠性不属本轮已验范围。
+这不是代码强制时长上限，也不表示服务端或 SDK 文件任务协议只支持约 232 秒。
+整段 PCM 只用于 decoded 帧字节事实计量，与 SDK WebSocket 分段和线上 wire bytes 不同。
+未知大型输入可能被内核 OOM 杀死从而绕过 CLI 的 BASELINE_FAILED；当前 MemoryError 作为普通 Exception 由 CLI fail-loud，不能证明内核 OOM 受控。
+"""
 from __future__ import annotations
 
 import argparse
@@ -345,7 +352,13 @@ def _file_sha256(path: Path) -> str:
 
 
 def _decode_pcm_bytes(path: Path) -> tuple[int, float]:
-    """计本机 ffmpeg/soundfile 解码出的 16 kHz mono float32 PCM 字节。"""
+    """计本机 ffmpeg/soundfile 解码出的 16 kHz mono float32 PCM 字节。
+
+    当前实现对 WAV 快路径一次 sf.read、其他格式一次 ffmpeg stdout PIPE 全量装入，只为计量 decoded 帧字节。
+    本函数没有时长或体积上限，也没有流式或内存上界保护。
+    已测样本：约 77.184 秒 WAV/MP4 解码 4_939_776 字节，约 231.552 秒 WAV 解码 14_819_328 字节。
+    不能把这些观测写成 ≤240 秒硬保障，也不能把整段 PCM 当成 SDK 分段或线上 payload。
+    """
     if path.suffix.lower() == ".wav":
         audio, rate = sf.read(path, dtype="float32", always_2d=True)
         if rate == SAMPLE_RATE:
