@@ -26,3 +26,13 @@
 - 原 B1 whole-buffer、B2 recovery cleanup order、普通 `MemoryError` 与 kernel OOM 的区别、fresh fixture ID 非修复均保持原 verdict；不实现 P2。
 - 派发时主干基线 `gh api` 不可用，继承红无法判定；不把它改写为新红。
 - 新证据详见 `m7-current-main-funnel-evidence.md`；旧 `pr64-canonical-risk-verdict.md`、`docs/guides/http-baseline.md` 与作者证据不改写。
+
+## 2026-10-05 真实服务入口补验证
+
+- Dispatch-Id：`dlg-20261005-022118-2d40be`；候选仍为 `03698e6`，不重刷 487+3 两套全量，不改产品/SDK/collector/tests。
+- 承认上一轮 `m7-synthetic-025` 只证明 SDK/collector producer 与合成 listener，不是 `CapsWriterServer` 服务链；旧表与旧元数据不改写。
+- 独立真实主进程 + 识别子进程 + `HttpServer`/`HttpStore`/`HttpFileRunner` + 默认 WSv2；识别引擎为现有夹具显式 stub。
+- 真实 `/health`：`ok` / `paraformer` / `git_sha=03698e6` / `worker_alive=true`；加载模块字节与磁盘候选一致。
+- collector CLI HTTP 与默认 WSv2 各一次：源 8044 字节、PCM 16000 字节；HTTP PATCH=源字节且 SQLite `DONE`；WSv2 1 个 UTF-8 JSON 文本帧、0 binary；FileRunner 实际走 ffmpeg。
+- 向自有 PID 发 `SIGTERM` 后主进程/worker/Manager 的 `/proc` 均不在，SQLite 仍可读 `DONE`。
+- 父报告哈希保持 `5f114664c6f53ee2aefbdc6d41a1da2a4ff1169fe00cf1c318c133197b10fb5b`，未覆盖旧 JSON。
