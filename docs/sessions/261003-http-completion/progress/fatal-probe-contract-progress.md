@@ -35,7 +35,7 @@
 | systemd 具名 skip 资源 | `ffmpeg`、user systemd `/bin/true` preflight、`aiohttp` importorskip。本次 **0 skip**，不是用 skip 反推 systemd 跑过 |
 | 本卡不 PR | 全套 CI 由主脑后续 PR；本机两套 pytest 见下 |
 
-绿提交：`49402349cce3ed0e07d50f076dd9c6f011b8ede7`。文档提交：以 `git rev-parse HEAD` 冻结。两套全量 `tests/` 共享锁 `/home/zlx/.cache/caps-http-261005-fullsuite.lock`：ws15.0.1 queue_s=0 exec_s=244.55 **496 passed / 3 skipped**；ws-unpinned(websockets 17.2) queue_s=0 exec_s=242.434 **496 passed / 3 skipped**。具名 skip：`test_aligner_integration.py:53`、`:62`（ForceAligner 后端/模型未安装）、`test_segmenter.py:208`（缺 silero-VAD/onnxruntime）。**不是** systemd/ffmpeg/aiohttp skip。`env -i` 裸 shell 跑 `tests/test_http_cleanup.py`：**16 passed / 0 skipped**。
+绿提交：`49402349cce3ed0e07d50f076dd9c6f011b8ede7`。文档提交：以 `git rev-parse HEAD` 冻结。两套全量 `tests/` 共享锁 `~/.cache/caps-http-261005-fullsuite.lock`：ws15.0.1 queue_s=0 exec_s=244.55 **496 passed / 3 skipped**；ws-unpinned(websockets 17.2) queue_s=0 exec_s=242.434 **496 passed / 3 skipped**。具名 skip：`test_aligner_integration.py:53`、`:62`（ForceAligner 后端/模型未安装）、`test_segmenter.py:208`（缺 silero-VAD/onnxruntime）。**不是** systemd/ffmpeg/aiohttp skip。`env -i` 裸 shell 跑 `tests/test_http_cleanup.py`：**16 passed / 0 skipped**。
 
 Task09 pin 481+3+1、无效 TMPDIR 6fail、Task10 两 493 绿、Task11 skipped（`/bin/true` 未传 bus）不重开诊断。原报告 Env unknown 不拿新 env 回填。
 
