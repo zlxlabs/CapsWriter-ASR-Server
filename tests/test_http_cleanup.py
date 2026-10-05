@@ -1452,19 +1452,25 @@ def test_same_turn_loop_stop_records_post_fatal_on_disk(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_mark_fatal_class_wrap_covers_worker_and_cleanup_done(tmp_path, monkeypatch):
-    """class 包装必须覆盖 I/O worker 构造期绑定与 sourceCleanupDone；实例晚绑不能冒覆盖。"""
-    from tests.fixtures.http_fatal_exit_probe import _install_mark_fatal_observer
+async def test_io_worker_bound_mark_fatal_writes_fresh_jsonl(tmp_path, monkeypatch):
+    """I/O worker 构造期绑定的 class _mark_fatal：独立空 JSONL 必须出现具体 PermissionError。"""
+    from tests.fixtures.http_fatal_exit_probe import (
+        _FATAL_SNAPSHOT,
+        _install_mark_fatal_observer,
+    )
 
-    report_path = tmp_path / "probe-report.jsonl"
+    report_path = tmp_path / "worker-only.jsonl"
     monkeypatch.setenv("CW_PROBE_REPORT", str(report_path))
     original_mark = server_module.HttpServer._mark_fatal
     original_done = server_module.HttpServer._on_source_cleanup_done
     try:
+        _FATAL_SNAPSHOT.clear()
+        _FATAL_SNAPSHOT.update({"mode": "fatal", "job_id": "job-io-worker"})
         _install_mark_fatal_observer()
-        server = HttpServer(_StubApp(), "127.0.0.1", 0, tmp_path / "httpdata").prepare()
-        worker_callback = server._worker._on_failure
-        assert getattr(worker_callback, "__func__", None) is type(server)._mark_fatal
+        assert server_module.HttpServer._on_source_cleanup_done is original_done
+        server = HttpServer(_StubApp(), "127.0.0.1", 0, tmp_path / "httpdata-worker").prepare()
+        assert server.fatal is None
+        assert getattr(server._worker._on_failure, "__func__", None) is type(server)._mark_fatal
         server._mark_fatal = lambda exc: (_ for _ in ()).throw(
             AssertionError("实例晚绑不得覆盖 I/O worker 已绑定的 class 观察点")
         )
@@ -1474,15 +1480,68 @@ async def test_mark_fatal_class_wrap_covers_worker_and_cleanup_done(tmp_path, mo
 
         with pytest.raises(PermissionError, match="injected source unlink denial"):
             await server._worker.run(boom)
-        await _wait_until(
-            lambda: report_path.exists() and report_path.stat().st_size > 0,
-            "I/O worker 走 class _mark_fatal 之后 JSONL 仍为空",
-        )
-        first = _require_specific_unlink_fatal([
-            json.loads(line) for line in report_path.read_text(encoding="utf-8").splitlines()
-            if line.strip()
-        ])
-        assert first["fatal_type"] == "PermissionError"
+        producer = report_path.read_bytes()
+        _require_specific_unlink_fatal(_jsonl_from_bytes(report_path), job_id="job-io-worker")
+        await server.stop()
+    finally:
+        _FATAL_SNAPSHOT.clear()
+        server_module.HttpServer._mark_fatal = original_mark
+        server_module.HttpServer._on_source_cleanup_done = original_done
+
+
+@pytest.mark.asyncio
+async def test_io_worker_disconnected_callback_writes_no_jsonl(tmp_path, monkeypatch):
+    """负控：断开 worker 真实 on_failure 后不得写出 post_fatal。"""
+    from tests.fixtures.http_fatal_exit_probe import (
+        _FATAL_SNAPSHOT,
+        _install_mark_fatal_observer,
+    )
+
+    report_path = tmp_path / "worker-disconnected.jsonl"
+    monkeypatch.setenv("CW_PROBE_REPORT", str(report_path))
+    original_mark = server_module.HttpServer._mark_fatal
+    original_done = server_module.HttpServer._on_source_cleanup_done
+    try:
+        _FATAL_SNAPSHOT.clear()
+        _FATAL_SNAPSHOT.update({"mode": "fatal", "job_id": "job-io-worker"})
+        _install_mark_fatal_observer()
+        server = HttpServer(_StubApp(), "127.0.0.1", 0, tmp_path / "httpdata-disc").prepare()
+        server._worker._on_failure = lambda exc: None
+
+        def boom():
+            raise PermissionError("injected source unlink denial")
+
+        with pytest.raises(PermissionError, match="injected source unlink denial"):
+            await server._worker.run(boom)
+        producer = report_path.read_bytes() if report_path.exists() else b""
+        assert producer == b"", producer
+        await server.stop()
+    finally:
+        _FATAL_SNAPSHOT.clear()
+        server_module.HttpServer._mark_fatal = original_mark
+        server_module.HttpServer._on_source_cleanup_done = original_done
+
+
+@pytest.mark.asyncio
+async def test_original_cleanup_done_writes_fresh_jsonl(tmp_path, monkeypatch):
+    """独立新 server + 空 JSONL：原 _on_source_cleanup_done 在 fatal 仍为 None 时必须落盘。"""
+    from tests.fixtures.http_fatal_exit_probe import (
+        _FATAL_SNAPSHOT,
+        _install_mark_fatal_observer,
+    )
+
+    report_path = tmp_path / "cleanup-done-only.jsonl"
+    monkeypatch.setenv("CW_PROBE_REPORT", str(report_path))
+    original_mark = server_module.HttpServer._mark_fatal
+    original_done = server_module.HttpServer._on_source_cleanup_done
+    try:
+        _FATAL_SNAPSHOT.clear()
+        _FATAL_SNAPSHOT.update({"mode": "fatal", "job_id": "job-cleanup-done"})
+        _install_mark_fatal_observer()
+        assert server_module.HttpServer._on_source_cleanup_done is original_done
+        server = HttpServer(_StubApp(), "127.0.0.1", 0, tmp_path / "httpdata-done").prepare()
+        assert server.fatal is None
+        assert not report_path.exists()
 
         async def fail_cleanup():
             raise PermissionError("injected source unlink denial")
@@ -1490,14 +1549,57 @@ async def test_mark_fatal_class_wrap_covers_worker_and_cleanup_done(tmp_path, mo
         task = asyncio.create_task(fail_cleanup())
         with pytest.raises(PermissionError, match="injected source unlink denial"):
             await task
-        type(server)._on_source_cleanup_done(server, task)
-        entries = [
-            json.loads(line) for line in report_path.read_text(encoding="utf-8").splitlines()
-            if line.strip()
-        ]
-        assert len([e for e in entries if e.get("phase") == "post_fatal"]) >= 1
+        original_done(server, task)
+        producer = report_path.read_bytes()
+        report = _require_specific_unlink_fatal(
+            _jsonl_from_bytes(report_path), job_id="job-cleanup-done",
+        )
+        assert report["job_id"] != "job-io-worker"
+        assert isinstance(server.fatal, PermissionError)
+        with pytest.raises(AssertionError):
+            _require_specific_unlink_fatal(_jsonl_from_bytes(report_path), job_id="wrong-job")
         await server.stop()
     finally:
+        _FATAL_SNAPSHOT.clear()
+        server_module.HttpServer._mark_fatal = original_mark
+        server_module.HttpServer._on_source_cleanup_done = original_done
+
+
+@pytest.mark.asyncio
+async def test_original_cleanup_done_wrong_type_rejected(tmp_path, monkeypatch):
+    """负控：原 callback 写入的若不是 unlink PermissionError，消费判据必须红。"""
+    from tests.fixtures.http_fatal_exit_probe import (
+        _FATAL_SNAPSHOT,
+        _install_mark_fatal_observer,
+    )
+
+    report_path = tmp_path / "cleanup-wrong-type.jsonl"
+    monkeypatch.setenv("CW_PROBE_REPORT", str(report_path))
+    original_mark = server_module.HttpServer._mark_fatal
+    original_done = server_module.HttpServer._on_source_cleanup_done
+    try:
+        _FATAL_SNAPSHOT.clear()
+        _FATAL_SNAPSHOT.update({"mode": "fatal", "job_id": "job-cleanup-done"})
+        _install_mark_fatal_observer()
+        server = HttpServer(_StubApp(), "127.0.0.1", 0, tmp_path / "httpdata-oserror").prepare()
+        assert server.fatal is None
+
+        async def fail_cleanup():
+            raise OSError("not-the-unlink-denial")
+
+        task = asyncio.create_task(fail_cleanup())
+        with pytest.raises(OSError, match="not-the-unlink-denial"):
+            await task
+        original_done(server, task)
+        producer = report_path.read_bytes()
+        assert producer, "原 callback 必须写出实际 JSONL 字节，不能空集恒真"
+        with pytest.raises(AssertionError):
+            _require_specific_unlink_fatal(
+                _jsonl_from_bytes(report_path), job_id="job-cleanup-done",
+            )
+        await server.stop()
+    finally:
+        _FATAL_SNAPSHOT.clear()
         server_module.HttpServer._mark_fatal = original_mark
         server_module.HttpServer._on_source_cleanup_done = original_done
 

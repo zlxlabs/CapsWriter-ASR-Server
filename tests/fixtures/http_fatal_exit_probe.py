@@ -174,8 +174,8 @@ def _install_mark_fatal_observer() -> None:
     """把观察点绑到 HttpServer._mark_fatal：真实存储 fatal 之后、loop 停之前落盘。
 
     必须在 HttpServer 实例化 / HttpIoWorker(self._mark_fatal) 之前包到 class：
-    I/O worker 构造器保存的是当时的 bound method；``_on_source_cleanup_done``
-    走 class 查找，实例晚绑不能冒覆盖这两条真实来源。
+    I/O worker 构造器保存当时的 bound method；生产 ``_on_source_cleanup_done``
+    本来就通过 ``self._mark_fatal`` 查到 class 包装，不得替换该回调函数。
     """
     from core.server import http_server as server_module
 
@@ -194,16 +194,7 @@ def _install_mark_fatal_observer() -> None:
         _emit_post_fatal(self, stored)
 
     observed_mark._cw_probe_observed = True
-
-    def observed_done(self, task) -> None:
-        if task.cancelled():
-            return
-        error = task.exception()
-        if error is not None:
-            type(self)._mark_fatal(self, error)
-
     server_module.HttpServer._mark_fatal = observed_mark
-    server_module.HttpServer._on_source_cleanup_done = observed_done
 
 
 def _write_probe_wav(path: Path) -> bytes:
