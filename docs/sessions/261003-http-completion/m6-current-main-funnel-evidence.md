@@ -41,7 +41,7 @@
 ## 全量测试（两套 CI 栈）
 
 两次套件串行执行，共享
-`flock --timeout 600 /home/zlx/.cache/caps-http-261005-fullsuite.lock`，
+`flock --timeout 600 ~/.cache/caps-http-261005-fullsuite.lock`，
 拿到锁后再 `timeout 900`。等锁失败会 fail-loud，没有重试、没有扩大 900 秒。
 锁等待与执行分开记账。隔离由既有测试的 `tmp_path` + port 0 完成，
 没有按名字杀进程，也没有动原系统 PATH。

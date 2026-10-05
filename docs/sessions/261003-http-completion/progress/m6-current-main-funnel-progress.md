@@ -24,7 +24,7 @@
 
 ## 全量验证（当前 HEAD，两套 websockets 各一次）
 
-共享锁 `/home/zlx/.cache/caps-http-261005-fullsuite.lock`，
+共享锁 `~/.cache/caps-http-261005-fullsuite.lock`，
 `flock --timeout 600` 后 `timeout 900`，无自动重试。
 
 - `websockets==15.0.1`：`482 passed, 3 skipped, 163 warnings in 230.56s`；
