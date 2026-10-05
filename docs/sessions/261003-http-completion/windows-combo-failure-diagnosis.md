@@ -46,3 +46,21 @@
 已有独立记录的 naked cleanup 15 passed/4 failed、systemd cleanup passed、HttpStore 16 passed（含二进制 payload）及 options 两例通过，都是分层诊断结果，不能解释旧全量 55/24。受控全量仅说明当前 Linux/POSIX 代码组合与主干在同一环境下有相同两条红；不外推 Windows 上 O_BINARY 行为，也不把「主干也红」当成旧 55/24 的豁免证据。
 
 建议保留这两个继承失败作为单独基线记录；旧现场标注「首因未能判定」，不据严重度猜测新代码、ffmpeg、导入路径或顺序污染。未修改实现、测试、CI、PR 状态或主干。
+
+
+
+## 本轮两个历史失败节点的有界补诊
+
+本轮只跑 **test_cli_http_producer_payload_and_private_json_bytes** 与 **test_empty_reference_fails_loudly_before_health_or_upload**，没有重跑全量。两个节点在一次有界依赖差分的两臂中都通过：臂 A 使用项目文档列出的 uv --no-project --python 3.12 依赖集合，未 pin 的 websockets 解析为 17.2；臂 B 只把它固定为此前全量记录中的 15.0.1。两臂其余依赖均为 numpy 2.5.3、rich 15.0.0、colorama 0.4.6、pytest 9.1.1、pytest-asyncio 1.4.0、soundfile 0.14.0、aiohttp 3.14.3、httpx 0.28.1；Python 3.12.3。每臂在同一调用中执行两个节点一次，pytest 退出码均为 0。
+
+运行时使用临时内存观察器调用 pytest.main，把 stdout、stderr 和测试内真实 CLI 子进程结果解析为白名单字段；没有写入或修改仓库测试。当前 worktree HEAD 为 1645534485481e3b27365f6b126844df1996409b，目标脚本与测试的 SHA-256 分别为 62f4b7254bc24212553a855b7c5f32c10352be3ba4fcfbfb78e8024184e6f79a、9be0b5a4dafe0c139487243d4226b506974776664d04e21a081a356a94b09b0c；这两个文件从候选 946bc99860709e3908032667367a6f48a4e4bdef 到本 HEAD 没有变化。Python 解释器角色是 uv 的 Python 3.12 临时环境；cwd 为当前仓库根目录；测试、scripts/_baseline_http_ws.py 和 SDK HTTP/WS 模块均从当前仓库/SDK 加载。
+
+子进程实际 argv 的脱敏角色序列为：同一 Python 解释器、scripts/_baseline_http_ws.py、--protocol http、loopback server 与 health URL、生成的 WAV、匿名 fixture ID、40 位服务 SHA、--expected-model paraformer、仓库外生成的私有目录、生成的参考稿；首测试另带 --reference-status unverified --timeout 5。第一子进程环境中测试专用 CW_MODEL_TYPE 与 sentinel 变量仅记录长度 27、20；没有输出环境值。脚本没有读取环境变量值。
+
+第一节点的真实 CLI 子进程两臂均为 rc=0、stderr 0 字节、stdout 为 schema 1 JSON。通过测试内 TcpCapture 观察实际 loopback 请求：health GET；上传 POST 的真实 JSON 为 options/sha256/size_bytes 三个顶层字段，options 实际值为 language=null、context=null、model=paraformer、seg_duration=15.0、seg_overlap=2.0；PATCH 实际发送 364 字节，与生成的 WAV 逐字节相等；随后有 commit、两次状态查询和结果 GET。SDK 实际计量到 6 个请求、196 个 control JSON 字节、1 个 364 字节 PATCH、0 重传。CLI 实际写出的私有 JSON 工件为 4498 字节、schema 1、规范 JSON 编码、权限 0600，含 6 个 producer events；未读取或输出正文、源文件哈希、响应体或私有路径。
+
+第二节点的真实 CLI 子进程两臂均为 rc=1、stdout 0 字节、stderr 45 字节，安全解析类型为 ValueError，包含 BASELINE_FAILED 标记；私有目录存在且为空，工件数为 0。源码顺序定位为 _run 先调用 _private_dir 创建该目录（第 456–458 行），读入 WAV 与参考稿后调用 normalize_reference；归一化结果为空时于第 466–467 行抛出 ValueError，validate_health 到第 468 行才会执行。因此该输入在 health/上传前 fail-loud，测试的 list(private_dir.iterdir()) == [] 在两臂中均成立。没有创建缺失目录或改变断言。
+
+本轮在当前代码、当前仓库导入路径和上述两套明确依赖下均未复现这两节点失败；15.0.1 与 17.2 的差别也没有复现差异。它不证明旧全量失败由测试顺序导致。既有全量记录只保留 AssertionError / FileNotFoundError 类型，没有异常行、调用帧或 CLI 子进程状态；旧 FileNotFoundError 与测试最后枚举私有目录的语句相符，但旧记录不足以证明失败就在该行，也无法解释当时目录为何缺失。故旧全量中的两个失败首因仍为 **unknown**，不能归咎于 CLI 契约、测试夹具、依赖版本或 sourceArchive/Gitroot 边界。
+
+处置：当前没有有证据支持的源码/测试修复点，不改代码、不改断言、不重跑全量。若要解释旧全量那次红，最小新增证据应由原消费命令在首个失败发生时记录异常函数/行号、CLI rc、stderr 安全错误类型和私有目录存在性；不需要扩大成依赖矩阵或重试到绿。
