@@ -31,7 +31,7 @@ DESIGN-note 方案对齐单。落盘路径：docs/sessions/<会话名>/design.md
   - 压缩编码路径（`flac` / `ogg_opus`）的 `samples_total` 改为**从已发出的字节流反推**：SDK 转码后已持有完整压缩字节，把这份字节重新送入 ffmpeg 解码为 16 kHz 单声道 PCM，流式累计字节数即精确样本数。服务端因此永远拿到与实际解码一致的值。
   - `deadline` 同步改用这份真实样本数计算，不再使用 ffprobe 容器时长。
   - `_audio_duration()` 整体删除：`samples_total` 与 `deadline` 都不再依赖它，删除后 SDK 不再调用 `ffprobe`，无 `format.duration` 的有效音频也不会提前 `decode_failed`。SDK 对 `ffprobe` 的硬依赖随之解除。
-  - 回归测试必须用**真实 ffmpeg**（现有 `tests/test_sdk_client.py:51` 的假 `ffprobe` 对任何输入恒返回 `1.0`，任何时长断言在它面前都恒真），并断言 SDK **实际发出的末帧字段**，不是内部函数返回值。
+  - 回归测试必须用**真实 ffmpeg**（现有 `tests/test_sdk_client.py::fake_media_tools` 夹具对任何输入恒返回 `1.0`，任何时长断言在它面前都恒真），并断言 SDK **实际发出的末帧字段**，不是内部函数返回值。
 
 - **已否决**：
   - *落盘临时 flac 再读 STREAMINFO*：Ogg/Opus 根本没有 STREAMINFO，两种编码要分叉实现，等于把同一个 bug 的两个变体都写出来；且引入磁盘占用、权限、磁盘满、清理失败四类新故障面。重新解码计数一套代码覆盖两种编码，实测两者与源直接解码逐样本相等。
@@ -42,23 +42,23 @@ DESIGN-note 方案对齐单。落盘路径：docs/sessions/<会话名>/design.md
 ## 关键不变式
 
 1. [实测] 压缩路径声明的 `samples_total` 与服务端实际解码样本数之差为 0。
-   证据：`tmp_issue43_scan.py`（本仓根目录，未提交）对 6 种来源 × 4 种编码共 24 组测量，元数据正常时最大偏差 522 样本；修复后对「时长头砍半的 mp4」与「音视频轨不等（视频 300s + 音频 60s）的 mp4」两类夹具，压缩路径偏差须为 0。
+   证据：`tmp_issue43_scan.py`（历史实测，脚本未入库且 clone 后不可达，其依赖已删除的 _audio_duration 因而不可复跑）对 6 种来源 × 4 种编码共 24 组测量，元数据正常时最大偏差 522 样本；修复后对「时长头砍半的 mp4」与「音视频轨不等（视频 300s + 音频 60s）的 mp4」两类夹具，压缩路径偏差须为 0。
    测试锁死：新增回归测试，断言 SDK 实际发出的末帧 `samples_total` 等于真实解码样本数。
 
 2. [实测] `deadline` 由真实样本数决定，不受容器时长影响。
-   证据：修复前实测 600 秒音频被砍头后 `set_deadline` 收到 `360.0`（`tmp_issue43_deadline.py`）。
+   证据：修复前实测 600 秒音频被砍头后 `set_deadline` 收到 `360.0`（`tmp_issue43_deadline.py`，历史实测，脚本未入库且 clone 后不可达，其依赖已删除的 _audio_duration 因而不可复跑）。
    测试锁死：新增用例，容器时长被砍半时 `deadline` 仍覆盖真实音频长度。
 
 3. [实测] 服务端 `samples_total` 校验保持硬失败，且必须留有覆盖「ffmpeg 退出 0 但流被截断」的测试。
-   证据：`tmp_issue43_truncation.py` 实测 flac 截断 90% / 60% 时 ffmpeg 退出码为 0。
-   测试锁死：`tests/test_protocol_v2.py:105` `test_truncated_and_invalid_flac_fail_and_reap_ffmpeg`（本次不修改，作为回归护栏）。
+   证据：`tmp_issue43_truncation.py`（历史实测，脚本未入库且 clone 后不可达，其依赖已删除的 _audio_duration 因而不可复跑）实测 flac 截断 90% / 60% 时 ffmpeg 退出码为 0。
+   测试锁死：`tests/test_protocol_v2.py::test_truncated_and_invalid_flac_fail_and_reap_ffmpeg`（本次不修改，作为回归护栏。注意本测试锁死的是后果而非 ffmpeg 退出码现象：测试使用 `flac[:int(len(flac) * 0.4)]` 保留 40% 真实截断比例，断言服务端因样本数不匹配硬失败返回 `code == "decode_failed"` 且 message 包含「声明 N」与「实际解码」，从不断言 ffmpeg 退出码）。
 
 4. [实测] `result.duration` 漏计极短末段不影响本次范围：只在文件末尾出现一次，不累积。
-   证据：`tmp_duration_leak.py` 走真实 `PcmSegmenter.drain_ready` + `process_audio_task`，文件 25.3s / 50.7s / 75.9s / 100.1s / 300.7s 全部跳过 0 段、漂移 0.000s；仅 5.05s 文件出现 1 段、漂移 +0.050s。
+   证据：`tmp_duration_leak.py`（历史实测，脚本未入库且 clone 后不可达，其依赖已删除的 _audio_duration 因而不可复跑）走真实 `PcmSegmenter.drain_ready` + `process_audio_task`，文件 25.3s / 50.7s / 75.9s / 100.1s / 300.7s 全部跳过 0 段、漂移 0.000s；仅 5.05s 文件出现 1 段、漂移 +0.050s。
    测试锁死：无（本次不改该行为，记录在此以免后续误判为同源缺陷）。
 
 5. [实测] 本仓 SDK 测试此前无法发现此类缺陷——假 `ffprobe` 恒返回 `1.0`。
-   证据：`tests/test_sdk_client.py:51-70` `fake_media_tools` 夹具，脚本内容为 `printf '1.0\n'`，对任何存在的输入都一样。
+   证据：`tests/test_sdk_client.py::fake_media_tools` 夹具，脚本内容为 `printf '1.0\n'`，对任何存在的输入都一样。
    测试锁死：新增回归测试必须绕开该夹具、调用真实 ffmpeg；若新测试仍走 `fake_media_tools`，视为未完成。
 
 6. [实测] SDK 不得再调用 `ffprobe`。
@@ -88,7 +88,7 @@ DESIGN-note 方案对齐单。落盘路径：docs/sessions/<会话名>/design.md
    - 用真实 ffmpeg 构造两个夹具：① 60 秒音频的 mp4，把 `mvhd`/`mdhd`/`tkhd` 时长砍半、`stts` 不动；② 视频轨 300 秒 + 音频轨 60 秒的正常 mp4。
    - 对每个夹具、每种压缩编码（`flac`、`ogg_opus`）调用 `transcribe_file`，捕获 WebSocket 上行帧。
    - 断言末帧 `samples_total` 等于真实解码样本数（差值为 0），且任务以成功终态收尾。
-   - 另跑一遍 `python3 tmp_issue43_scan.py`，确认输出中不再出现 `decode_failed`。
+   - 运行仓内回归测试 `python -m pytest tests/test_sdk_samples_total.py -q`，确认两类夹具在各编码下均通过且末帧样本数精确匹配。
 3. 预期：两类夹具、四种编码全部通过；服务端不再返回 `decode_failed`；`deadline` 覆盖真实音频长度。
 
 库函数绿、单元测试绿不算验收——必须走 `transcribe_file` 入口并断言实际发出的帧字段。
