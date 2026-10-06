@@ -427,11 +427,14 @@ async def _receive_compressed_frame(websocket, consumer):
         done, _ = await asyncio.wait(
             (receive, consumer), return_when=asyncio.FIRST_COMPLETED
         )
-        if consumer in done and not receive.done():
-            receive.cancel()
-            await asyncio.gather(receive, return_exceptions=True)
+        if consumer in done:
+            if not receive.done():
+                receive.cancel()
+                await asyncio.gather(receive, return_exceptions=True)
+                consumer.result()
+                raise RuntimeError('压缩音频消费协程在末帧前结束')
+            # 末帧与消费协程同时完成：先取出消费结果，已知失败压过末帧。
             consumer.result()
-            raise RuntimeError('压缩音频消费协程在末帧前结束')
         return receive.result()
     finally:
         if not receive.done():

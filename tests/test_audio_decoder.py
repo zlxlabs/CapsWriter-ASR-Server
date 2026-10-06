@@ -1,5 +1,7 @@
 import asyncio
 import os
+import shutil
+import signal
 import subprocess
 import sys
 import time
@@ -192,7 +194,7 @@ async def test_ffmpeg_failure_message_keeps_only_last_500_stderr_bytes(tmp_path,
         await decoder.feed(b"input")
         with pytest.raises(AudioDecodeError) as caught:
             await decoder.finish()
-    await consumer
+    await asyncio.gather(consumer, return_exceptions=True)
     stderr_tail = caught.value.message.partition("ffmpeg stderr 末尾：")[2]
 
     assert caught.value.code == "decode_failed"
@@ -287,3 +289,138 @@ def test_unknown_encoding_is_unsupported():
     with pytest.raises(AudioDecodeError) as caught:
         AudioDecoder("wav")
     assert caught.value.code == "unsupported_encoding"
+
+
+@pytest.mark.asyncio
+async def test_pcm_chunks_raises_decode_failed_on_nonzero_ffmpeg_without_finish(
+    tmp_path, monkeypatch,
+):
+    """已知非零退出必须在 pcm_chunks 迭代时抛出，不得等 finish。"""
+    wrapper = Path(tmp_path) / "ffmpeg"
+    wrapper.write_text(
+        f"#!{sys.executable}\n"
+        "import sys\n"
+        "sys.stdin.buffer.read(1)\n"
+        "sys.stderr.write('invalid data\\n')\n"
+        "sys.exit(251)\n"
+    )
+    wrapper.chmod(0o755)
+    monkeypatch.setenv("PATH", str(tmp_path))
+    decoder = AudioDecoder("flac")
+    consumer = asyncio.create_task(_collect(decoder))
+
+    async with decoder:
+        await decoder.feed(b"x")
+        with pytest.raises(AudioDecodeError) as caught:
+            await asyncio.wait_for(consumer, timeout=5)
+        with pytest.raises(AudioDecodeError) as finish_caught:
+            await decoder.finish()
+
+    assert caught.value.code == "decode_failed"
+    assert finish_caught.value.code == "decode_failed"
+    assert decoder.process is not None
+    returncode = decoder.process.returncode
+    assert returncode == 251
+    assert f"退出码 {returncode}" in caught.value.message
+    assert "ffmpeg stderr 末尾：" in caught.value.message
+
+
+@pytest.mark.skipif(not hasattr(signal, "SIGKILL"), reason="本平台没有 SIGKILL")
+@pytest.mark.asyncio
+async def test_pcm_chunks_raises_when_ffmpeg_killed_after_progress(compressed_audio):
+    """上传途中 SIGKILL 真 ffmpeg 后，迭代即抛 decode_failed；不得用垃圾输入冒充。"""
+    _, flac, _ = compressed_audio
+    decoder = AudioDecoder("flac")
+    emitted = {"n": 0}
+
+    async def consume():
+        chunks = []
+        async for chunk in decoder.pcm_chunks():
+            emitted["n"] += int(chunk.size)
+            chunks.append(chunk)
+        return chunks
+
+    consumer = asyncio.create_task(consume())
+    async with decoder:
+        await decoder.feed(flac)
+        deadline = time.monotonic() + 5
+        while emitted["n"] == 0:
+            assert time.monotonic() < deadline, "5s 内没有解码出任何 PCM，不是中途死亡"
+            await asyncio.sleep(0.01)
+        process = decoder.process
+        assert process is not None and process.returncode is None
+        pid = process.pid
+        os.kill(pid, signal.SIGKILL)
+        returncode = await asyncio.wait_for(process.wait(), timeout=5)
+        with pytest.raises(AudioDecodeError) as caught:
+            await asyncio.wait_for(consumer, timeout=5)
+        with pytest.raises(AudioDecodeError) as finish_caught:
+            await decoder.finish()
+
+    assert pid == process.pid
+    assert returncode not in (None, 0)
+    assert caught.value.code == "decode_failed"
+    assert finish_caught.value.code == "decode_failed"
+    assert f"退出码 {returncode}" in caught.value.message
+
+
+@pytest.mark.asyncio
+async def test_pcm_chunks_raises_on_unaligned_f32le_output(tmp_path, monkeypatch):
+    wrapper = Path(tmp_path) / "ffmpeg"
+    wrapper.write_text(
+        f"#!{sys.executable}\n"
+        "import sys\n"
+        "sys.stdin.buffer.read(1)\n"
+        "sys.stdout.buffer.write(b'xyz')\n"
+    )
+    wrapper.chmod(0o755)
+    monkeypatch.setenv("PATH", str(tmp_path))
+    decoder = AudioDecoder("flac")
+    consumer = asyncio.create_task(_collect(decoder))
+
+    async with decoder:
+        await decoder.feed(b"input")
+        with pytest.raises(AudioDecodeError) as caught:
+            await asyncio.wait_for(consumer, timeout=5)
+        with pytest.raises(AudioDecodeError):
+            await decoder.finish()
+
+    assert caught.value.code == "decode_failed"
+    assert "未按 4 字节对齐" in caught.value.message
+    assert decoder.process.returncode == 0
+
+
+@pytest.mark.asyncio
+async def test_stderr_warning_with_zero_returncode_still_succeeds(
+    tmp_path, monkeypatch, compressed_audio,
+):
+    _, flac, _ = compressed_audio
+    real = shutil.which("ffmpeg")
+    assert real, "本机必须有 ffmpeg"
+    wrapper = Path(tmp_path) / "ffmpeg"
+    wrapper.write_text(
+        f"#!{sys.executable}\n"
+        "import os, sys\n"
+        "sys.stderr.write('ffmpeg warning: harmless\\n')\n"
+        "sys.stderr.flush()\n"
+        f"os.execv({real!r}, [{real!r}, *sys.argv[1:]])\n"
+    )
+    wrapper.chmod(0o755)
+    monkeypatch.setenv("PATH", f"{tmp_path}{os.pathsep}{os.environ['PATH']}")
+    actual, decoder = await _decode_chunks("flac", [flac])
+
+    assert decoder.process.returncode == 0
+    assert actual.size > 0
+
+
+@pytest.mark.asyncio
+async def test_pcm_chunks_cancel_still_cancelled_error(compressed_audio):
+    _, flac, _ = compressed_audio
+    decoder = AudioDecoder("flac")
+    consumer = asyncio.create_task(_collect(decoder))
+    await decoder.feed(flac[:1024])
+    consumer.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await consumer
+    await decoder.cancel()
+    assert decoder.process.returncode is not None
