@@ -6,7 +6,7 @@ import shutil
 import numpy as np
 
 
-async def _drain_subprocess_pipes(process: asyncio.subprocess.Process) -> None:
+async def drain_subprocess_pipes(process: asyncio.subprocess.Process) -> None:
     """排空子进程输出管道，避免中止时 wait 依赖暂停的读侧。"""
     await asyncio.gather(process.stdout.read(), process.stderr.read())
 
@@ -232,7 +232,7 @@ class AudioDecoder:
             *(task for task in (self._writer_task, self._reader_task, self._stderr_task) if task),
             return_exceptions=True,
         )
-        await _drain_subprocess_pipes(process)
+        await drain_subprocess_pipes(process)
         await process.wait()
 
 

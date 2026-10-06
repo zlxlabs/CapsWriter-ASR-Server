@@ -49,7 +49,7 @@ from core.server.state import (
 )
 from . import logger
 from . import segmenter as shared_segmenter
-from .connection.audio_decoder import _drain_subprocess_pipes
+from .connection.audio_decoder import drain_subprocess_pipes
 from .connection.segmenter import get_cut_finder
 
 # ffmpeg 解码读取块（有界；不按压缩体积估算内存与时长）
@@ -181,7 +181,7 @@ class FileSourceDecoder:
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
         if self.process is not None:
-            await _drain_subprocess_pipes(self.process)
+            await drain_subprocess_pipes(self.process)
             await self.process.wait()
 
     async def __aenter__(self) -> "FileSourceDecoder":
