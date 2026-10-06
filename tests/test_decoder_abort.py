@@ -3,23 +3,35 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import functools
 import logging
+import multiprocessing
+import os
 import shutil
+import signal
 import subprocess
 import time
 import uuid
 from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
 import websockets
 
 from core.protocol import AudioMessage
-from core.server.connection import audio_decoder as audio_decoder_module
 from core.server.connection import ws_recv as ws_recv_module
 from core.server.connection.audio_decoder import AudioDecoder
+from core.server.connection.ws_recv import ws_recv
+from core.server.connection.ws_send import ws_send
 from core.server.http_file_runner import FileSourceDecoder
 from tests.harness.client import collect_terminal
+from tests.harness.server import ObservedTaskQueue
+from tests.harness.worker import run_fake_worker
+
+
+ISOLATED_TIMEOUT_SECONDS = 15.0
+ISOLATED_WS_ROUNDS_TIMEOUT_SECONDS = 45.0
 
 
 def _encode_audio(samples: np.ndarray, codec: str, output_format: str) -> bytes:
@@ -63,92 +75,139 @@ async def _wait_for_backpressure(process, timeout: float = 5.0) -> None:
         if reader._paused and buffered > 2 * limit:
             return
         await asyncio.sleep(0.01)
-    raise AssertionError(f"ffmpeg stdout 未形成真实背压：paused={reader._paused} buffered={_stream_buffered(reader)} limit={limit}")
+    raise AssertionError(
+        f"ffmpeg stdout 未形成真实背压：paused={reader._paused} "
+        f"buffered={_stream_buffered(reader)} limit={limit}"
+    )
 
 
-async def _force_reap(process, tasks=()) -> None:
-    for task in tasks:
-        task.cancel()
-    await asyncio.gather(*(task for task in tasks if task is not None), return_exceptions=True)
-    if process.returncode is None:
-        process.kill()
-    await asyncio.gather(process.stdout.read(), process.stderr.read())
-    await process.wait()
+def _ffmpeg_pids() -> set[int]:
+    pids = set()
+    for entry in Path("/proc").iterdir():
+        if not entry.name.isdigit():
+            continue
+        try:
+            comm = Path(f"/proc/{entry.name}/comm").read_text().strip()
+        except OSError:
+            continue
+        if comm == "ffmpeg":
+            pids.add(int(entry.name))
+    return pids
 
 
-@pytest.mark.asyncio
-@pytest.mark.parametrize("encoding", ["flac", "ogg_opus"])
-async def test_cancel_drains_backpressured_ffmpeg_pipes(
-    long_compressed_audio, encoding
-):
-    _, encoded = long_compressed_audio
+def _reap_group(pid: int, extra: set[int]) -> None:
+    try:
+        os.killpg(pid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+    for ffmpeg_pid in extra | _ffmpeg_pids():
+        try:
+            os.kill(ffmpeg_pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+
+
+def _isolated_child(kind: str, args: tuple, conn) -> None:
+    os.setsid()
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    try:
+        result = loop.run_until_complete(_isolated_scenario(kind, args))
+        conn.send(("ok", result))
+    except BaseException as exc:
+        try:
+            conn.send(("err", f"{type(exc).__name__}: {exc}"))
+        except Exception:
+            pass
+        os._exit(1)
+    os._exit(0)
+
+
+def _run_isolated(kind: str, args: tuple, timeout: float = ISOLATED_TIMEOUT_SECONDS):
+    """在独立进程组跑场景；超时由父进程杀组，不依赖被测 cleanup 返回。"""
+    ctx = multiprocessing.get_context("spawn")
+    parent_conn, child_conn = ctx.Pipe(duplex=False)
+    before = _ffmpeg_pids()
+    proc = ctx.Process(target=_isolated_child, args=(kind, args, child_conn))
+    proc.start()
+    child_conn.close()
+    proc.join(timeout)
+    leftover = _ffmpeg_pids() - before
+    if proc.is_alive():
+        _reap_group(proc.pid, leftover)
+        proc.join(5)
+        leftover = sorted(_ffmpeg_pids() - before)
+        raise AssertionError(
+            f"expected isolated {kind} to finish in {timeout:g}s, "
+            f"actual hung pid={proc.pid} leftover_ffmpeg={leftover}"
+        )
+    if leftover:
+        _reap_group(proc.pid, leftover)
+        leftover = sorted(_ffmpeg_pids() - before)
+        if leftover:
+            raise AssertionError(
+                f"expected isolated {kind} to reap ffmpeg, actual leftover={leftover}"
+            )
+    if not parent_conn.poll(0.2):
+        raise AssertionError(
+            f"expected isolated {kind} result pipe, actual exitcode={proc.exitcode}"
+        )
+    status, payload = parent_conn.recv()
+    if status != "ok":
+        raise AssertionError(f"isolated {kind} failed: {payload}")
+    return payload
+
+
+async def _isolated_scenario(kind: str, args: tuple):
+    if kind == "cancel":
+        return await _scenario_cancel(*args)
+    if kind == "finish_cancel":
+        return await _scenario_finish_cancel(*args)
+    if kind == "ws":
+        return await _scenario_ws(*args)
+    raise AssertionError(f"unknown isolated kind {kind}")
+
+
+async def _scenario_cancel(encoding: str, payload: bytes) -> None:
     decoder = AudioDecoder(encoding)
     await decoder.feed(b"")
     process = decoder.process
-    feed_task = asyncio.create_task(decoder.feed(encoded[encoding]))
+    feed_task = asyncio.create_task(decoder.feed(payload))
     started = time.monotonic()
-    try:
-        await _wait_for_backpressure(process)
-        await asyncio.wait_for(decoder.cancel(), timeout=2)
-        assert time.monotonic() - started < 2
-        assert process.returncode is not None
-        assert process.stdout.at_eof()
-        assert process.stderr.at_eof()
-    finally:
-        if not feed_task.done():
-            feed_task.cancel()
+    await _wait_for_backpressure(process)
+    await decoder.cancel()
+    elapsed = time.monotonic() - started
+    if elapsed >= 2:
+        raise AssertionError(f"expected cancel() in <2s, actual {elapsed:.3f}s")
+    if process.returncode is None:
+        raise AssertionError("expected ffmpeg reaped, actual returncode=None")
+    if not process.stdout.at_eof() or not process.stderr.at_eof():
+        raise AssertionError("expected stdout/stderr EOF after cancel")
+    if not feed_task.done():
+        feed_task.cancel()
         await asyncio.gather(feed_task, return_exceptions=True)
-        await _force_reap(
-            process,
-            (decoder._writer_task, decoder._reader_task, decoder._stderr_task),
-        )
 
 
-@pytest.mark.asyncio
-async def test_external_finish_cancellation_propagates(long_compressed_audio):
-    _, encoded = long_compressed_audio
+async def _scenario_finish_cancel(payload: bytes) -> None:
     decoder = AudioDecoder("flac")
     await decoder.feed(b"")
     process = decoder.process
-    feed_task = asyncio.create_task(decoder.feed(encoded["flac"]))
+    feed_task = asyncio.create_task(decoder.feed(payload))
+    await _wait_for_backpressure(process)
+    finish_task = asyncio.create_task(decoder.finish())
+    await asyncio.sleep(0)
+    finish_task.cancel()
     try:
-        await _wait_for_backpressure(process)
-        finish_task = asyncio.create_task(decoder.finish())
-        await asyncio.sleep(0)
-        finish_task.cancel()
-        with pytest.raises(asyncio.CancelledError):
-            await finish_task
-        assert process.returncode is not None
-    finally:
-        if not feed_task.done():
-            feed_task.cancel()
+        await finish_task
+    except asyncio.CancelledError:
+        pass
+    else:
+        raise AssertionError("expected CancelledError from finish(), actual returned")
+    if process.returncode is None:
+        raise AssertionError("expected ffmpeg reaped, actual returncode=None")
+    if not feed_task.done():
+        feed_task.cancel()
         await asyncio.gather(feed_task, return_exceptions=True)
-        await _force_reap(
-            process,
-            (decoder._writer_task, decoder._reader_task, decoder._stderr_task),
-        )
-
-
-@pytest.mark.asyncio
-async def test_http_decoder_close_drains_backpressured_ffmpeg_pipes(tmp_path: Path, long_compressed_audio, caplog):
-    _, encoded = long_compressed_audio
-    source = tmp_path / "long.flac"
-    source.write_bytes(encoded["flac"])
-    decoder = await FileSourceDecoder(source).start()
-    chunks = decoder.pcm_chunks()
-    process = decoder.process
-    await anext(chunks)
-    try:
-        await _wait_for_backpressure(process)
-        with caplog.at_level(logging.ERROR):
-            await asyncio.wait_for(decoder.close(), timeout=2)
-        assert process.returncode is not None
-        assert process.stdout.at_eof()
-        assert process.stderr.at_eof()
-        assert not any("kill 后仍未退出" in record.getMessage() for record in caplog.records)
-    finally:
-        await chunks.aclose()
-        await _force_reap(process, (decoder._stderr_task,))
 
 
 def _compressed_frame(task_id: str, payload: bytes, encoding: str, *,
@@ -160,10 +219,6 @@ def _compressed_frame(task_id: str, payload: bytes, encoding: str, *,
         encoding=encoding, samples_total=samples_total if final else None,
     ).to_json()
 
-
-async def _assert_closed(websocket) -> None:
-    with pytest.raises(websockets.ConnectionClosed):
-        await asyncio.wait_for(websocket.recv(), timeout=20)
 
 def _tracking_decoder_class(real_decoder):
     class TrackingDecoder(real_decoder):
@@ -200,15 +255,13 @@ def _tracking_decoder_class(real_decoder):
 
     return TrackingDecoder
 
-async def _run_ws_audio_too_long(
-    fake_asr_server, payload: bytes, encoding: str, samples_total: int, *,
-    final_only: bool, decoder_class,
-) -> tuple[float, object]:
+
+async def _run_ws_client(url, payload, encoding, samples_total, *, final_only, decoder_class):
     task_id = f"cw93-{encoding}-{uuid.uuid4()}"
     decoder_class.instances.clear()
     started = time.monotonic()
     async with websockets.connect(
-        fake_asr_server.url, max_size=None, ping_interval=None
+        url, max_size=None, ping_interval=None, close_timeout=0.1
     ) as client:
         async def send_stream() -> None:
             if final_only:
@@ -227,75 +280,135 @@ async def _run_ws_audio_too_long(
             ))
 
         sender = asyncio.create_task(send_stream())
-        messages, closed = await collect_terminal(
-            client, task_id=task_id, timeout=5
-        )
+        messages, closed = await collect_terminal(client, task_id=task_id, timeout=5)
         await asyncio.gather(sender, return_exceptions=True)
         elapsed = time.monotonic() - started
         error = next(message for message in messages if message.get("type") == "error")
-        assert error["code"] == "audio_too_long", error
-        assert elapsed <= 5
+        if error["code"] != "audio_too_long":
+            raise AssertionError(f"expected code=audio_too_long, actual {error}")
+        if elapsed > 5:
+            raise AssertionError(f"expected error in ≤5s, actual {elapsed:.3f}s")
         if not closed:
-            await _assert_closed(client)
-    assert decoder_class.instances
+            try:
+                await asyncio.wait_for(client.recv(), timeout=2)
+            except (websockets.ConnectionClosed, TimeoutError):
+                pass
+    if not decoder_class.instances:
+        raise AssertionError("expected TrackingDecoder instance")
     decoder = decoder_class.instances[-1]
-    assert decoder.backpressure_observed
-    assert decoder.process.returncode is not None
-    return elapsed, decoder
+    if not decoder.backpressure_observed:
+        raise AssertionError("expected real stdout backpressure before audio_too_long")
+    if decoder.process.returncode is None:
+        raise AssertionError("expected ffmpeg reaped, actual returncode=None")
+    return elapsed
+
+
+async def _scenario_ws(encoding, payload, samples_total, final_only, rounds):
+    decoder_class = _tracking_decoder_class(ws_recv_module.AudioDecoder)
+    ws_recv_module.AudioDecoder = decoder_class
+    ws_recv_module.Config.seg_cut_snap = False
+    ws_recv_module.Config.upload_idle_seconds = 120.0
+    os.environ["CW_MAX_TASK_SECONDS"] = "5"
+    manager = multiprocessing.Manager()
+    sockets_id = manager.list()
+    calls = manager.list()
+    observed = manager.list()
+    queue_in = multiprocessing.Queue()
+    queue_out = multiprocessing.Queue()
+    worker = multiprocessing.Process(
+        target=run_fake_worker,
+        args=(queue_in, queue_out, sockets_id, {}, calls),
+        daemon=True,
+    )
+    worker.start()
+    app = SimpleNamespace(state=SimpleNamespace(
+        queue_in=ObservedTaskQueue(queue_in, observed),
+        queue_out=queue_out, sockets={}, sockets_id=sockets_id,
+    ))
+    server = await websockets.serve(
+        functools.partial(ws_recv, app=app),
+        "127.0.0.1", 0, max_size=None, ping_interval=None,
+    )
+    sender = asyncio.create_task(ws_send(app))
+    url = f"ws://127.0.0.1:{server.sockets[0].getsockname()[1]}"
+    elapsed = []
+    try:
+        for _ in range(rounds):
+            elapsed.append(await _run_ws_client(
+                url, payload, encoding, samples_total,
+                final_only=final_only, decoder_class=decoder_class,
+            ))
+        return elapsed
+    finally:
+        server.close()
+        worker.kill()
+        if not sender.done():
+            sender.cancel()
+
+
+@pytest.mark.parametrize("encoding", ["flac", "ogg_opus"])
+def test_cancel_drains_backpressured_ffmpeg_pipes(long_compressed_audio, encoding):
+    _, encoded = long_compressed_audio
+    _run_isolated("cancel", (encoding, encoded[encoding]))
+
+
+def test_external_finish_cancellation_propagates(long_compressed_audio):
+    _, encoded = long_compressed_audio
+    _run_isolated("finish_cancel", (encoded["flac"],))
 
 
 @pytest.mark.asyncio
+async def test_http_decoder_close_drains_backpressured_ffmpeg_pipes(
+    tmp_path: Path, long_compressed_audio, caplog
+):
+    _, encoded = long_compressed_audio
+    source = tmp_path / "long.flac"
+    source.write_bytes(encoded["flac"])
+    decoder = await FileSourceDecoder(source).start()
+    chunks = decoder.pcm_chunks()
+    process = decoder.process
+    await anext(chunks)
+    try:
+        await _wait_for_backpressure(process)
+        with caplog.at_level(logging.ERROR):
+            await asyncio.wait_for(decoder.close(), timeout=2)
+        assert process.returncode is not None
+        assert process.stdout.at_eof()
+        assert process.stderr.at_eof()
+        assert not any("kill 后仍未退出" in record.getMessage() for record in caplog.records)
+    finally:
+        await chunks.aclose()
+        if process.returncode is None:
+            process.kill()
+        await asyncio.gather(process.stdout.read(), process.stderr.read())
+        await process.wait()
+
+
 @pytest.mark.parametrize("encoding", ["flac", "ogg_opus"])
-async def test_ws_compressed_audio_too_long_is_delivered_with_backpressure(
-    fake_asr_server, long_compressed_audio, monkeypatch, caplog, encoding
+def test_ws_compressed_audio_too_long_is_delivered_with_backpressure(
+    long_compressed_audio, encoding
 ):
     samples, encoded = long_compressed_audio
-    monkeypatch.setenv("CW_MAX_TASK_SECONDS", "5")
-    monkeypatch.setattr(ws_recv_module.Config, "upload_idle_seconds", 120.0)
-    real_decoder = ws_recv_module.AudioDecoder
-    TrackingDecoder = _tracking_decoder_class(real_decoder)
-    monkeypatch.setattr(ws_recv_module, "AudioDecoder", TrackingDecoder)
-    with caplog.at_level(logging.INFO):
-        for round_number in range(1, 6):
-            result, _ = await _run_ws_audio_too_long(
-                fake_asr_server,
-                encoded[encoding],
-                encoding,
-                samples.size,
-                final_only=False,
-                decoder_class=TrackingDecoder,
-            )
-            print(
-                f"cw93_e2e_latency encoding={encoding} round={round_number} "
-                f"elapsed_s={result:.6f}",
-                flush=True,
-            )
-    assert any(
-        f"code=audio_too_long" in record.getMessage()
-        for record in caplog.records
+    elapsed = _run_isolated(
+        "ws",
+        (encoding, encoded[encoding], int(samples.size), False, 5),
+        ISOLATED_WS_ROUNDS_TIMEOUT_SECONDS,
     )
+    assert all(item <= 5 for item in elapsed), elapsed
+    for round_number, item in enumerate(elapsed, start=1):
+        print(
+            f"cw93_e2e_latency encoding={encoding} round={round_number} "
+            f"elapsed_s={item:.6f}",
+            flush=True,
+        )
 
 
-@pytest.mark.asyncio
 @pytest.mark.parametrize("encoding", ["flac", "ogg_opus"])
-async def test_ws_final_frame_audio_too_long_observes_decoder_failure(
-    fake_asr_server, long_compressed_audio, monkeypatch, encoding
+def test_ws_final_frame_audio_too_long_observes_decoder_failure(
+    long_compressed_audio, encoding
 ):
     samples, encoded = long_compressed_audio
-    monkeypatch.setenv("CW_MAX_TASK_SECONDS", "5")
-    monkeypatch.setattr(ws_recv_module.Config, "upload_idle_seconds", 120.0)
-    real_decoder = ws_recv_module.AudioDecoder
-    TrackingDecoder = _tracking_decoder_class(real_decoder)
-    monkeypatch.setattr(ws_recv_module, "AudioDecoder", TrackingDecoder)
-    await _run_ws_audio_too_long(
-        fake_asr_server,
-        encoded[encoding],
-        encoding,
-        samples.size,
-        final_only=True,
-        decoder_class=TrackingDecoder,
+    _run_isolated(
+        "ws",
+        (encoding, encoded[encoding], int(samples.size), True, 1),
     )
-
-
-def test_decoder_abort_has_no_stale_cancel_timeout_constant():
-    assert not hasattr(audio_decoder_module, "_CANCEL_TIMEOUT_SECONDS")

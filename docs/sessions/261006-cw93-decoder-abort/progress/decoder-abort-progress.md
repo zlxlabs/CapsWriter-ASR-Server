@@ -48,3 +48,17 @@
 - 本段结论：预算收尾提交已推送，远端 draft PR 指向最终 HEAD；最终 numstat 为 418 行，ffmpeg 残留为空。
 - 关键决策与已否决方案：无新增决策；保留里程碑 6 的历史记录，不回写历史段落。
 - 下一步唯一动作：无。
+
+## 里程碑 8：续修有界回归
+
+- 当前阶段：implementation / resume P2-1
+- 本段结论：排空函数改为公开名 `drain_subprocess_pipes`；末帧在消费失败检查后直接 `await finish`；取消/末帧/WS 越线用例改到 spawn 进程组，超时由父进程 `killpg`，不依赖被测 cleanup 返回。
+- 关键决策与已否决方案：子进程用 `run_until_complete` 后立刻 `os._exit`，避免 `asyncio.run` 关机等待挂住的 handler；否决在同一事件循环里用 `wait_for`/`shield` 包 `cancel()`，因为它取消不了已登记的 `process.wait()`。
+- 下一步唯一动作：红验 a/b/c 后跑 Narrow-Verify 与 Verify-Command。
+
+## 里程碑 8：续修有界回归
+
+- 当前阶段：implementation / resume P2-1
+- 本段结论：排空函数改为公开名 `drain_subprocess_pipes`；末帧在消费失败检查后直接 `await finish`；取消/末帧/WS 越线用例改到 spawn 进程组，超时由父进程 `killpg`，不依赖被测 cleanup 返回。
+- 关键决策与已否决方案：子进程用 `run_until_complete` 后立刻 `os._exit`，避免 `asyncio.run` 关机等待挂住的 handler；否决在同一事件循环里用 `wait_for`/`shield` 包 `cancel()`，因为它取消不了已登记的 `process.wait()`。
+- 下一步唯一动作：红验 a/b/c 后跑 Narrow-Verify 与 Verify-Command。
