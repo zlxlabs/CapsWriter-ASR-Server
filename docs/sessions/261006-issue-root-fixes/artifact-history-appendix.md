@@ -10,7 +10,9 @@
   `verify_sources.py` 逐字比对源对象；不承担结论的篇幅（已审实现清单、未验证范围、附表）**不复制**，
   保留在归档 ref，用下方恢复命令读原文。
 - **时点纪律**：历史否决与历史验收都不能覆盖当前时点。旧失败不是当前红，新验收不回洗旧失败。
-- **可读性**：本文所列全部 ref 在盘点时点均为可读提交（337/337）。若将来某 ref 不可读，指针即为
+- **可读性**：盘点时点本文所列全部 source SHA 在本对象库均可解析为可读提交（复算 449 条来源记录，
+  `OBJECT_UNAVAILABLE` / `QUERY_ERROR` 均为 0）。这个「0」是**那次运行的记录**，不是随仓冻结的分母清单；
+  新克隆若未取齐历史对象会逐条报 `OBJECT_UNAVAILABLE`。若将来某 ref 不可读，指针即为
   `UNKNOWN` 而不是「已归档」。
 
 ## 1. 证据 A：浮点 PCM 分段量化 P2（当前 design 保留结论的历史依据）
@@ -84,7 +86,7 @@ failure-visibility: p2-only
 
 <!-- source-check: refs/heads/card/http-eng-outside-260930@69bee18d0c6d225bd4b0e472bc3ada97bd7fa543 docs/sessions/260930-http-file/reviews/eng-outside-verdict.md EV-C1 -->
 ```text
-共 3 条计划级 finding；均可在现有锁定行为内补足，不要求新增平台、自动重试或改变 WS 契约。
+共 3 条计划级 finding；均可在现有锁定行为内补足，不要求新增平台、自动重试或改变 WS 契约。其他检查到的 commit 顺序、offset ACK、结果与 DONE 同事务、重启不自动重跑、容量拒收与 WS 兼容约束已有明确计划条款，因此不另列猜测。
 ```
 
 - 恢复命令：
@@ -112,7 +114,13 @@ H2 精确增量审查」在基线树已有同名文件（`reviews/m6-h1-full-rev
 
 ## 6. 摘录逐字校验
 
-`source-check` 注释后的围栏内容必须逐字出现在对应 source 的 Git 对象字节中。校验脚本与脚本内的
-负控（人为改动一个字符后必须报不匹配）见
-`/tmp/capswriter-261006-artifact-dlg-20261006-025712-1985d5/verify_sources.py`。校验只依赖 Git 对象，
-不依赖工作区文件。
+`source-check` 注释后的围栏内容必须**逐行**出现在对应 source 的 Git 对象字节中（不是子串包含）。
+随仓复算入口：[`docs/development/known-issues/artifact-disposition-261006.md`](../../development/known-issues/artifact-disposition-261006.md)
+的「公开自包含复算入口」一节——把那段代码存成 `verify_artifact_disposition.py` 放仓库根即可运行，
+第 3 关就校这 5 段摘录，并带首字符变异负控。校验只依赖 Git 对象，不依赖工作区文件。
+
+第 3 节的 `EV-C1` 原文行在首轮是截断的（只取到「……改变 WS 契约。」），本轮已改为**整行原文**
+（后续半句一并保留），以便逐行判定成立。
+
+覆盖限制：该入口依赖**持有本地归档对象的仓库**；新克隆未取齐历史对象时，对应来源报
+`OBJECT_UNAVAILABLE`（对象不可用），不是「来源缺路径」，脚本逐条打印、不静默通过。
