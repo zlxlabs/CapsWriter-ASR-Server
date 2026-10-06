@@ -203,6 +203,8 @@ def test_bash_syntax_and_powershell_contract():
     powershell_script = DEPLOY_DIR / "update.ps1"
     assert powershell_script.is_file()
     content = powershell_script.read_text(encoding="utf-8")
+    # update.ps1 依赖 PowerShell 7 才有的 Invoke-WebRequest -SkipHttpErrorCheck，5.1 下须直接拒绝
+    assert content.startswith("#Requires -Version 7\n")
     for command in (
         "fetch --tags origin",
         "checkout --detach",

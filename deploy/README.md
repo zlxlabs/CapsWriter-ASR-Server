@@ -20,10 +20,10 @@ deploy/update.sh <git-ref>
 
 需要为不同引擎或实例更新时，按实际服务分别设置 `CW_MODEL_TYPE`、`DEPLOY_PROCESS_NAME` 和 `DEPLOY_PORT`。`DEPLOY_PORT` 必须与该实例监听端口一致。
 
-Windows 使用已创建的计划任务：
+Windows 使用已创建的计划任务，须用 PowerShell 7（`pwsh`）运行；Windows 自带的 PowerShell 5.1 会被脚本开头的 `#Requires -Version 7` 直接拒绝：
 
 ```powershell
-.\deploy\update.ps1 -Ref <git-ref> -Python .\.venv\Scripts\python.exe -TaskName My-ASR -Port 6016 -ModelType paraformer
+pwsh -NoProfile -File .\deploy\update.ps1 -Ref <git-ref> -Python .\.venv\Scripts\python.exe -TaskName My-ASR -Port 6016 -ModelType paraformer
 ```
 
 `-Python` 必填，应指向计划任务实际使用且带 pip 的解释器。计划任务的启动脚本和环境变量由部署者自行维护。
