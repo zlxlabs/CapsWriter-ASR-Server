@@ -11,7 +11,7 @@
 | Lane | 激活里程碑 | 推进文件 |
 | --- | --- | --- |
 | http-core | — | — |
-| http-integration | M6 | [goals/http-integration/M6-qa.md](goals/http-integration/M6-qa.md) |
+| http-integration | — | — |
 | http-sdk | — | — |
 
 | Lane | ID | 名称 | 状态 | 排序 | 优先级 | 依赖 | 进度文件 |
@@ -20,7 +20,7 @@
 | http-core | M2 | http-core/M2：HTTP 上传与持久受理 | 已完成 | 2 | 高 | http-core/M1 | [goals/http-core/M2-upload.md](goals/http-core/M2-upload.md) |
 | http-core | M3 | http-core/M3：HTTP 文件 runner 与结果分派 | 已完成 | 3 | 高 | http-core/M2 | [goals/http-core/M3-runner.md](goals/http-core/M3-runner.md) |
 | http-core | M4 | http-core/M4：资源边界与重启清理 | 已完成 | 4 | 高 | http-core/M3 | [goals/http-core/M4-resources.md](goals/http-core/M4-resources.md) |
-| http-integration | M6 | http-integration/M6：HTTP 边界 QA | 进行中 | 1 | 高 | http-core/M4, http-sdk/M5 | [goals/http-integration/M6-qa.md](goals/http-integration/M6-qa.md) |
+| http-integration | M6 | http-integration/M6：HTTP 边界 QA | 已完成 | 1 | 高 | http-core/M4, http-sdk/M5 | [goals/http-integration/M6-qa.md](goals/http-integration/M6-qa.md) |
 | http-integration | M7 | http-integration/M7：部署、协议与质量基线 | 未开始 | 2 | 中 | http-integration/M6 | [goals/http-integration/M7-baseline.md](goals/http-integration/M7-baseline.md) |
 | http-sdk | M5 | http-sdk/M5：显式 HTTP SDK/CLI | 已完成 | 1 | 中 | — | [goals/http-sdk/M5-sdk.md](goals/http-sdk/M5-sdk.md) |
 <!-- GOALS-INDEX:END -->
@@ -71,3 +71,12 @@
 - **新证据是否改变了工作顺序？**：不改变依赖 M4→M6→M7；独立前置平台解码/原生模型单推理已完成窄验证，Gate 单点拒绝不使其他获授权收口停工。
 - **done 的定义还成立吗？**：成立。M4 收口不等于全部 HTTP 路线完成，也不授予生产部署/原服务改动/凭据轮换权限。
 - **审计结论**：M4 已完成，激活 M6；源代码不变，仅完成记录与生成索引。
+
+### http-integration
+- **审计日期 / 增量**：2026-10-06 / M6 正式收口，PR #83，合并提交 `796104c371c672609cc38ef17d472ef383228cf7`。
+- **里程碑真完成了吗？**：M6 在上述冻结源码时点已完成。十二组真实边界各有具名测试，Hosted 与无会话裸 shell 分别真跑五轮；正式主审、OCR、质量、聚合及账本通过，精确合并后 CI 三项实际成功。证据见 [正式验收记录](docs/sessions/261003-http-completion/m6-final-merged-acceptance.md)，不是仅凭 schema、草稿绿或执行器报告判定。
+- **下一个目标还是对的吗？**：M7 仍正确；Windows 修复 PR #82 的本地全量 55 failed / 24 errors 原因未知，尚未正式合并。必须先解除这个阻塞，再用新的共同运行时取得三平台 HTTP/默认 WS 应用字节、识别质量和资源证据；不把旧平台参考数据当新源码基线。
+- **有没有漏掉的里程碑？**：没有；M1–M7 路线不变。M6 的旧简单 relabel 单测仍有重复 ID 遮蔽 round-ID guard 的 P2 覆盖缺口；任意重写 JSON 可过属于 schema-only 的声明边界，不新增防伪框架。
+- **新证据是否改变了工作顺序？**：不改变 M4→M6→M7 依赖。主干此后新增 `d251618e16766061074fe5767d6aecd39b9f9236`，含运行源码与 harness 变化；旧 `796104c` 的 340 对象等价、511 双臂及两环境五轮不替这个新增量重新资格。本次目标 PR 只登记历史完成与生成索引，不重写或背书该 peer 源码。
+- **done 的定义还成立吗？**：成立。M6 完成不等于 M7、整条 HTTP 路线或生产部署完成；假引擎与缩小常量验证不代替真实识别质量、物理压力或生产完整装配。已记录的失败、工具未知与安全风险不因状态回写而撤销。
+- **审计结论**：登记 M6 历史验收完成，下一目标为 M7；索引当前无进行中项，M7 仍为未开始且未完成。旧审计按当时证据保留，本次不部署生产。
