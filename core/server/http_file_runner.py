@@ -49,14 +49,13 @@ from core.server.state import (
 )
 from . import logger
 from . import segmenter as shared_segmenter
+from .connection.audio_decoder import _drain_subprocess_pipes
 from .connection.segmenter import get_cut_finder
 
 # ffmpeg 解码读取块（有界；不按压缩体积估算内存与时长）
 DECODE_READ_BYTES = 64 * 1024
 # 真实样本数上限：与 WS 的 CW_MAX_TASK_SECONDS 同一口径（默认 4 小时）
 MAX_TASK_SECONDS = float(os.environ.get("CW_MAX_TASK_SECONDS", "14400"))
-# 解码收尾（kill + 子任务回收）的有界期限
-DECODER_CLOSE_TIMEOUT = 10.0
 # runner 收尾（取消所有在跑 Job）的有界期限
 RUNNER_STOP_TIMEOUT = 20.0
 # HTTP 终态持久化的有界期限：本地 SQLite 终态写通常亚毫秒级，5s 已覆盖最坏
@@ -176,15 +175,14 @@ class FileSourceDecoder:
     async def close(self) -> None:
         self.kill()
         tasks = [task for task in (self._stderr_task,) if task is not None]
-        if self.process is not None and self.process.returncode is None:
-            try:
-                await asyncio.wait_for(self.process.wait(), timeout=DECODER_CLOSE_TIMEOUT)
-            except asyncio.TimeoutError:  # pragma: no cover - kill 后仍不退出的兜底
-                logger.error("ffmpeg 解码进程在 kill 后仍未退出")
         for task in tasks:
-            task.cancel()
+            if not task.done():
+                task.cancel()
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
+        if self.process is not None:
+            await _drain_subprocess_pipes(self.process)
+            await self.process.wait()
 
     async def __aenter__(self) -> "FileSourceDecoder":
         return await self.start()
@@ -497,7 +495,6 @@ class HttpFileRunner:
             # 末段入队后仍不释放：槽位/owner/源引用由终态（持久化或可靠 FAILED）释放
             await record.terminal_event.wait()
         finally:
-            decoder.kill()
             await decoder.close()
             release_terminal_task(self.state, key)
 
