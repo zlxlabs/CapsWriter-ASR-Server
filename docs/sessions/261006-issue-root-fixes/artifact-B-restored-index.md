@@ -1,9 +1,9 @@
 # #81 B 档恢复索引：非在途历史审查结论（artifact-B-restored-index）
 
-- 依据：`263d4770627f8577d4e4f5459e87a277599facec:docs/sessions/261006-issue-root-fixes/artifact-B-source-plan.md` 准备表；用户 2026-10-06 修订范围「按真实可核清单落地B、在途保留、公开门禁未确认」。
-- 分母：准备表 38 条候选 + 公共门禁未定 4 条 = 42；本 PR 新增恢复 28；类型排除 6；在途有意留档 4（Windows×3 交 PR #82、m7-platform-prep×1）；公共门禁不明 4。
+- 依据：`263d4770627f8577d4e4f5459e87a277599facec:docs/sessions/261006-issue-root-fixes/artifact-B-source-plan.md` 准备表；用户 2026-10-06 修订「按真实可核清单落地B、在途保留、公开门禁未确认」，dlg-20261006-121042-a607bf 再修订：public-gate 两份 reviews 从旧宽表 `88aaa697ea6893b7315932be22813b159f601f30:docs/sessions/261006-issue-root-fixes/artifact-inventory.tsv` 精确来源恢复（`artifact-history-appendix.md` 无这两路径条目，来源以宽表行为准），两份 progress 明确类型排除——B 从未包括过程记录。
+- 分母：准备表 38 条候选 + 公共门禁 4 条 = 42；本 PR 新增恢复 30；类型排除 8；在途有意留档 4（Windows×3 交 PR #82、m7-platform-prep×1）；不明 0。
 - 声明：原「38 份 verdict」的测量快照已缺失，本索引按可核来源恢复，**不是原 38 集合的认证**，不含任何整体 PASS 判定；恢复物是历史档案，非当前代码审查结论，历史 FAIL/p1-found/skipped/否决按原 blob 逐字保留、未改写为当前成功。
-- 复算方法：`git rev-parse <sourceCommit>:docs/sessions/<path>` 应等于 blobSHA；`git cat-file blob <blobSHA>` 应与文件字节一致（本批 28/28 已过 `git hash-object`==blob 校验）。
+- 复算方法：`git rev-parse <sourceCommit>:docs/sessions/<path>` 应等于 blobSHA；`git cat-file blob <blobSHA>` 应与文件字节一致（本批 30/30 已过 `git hash-object`==blob 校验）。
 - 来源修正：`E3-runner-review-F-verdict.md` 准备表 sourceCommit 第 9 位 hex 笔误 `dff79bb3…`，实际为 `dff79bbd36d6364bcb5fc39521df4505169dd349`（本地 ref 与 `git ls-remote origin` 双核一致），blob 不变。
 - NO_PATH 证据保留：`c2-fixed-review2-verdict.md` 源 `38d286f1f73ef3d9c6bef1522f8f0c5df4e86db1`、`m6-postfatal-verdict.md` 源 `6d4665359d5b1c7599de1c0db15e278ac94d0fa5` 在对应 commit 无此路径（已实测），按准备表保留为冲突证据，不当 blob 使用。
 
@@ -47,12 +47,13 @@
 | 261003-http-completion/reviews/windows-http-integrity-posix-verdict.md | 6256bad127001690fa415d717aae6371ee466194（4源同blob） | 9f32e61b446dfe231904f416fa5842cc45c719e1 | 有意留档 | 同上 |
 | 261003-http-completion/reviews/windows-http-integrity-review1-verdict.md | 6256bad127001690fa415d717aae6371ee466194（4源同blob） | 7ed85387c4b9b7b43a8b449d7631437dc135e5c9 | 有意留档 | 同上 |
 | 261003-http-completion/reviews/m7-platform-prep-verdict.md | 8c132f13627cb413a4d214b9a44f5a632ab9db61、887014512f2e1ab7c455c450efd9c06586c8bba9（同blob） | 268082cfd1cf2e011ff5aefb335f047de18af1c7 | 有意留档 | M7 在途重叠，用户修订范围明确不恢复；另 NO_PATH 41939845ae221370b19cab8fa523969a365f4702 |
-| 20260926-public-gate/reviews/fork-backup-refresh-verdict.md | — | — | 不明 | 准备表未给 sourceCommit/blob；用户定「公开未确认」，本卡不恢复 |
-| 20260926-public-gate/reviews/onboarding-verdict.md | — | — | 不明 | 同上 |
-| 20260926-public-gate/progress/onboarding-progress.md | — | — | 不明 | progress 本非 verdict；同上 |
-| 20260926-public-gate/progress/quality-entry-progress.md | — | — | 不明 | 同上 |
+| 20260926-public-gate/reviews/fork-backup-refresh-verdict.md | 1807d3c7cac2ce9467bc743c1b4996764a4517a1（旧宽表源 refs/heads/card/fork-refresh-verdict-260926；refs/reclaimed/20261003 同 commit 同 blob） | d6b405d36b5b3e2cd9dfe70785c7eac6d4e4b0ed | 本PR新增 | 独立只读复核 verdict（负向探针+边界结论，failure-visibility: clean） |
+| 20260926-public-gate/reviews/onboarding-verdict.md | 44690dbb1def6ea8a5e679fea16388c6394f8f89（旧宽表源 refs/heads/card/public-quality-260926；refs/reclaimed/20261003 同 commit 同 blob） | 1c4b482fb510a504d8554114366e5e312e63792a | 本PR新增 | 独立审查 pass（无 P1/P2，P3 不阻塞）；NO_PATH 另源 .untracked@503fee62bfdd278bf865fd4e30359d42a13ed78d 实测无此路径，留作证据 |
+| 20260926-public-gate/progress/onboarding-progress.md | 44690dbb1def6ea8a5e679fea16388c6394f8f89（宽表源） | 54547c8ae17e120997e856ca8a56cf66c5f80fb4 | 类型排除 | 过程记录，B 从未包括 progress；原文对象留库未删改 |
+| 20260926-public-gate/progress/quality-entry-progress.md | 44690dbb1def6ea8a5e679fea16388c6394f8f89（宽表源） | 9977cfe3be6b46ff6d2545de014243871449eed8 | 类型排除 | 同上 |
 
-- 现master已在：0 —— 恢复前对基线 `03ec517731135656929b8a019090f7918bc02d66`（与派发时 `git ls-remote origin` 实测远端 master 一致，无人新落）逐路径核验，无同路径对象，无覆盖。
-- byte 校验：28/28 `git hash-object`==blobSHA；恢复总量 1776 行 / 238,801 B（原文，非新模板），在 2400/3500 预算内。
-- publicscan：api key/secret/passwd/webhook/bearer/ghp/xox/外域 email 模式 0 命中。
-- 行尾空白：全量仅 1 行（`E2-params-installed-consumer-verdict.md:73` 行尾双空格，历史原文自带、逐字保留）；`git diff --check` 共报这 1 行，非本卡新增错误。（更正：预检时用本机 `grep -E '[ \t]+$'` 得到的「8 行」是把 `\t` 当字面量 t 的方言误报，已用 od 与 `git diff --check` 双重核伪。）
+- 现master已在：0 —— 恢复前对基线 `03ec517731135656929b8a019090f7918bc02d66`（与派发时 `git ls-remote origin` 实测远端 master 一致，无人新落）逐路径核验，无同路径对象，无覆盖；dlg-20261006-121042 补齐 public-gate 两路径时同核（远端 master 仍 03ec5177，两路径仍缺）。
+- byte 校验：30/30 `git hash-object`==blobSHA；恢复总量 1855 行 / 249,627 B（原文，非新模板），全程 03ec→HEAD 增量低于 3500 硬顶。原 28 份未动证据：`git diff --name-only 340791d61a8a0729018af7fff0f6f39594fe7c1b HEAD` 仅含本次 3 个路径（两 verdict 与本索引）。
+- publicscan：无真实凭据值——模式扫描命中的仅为 workflow secret **名称**的审查性文字引用（SILO_SECRET_KEY/FEISHU_CI_WEBHOOK 等，名非值），无 token/webhook 值、无外域 email。
+- 行尾空白：全量仅 1 行（`E2-params-installed-consumer-verdict.md:73` 行尾双空格，历史原文自带、逐字保留）；`git diff --check` 共报这 1 行，非本卡新增错误；补齐两文件经空格预检与 `git diff --check` 均无新增空白行。
+- 落库说明：`docs/sessions/20260926-public-gate/` 整目录被 `.gitignore:154` 年份归档规则 `20*/` 意外命中（26xxxx 会话目录不匹配，仅 2026 前缀目录名命中）；本轮按派发授权仅对两份 reviews 精确路径 `git add -f`，未整目录纳入。（更正：预检时用本机 `grep -E '[ \t]+$'` 得到的「8 行」是把 `\t` 当字面量 t 的方言误报，已用 od 与 `git diff --check` 双重核伪。）
