@@ -164,7 +164,10 @@ def _pending_sdk_tasks() -> list[str]:
     pending = []
     for task in asyncio.all_tasks():
         qualname = getattr(task.get_coro(), "__qualname__", "")
-        if qualname.startswith(("_transcribe_connected.", "transcribe_file.", "_operation.")):
+        if (
+            qualname == sdk_client._receive.__qualname__
+            or qualname.startswith(("_transcribe_connected.", "transcribe_file.", "_operation."))
+        ):
             if not task.done():
                 pending.append(qualname)
     return pending
@@ -239,7 +242,9 @@ async def accept_and_finish(ws, state):
         state["frames"].append(frame)
         if frame["is_final"]:
             state["final_received"] = True
-            await ws.send(json.dumps(final_result()))
+            # 服务端回帧必带 task_id（core/protocol.py）：SDK 只把与本任务匹配的消息
+            # 当进展，不带 task_id 的回帧会被按协议忽略。
+            await ws.send(json.dumps(final_result(task_id=frame["task_id"])))
             return
 
 
@@ -311,6 +316,11 @@ async def test_progress_is_received_before_upload_finishes(tmp_path, monkeypatch
         async def __aexit__(self, *args):
             return await self.context_manager.__aexit__(*args)
 
+        @property
+        def transport(self):
+            # SDK 在异常路径上靠它中止传输；测试替身必须和真实连接暴露同一个出口。
+            return self.ws.transport
+
         async def send(self, message):
             await self.ws.send(message)
             self.calls += 1
@@ -340,10 +350,11 @@ async def test_progress_is_received_before_upload_finishes(tmp_path, monkeypatch
             frame = json.loads(message)
             state["frames"].append(frame)
             if len(state["frames"]) == 1:
-                await ws.send(json.dumps({"type": "result", "is_final": False, "text": "进度"}))
+                await ws.send(json.dumps({"type": "result", "is_final": False,
+                                          "text": "进度", "task_id": frame["task_id"]}))
             if frame["is_final"]:
                 state["final_received"] = True
-                await ws.send(json.dumps(final_result()))
+                await ws.send(json.dumps(final_result(task_id=frame["task_id"])))
                 return
 
     async with fake_v2_server(reply_on_first_frame) as (url, state):
@@ -353,7 +364,11 @@ async def test_progress_is_received_before_upload_finishes(tmp_path, monkeypatch
             encoding="flac",
             on_progress=lambda result: progress_observed.append((result, sent["final_send_returned"])),
         )
-    assert progress_observed == [({"type": "result", "is_final": False, "text": "进度"}, False)]
+    assert [result for result, _ in progress_observed] == [
+        {"type": "result", "is_final": False, "text": "进度",
+         "task_id": state["frames"][0]["task_id"]}
+    ]
+    assert [flag for _, flag in progress_observed] == [False]
     assert state["final_received"]
 
 
@@ -399,6 +414,7 @@ async def test_final_result_returns_without_server_close(
         getter_waiter = asyncio.create_task(getter_created.wait())
         getter_done, _ = await asyncio.wait({getter_waiter}, timeout=5)
         getter_observed = getter_waiter in getter_done
+        pending_before_final = _pending_sdk_tasks()
         allow_final.set()
         done, _ = await asyncio.wait({caller}, timeout=10)
         release.set()
@@ -412,6 +428,7 @@ async def test_final_result_returns_without_server_close(
         f"final 已到达服务端但 transcribe_file 10 秒内没有返回（issue #65）；outcome={outcome}"
     )
     assert getter_observed, "final 返回路径没有观察到 SDK 创建的 Queue.get Task"
+    assert sdk_client._receive.__qualname__ in pending_before_final, pending_before_final
     assert getter_tasks and all(task.done() for task in getter_tasks), getter_tasks
     assert "error" not in outcome, outcome.get("error")
     assert leaked == [], f"SDK 内部任务未被回收：{leaked}"
@@ -510,6 +527,11 @@ async def test_upload_failure_is_not_masked_by_final_when_both_tasks_done(
         async def __aexit__(self, *args):
             return await self.context_manager.__aexit__(*args)
 
+        @property
+        def transport(self):
+            # SDK 在异常路径上靠它中止传输；测试替身必须和真实连接暴露同一个出口。
+            return self.ws.transport
+
         async def send(self, message):
             await self.ws.send(message)
             await receive_ready.wait()
@@ -526,9 +548,10 @@ async def test_upload_failure_is_not_masked_by_final_when_both_tasks_done(
     failing_connect.__signature__ = inspect.signature(original_connect)
     monkeypatch.setattr(sdk_client.websockets, "connect", failing_connect)
 
-    async def tracked_receive(ws, *, on_progress, idle_messages):
+    async def tracked_receive(ws, *, task_id, on_progress, idle_messages, mark_progress):
         result = await original_receive(
-            ws, on_progress=on_progress, idle_messages=idle_messages
+            ws, task_id=task_id, on_progress=on_progress,
+            idle_messages=idle_messages, mark_progress=mark_progress,
         )
         receive_ready.set()
         # Queue both task resumptions before asyncio.wait handles either completion.
@@ -593,7 +616,7 @@ async def test_upload_failure_is_not_masked_by_final_when_both_tasks_done(
 
 @pytest.mark.asyncio
 async def test_idle_timeout_still_fires_after_upload(tmp_path, fake_media_tools):
-    """修复后 idle 预算仍然生效：上传结束且服务端不再回消息，按 idle_timeout 上抛。"""
+    """上传结束且服务端不再回消息：按 idle_timeout 上抛，消息报「等待结果」与已发帧数。"""
     audio_path = make_audio(tmp_path / "source.wav")
 
     async def swallow_everything(ws, state):
@@ -605,16 +628,22 @@ async def test_idle_timeout_still_fires_after_upload(tmp_path, fake_media_tools)
         with pytest.raises(AsrError) as caught:
             await transcribe_file(audio_path, url, idle_timeout=2, deadline_total=30)
     assert caught.value.code == "timeout"
-    assert "上传结束后等待服务端消息超时" in caught.value.message
+    assert caught.value.message.startswith("等待结果连续 2 秒没有进展")
+    assert "已发送 1/1 帧" in caught.value.message
+    assert "收到中间结果 0 条" in caught.value.message
     assert time.monotonic() - started < 10
     assert state["frames"][-1]["is_final"] is True
 
 
 @pytest.mark.asyncio
-async def test_receive_idle_budget_does_not_fire_during_slow_upload(
+async def test_receive_idle_budget_does_not_fire_while_uploads_keep_succeeding(
     tmp_path, monkeypatch, sdk_queue_getter_tasks
 ):
-    """上传耗时超过 idle 预算仍活着；上传结束后才开始 idle 计时。"""
+    """上传耗时超过一个 idle 窗口仍活着：每帧都真的发出去就算真实进展。
+
+    idle_watch 从连接建立就启动（旧实现要等 upload_done 才启动），所以本用例同时锁住
+    「上传阶段已在监视」；上传完成后上行一停，就按 idle 失败。
+    """
     audio_path = make_audio(tmp_path / "source.wav")
     pcm = b"\0" * (5 * 256 * 1024)
     monkeypatch.setattr(sdk_client, "_transcode", lambda *_: asyncio.sleep(0, result=pcm))
@@ -641,6 +670,11 @@ async def test_receive_idle_budget_does_not_fire_during_slow_upload(
 
         async def __aexit__(self, *args):
             return await self.context_manager.__aexit__(*args)
+
+        @property
+        def transport(self):
+            # SDK 在异常路径上靠它中止传输；测试替身必须和真实连接暴露同一个出口。
+            return self.ws.transport
 
         async def send(self, message):
             nonlocal first_send_at, final_send_returned_at
@@ -687,7 +721,7 @@ async def test_receive_idle_budget_does_not_fire_during_slow_upload(
         upload_elapsed_at_gate = time.monotonic() - first_send_at if first_send_at else 0
         caller_alive_during_upload = not caller.done()
         no_receive_during_upload = received_messages == []
-        getter_not_created_during_upload = not getter_created.is_set()
+        getter_created_during_upload = getter_created.is_set()
         frames_before_final = [frame["is_final"] for frame in state["frames"]]
         release_final_send.set()
         getter_waiter = asyncio.create_task(getter_created.wait())
@@ -711,17 +745,21 @@ async def test_receive_idle_budget_does_not_fire_during_slow_upload(
     assert upload_elapsed_at_gate > idle_timeout * 1.5
     assert caller_alive_during_upload, "idle 预算在上传期间终止了调用"
     assert no_receive_during_upload, "上传期间 SDK 收到了服务端消息"
-    assert getter_not_created_during_upload, "上传未结束就创建了 idle Queue.get"
+    assert getter_created_during_upload, "上传期间没有创建 idle Queue.get"
     assert frames_before_final == [False, False, False, False]
     assert caller_finished, "上传完成后 idle 未在有界时间内结束调用"
     assert isinstance(error, AsrError) and error.code == "timeout", error
+    # 上传完成后上行彻底停下：只能在「等待结果」阶段按 idle 失败，不能回退到
+    # 「上传结束后等待服务端消息超时」这种把上传当成已完成前提的措辞。
+    assert error.message.startswith("等待结果连续"), error.message
+    assert "已发送 5/5 帧" in error.message, error.message
     assert getter_observed_after_upload
     assert getter_tasks and all(task.done() for task in getter_tasks), getter_tasks
     assert final_send_returned_at is not None and first_send_at is not None
     upload_duration = final_send_returned_at - first_send_at
     assert upload_duration > idle_timeout * 1.8
     assert len(send_durations) == 5
-    assert all(duration < idle_timeout for duration in send_durations), send_durations
+    # 逐帧 send 时限已删除：这里的每帧耗时仍短于 idle，但不再是判据。
     assert received_messages == []
     assert [frame["is_final"] for frame in state["frames"]] == [False, False, False, False, True]
 
@@ -891,7 +929,9 @@ async def test_server_error_code_and_retryable_are_preserved(
             if frame["is_final"]:
                 await allow_error.wait()
                 await ws.send(json.dumps({
-                    "type": "error", "code": "inference_failed", "message": "engine failed", "retryable": True
+                    "type": "error", "task_id": frame["task_id"],
+                    "code": "inference_failed", "message": "engine failed",
+                    "retryable": True,
                 }))
                 return
 
@@ -938,7 +978,12 @@ async def test_idle_timeout_is_independent_of_incoming_messages(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_blocked_send_uses_idle_timeout(tmp_path, monkeypatch):
+async def test_blocked_send_with_silent_server_reports_idle_stall(tmp_path, monkeypatch):
+    """ws.send 永久阻塞且下行静默：在「上传」阶段的 idle 上失败，而不是逐帧 send 超时。
+
+    逐帧 send 时限已删除（一次 send 耗时长不等于任务没推进）；本例无任何真实进展，
+    因此仍必须有界失败，且消息指向 SDK 自己掌握的事实而不是「服务端不给力」。
+    """
     audio_path = make_audio(tmp_path / "source.wav")
     original_connect = websockets.connect
     proxy_unspecified = object()
@@ -954,6 +999,11 @@ async def test_blocked_send_uses_idle_timeout(tmp_path, monkeypatch):
 
         async def __aexit__(self, *args):
             return await self.context_manager.__aexit__(*args)
+
+        @property
+        def transport(self):
+            # SDK 在异常路径上靠它中止传输；测试替身必须和真实连接暴露同一个出口。
+            return self.ws.transport
 
         async def send(self, _message):
             await asyncio.Future()
@@ -975,18 +1025,32 @@ async def test_blocked_send_uses_idle_timeout(tmp_path, monkeypatch):
         with pytest.raises(AsrError) as caught:
             await transcribe_file(audio_path, url, idle_timeout=2, deadline_total=10)
     assert caught.value.code == "timeout"
-    assert "发送音频帧" in caught.value.message
+    assert caught.value.message.startswith("上传连续 2 秒没有进展"), caught.value.message
+    assert "已发送 0/1 帧" in caught.value.message, caught.value.message
+    assert "收到中间结果 0 条" in caught.value.message, caught.value.message
     assert time.monotonic() - started < 5
 
 
 @pytest.mark.asyncio
 async def test_total_deadline_expires_despite_continuous_progress(tmp_path):
+    """即使匹配本任务的中间结果一直到达，显式 deadline_total 仍按用户要求终止。
+
+    回帧必须走真实协议 schema 且带 task_id，否则会被 _receive 当噪声滤掉，
+    本用例就从「持续进展」退化成「毫无进展」，成了假噪声路径。
+    """
+    from core.protocol import RecognitionMessage
+
     audio_path = make_audio(tmp_path / "source.wav")
+    sent = {"progress": 0}
 
     async def progress_forever(ws, _state):
-        await ws.recv()
+        frame = json.loads(await ws.recv())
         while True:
-            await ws.send(json.dumps({"type": "result", "is_final": False, "text": "进度"}))
+            await ws.send(RecognitionMessage(
+                task_id=frame["task_id"], is_final=False, duration=0.0,
+                time_start=0.0, time_submit=0.0, time_complete=0.0, text="进度",
+            ).to_json())
+            sent["progress"] += 1
             await asyncio.sleep(0.05)
 
     async with fake_v2_server(progress_forever) as (url, _):
@@ -999,6 +1063,9 @@ async def test_total_deadline_expires_despite_continuous_progress(tmp_path):
                 on_progress=lambda _result: None,
             )
     assert caught.value.code == "timeout"
+    assert "转录超过deadline_total" in caught.value.message
+    # 被测前提：确实是「持续有效进展」而不是噪声路径。
+    assert sent["progress"] >= 5, sent
 
 
 @pytest.mark.asyncio
@@ -1076,6 +1143,11 @@ async def test_send_failure_surfaces_as_connection_lost(tmp_path, monkeypatch):
 
         async def __aexit__(self, *args):
             return await self.context_manager.__aexit__(*args)
+
+        @property
+        def transport(self):
+            # SDK 在异常路径上靠它中止传输；测试替身必须和真实连接暴露同一个出口。
+            return self.ws.transport
 
         async def send(self, _message):
             raise closed

@@ -114,9 +114,10 @@ FINAL_RESULT = {
 }
 
 
-def _final_payload(**overrides) -> str:
+def _final_payload(task_id: str, **overrides) -> str:
     result = dict(FINAL_RESULT)
     result.update(overrides)
+    result["task_id"] = task_id
     return json.dumps(result)
 
 
@@ -144,7 +145,7 @@ async def test_default_deadline_reanchors_after_local_stage(tmp_path, monkeypatc
         # 远端阶段再烧 110 秒假时钟：累计 210 秒 > 入口的 120 秒上限，
         # 只有「远端预算从本地阶段结束时重新锚定」才会成功返回。
         clock.advance(110.0)
-        await ws.send(_final_payload())
+        await ws.send(_final_payload(seen["sent"]["task_id"]))
 
     async with fake_v2_server(handler) as url:
         transcript = await transcribe_file(audio, url, encoding="s16le", idle_timeout=5)
@@ -168,8 +169,8 @@ async def test_explicit_deadline_total_still_covers_local_stage(tmp_path, monkey
     monkeypatch.setattr(sdk_client, "_transcode", slow_transcode)
 
     async def handler(ws):
-        await ws.recv()
-        await ws.send(_final_payload())
+        frame = json.loads(await ws.recv())
+        await ws.send(_final_payload(frame["task_id"]))
 
     async with fake_v2_server(handler) as url:
         with pytest.raises(AsrError) as caught:
@@ -345,7 +346,7 @@ async def test_auto_budget_lets_93s_identification_finish(tmp_path, monkeypatch)
             if frame["is_final"]:
                 break
         clock.advance(306.0)
-        await ws.send(_final_payload())
+        await ws.send(_final_payload(frame["task_id"]))
 
     async with fake_v2_server(handler) as url:
         transcript = await transcribe_file(audio, url, encoding="s16le", idle_timeout=5)
@@ -371,7 +372,7 @@ async def test_default_timeout_message_reports_budget_and_audio_duration(
             if frame["is_final"]:
                 break
         clock.advance(600.0)  # 越过 _auto_budget(93) = 492 秒
-        await ws.send(_final_payload())
+        await ws.send(_final_payload(frame["task_id"]))
 
     async with fake_v2_server(handler) as url:
         with pytest.raises(AsrError) as caught:

@@ -1,0 +1,225 @@
+# 卡 B（#76 SDK 双向进展判据）执行存档
+
+- 卡：B（#76），root_cause_group `sdk-upload-progress-watchdog`
+- 分支：`card/caps-76-sdk-261006`，Base `e849c21748392ad848131e07ff17d32e4cc83a8b`
+- 设计来源（只读）：`8e93f7e49b07c8a25d199d0942dd7145b48f339b` 的 `docs/sessions/261006-issue-root-fixes/design.md`
+- 本 scratch：`/tmp/capswriter-261006-probe-backpressure/`
+
+---
+
+## 单元一：真实背压复现（先证被测条件成立）
+
+设计卡的探针 B 没能造出 send 阻塞，本卡按要求先证明真实发送背压存在，再动手改代码。
+
+### 探针 C（`probe_c_real_backpressure.py`）：回环吞吐正常，但读速决定上限
+
+- 真实 `transcribe_file` + 600 秒噪声 WAV（19.2 MB，s16le，10 帧，每帧 wire 2.56 MB）。
+- 本地 `websockets.serve(max_queue=1)` + 每 1.5 秒读一帧。
+- 结果：15 秒内服务端读到 9/10 帧，读速与节流一致 —— 但这是**读速**决定的，不是内核背压。
+
+### 探针 D（`probe_d_buffer_absorb.py`）：`websockets.serve` 永远造不出真实背压
+
+直接量「服务端读 2 帧后停止读取，客户端还能连发多少」：
+
+```
+{'rcvbuf': None,     'sent': 12, 'blocked': False, 'elapsed': 0.05, 'server_read': 2}
+{'rcvbuf': 262144,   'sent': 12, 'blocked': False, 'elapsed': 0.07, 'server_read': 2}
+{'rcvbuf': 65536,    'sent': 12, 'blocked': False, 'elapsed': 0.05, 'server_read': 2}
+```
+
+12 × 2.56 MB = 30 MB 在 0.05 秒内「发完」，`SO_RCVBUF` 降到 64 KB 也无效。原因：`websockets`
+的 `Assembler` 会把**未读完整的帧**无限缓冲进用户态（只按「已完成消息条数」限流），
+所以 socket 读得再慢也轮不到内核接收窗口关闭。**结论：拿 `websockets.serve` 当假服务端
+断言背压是恒真断言。**
+
+### 卡 B 的做法：最小 raw-socket WebSocket 对端
+
+`tests/test_sdk_progress_watchdog.py` 里的 `FakeRemoteServer` 自己完成 `/health` 与 RFC6455
+握手，自己解析帧，用 `read_gate` 控制「读到哪一帧为止」：
+
+- `read_gate` 一关，对端不再从 socket 取数据 → StreamReader 缓冲填满 → `pause_reading` →
+  内核接收窗口关闭 → 客户端 `ws.send` 在**真实内核背压**下阻塞。
+- 被测条件从 SDK 自己的超时消息里取证：`已发送 N/10 帧`，`N < 10` 才算背压成立；
+  连续多轮观察 `frames_read` 不增长作为旁证。
+
+（同一形态的探针脚本保留在 scratch，测试内的 `FakeRemoteServer` 是它的测试化版本。）
+
+### 附带定位：idle 失败后的收尾会挂死（探针 E）
+
+第一次跑矩阵时 3 条「发送阻塞」用例全部 `assert caller in done` 失败。`probe_e_stall_teardown.py`
+沿 `cr_await` 链打出真实等待点：
+
+```
+client.py:583  transcribe_file.<locals>.operation
+client.py:516  _operation
+client.py:390  _transcribe_connected          ← async with 的 __aexit__
+websockets/asyncio/client.py:586   connect.__aexit__
+websockets/asyncio/connection.py:221  Connection.__aexit__
+websockets/asyncio/connection.py:636  Connection.close
+contextlib.py:217  _AsyncGeneratorContextManager.__aexit__
+```
+
+`Connection.close()` → `send_context()` → `send_data()` + `await self.drain()`，
+`drain()` 等的是 `resume_writing()`，而写缓冲要等对端读才会掉到低水位。对端已停读 → 永久挂起，
+`close_timeout` 只兜 `connection_lost_waiter`，兜不住 `drain()`。
+
+这条是**本卡之前就存在的缺陷**（旧的逐帧 send 超时同样会走进这里），但只有真实背压才能碰到；
+它直接违反本卡完成条件 1（上传未完成即有界失败）与完成条件 5（取消后全部回收），
+因此在 `_transcribe_connected` 里改为自管连接进入/退出：成功路径仍优雅关闭，
+异常/取消/停滞路径 `ws.transport.abort()`。
+
+---
+
+## 单元二：idle 判据 TDD
+
+`tests/test_sdk_progress_watchdog.py`（14 条，全部走真实 `transcribe_file` 与真实上传帧）：
+
+| 用例 | 覆盖 | 关键断言 |
+| --- | --- | --- |
+| `test_blocked_upload_with_silent_server_fails_on_idle_before_upload_done` | 矩阵 1 | `上传连续 3 秒没有进展：已发送 N/10 帧` 且 `N < 10`（背压前提自证） |
+| `test_successful_sends_keep_upload_alive_past_one_idle_window` | 矩阵 2a | 上传耗时 > idle 仍活着；上传结束后按「等待结果」失败，`已发送 10/10 帧` |
+| `test_idle_fires_after_upload_completes_without_any_result` | 矩阵 2b | 短音频单帧，已发满 1/1 |
+| `test_backpressure_with_continuous_results_survives_and_finalizes` | 矩阵 3a | 背压 9 秒不死；`frames_read < 10` 且 `results_sent >= 5`；松闸后拿到 final |
+| `test_messages_that_are_not_task_progress_do_not_refresh_idle[unknown/foreign]` | 矩阵 3b | 在 idle（<15s）暴露而非等 90s 总预算 |
+| `test_server_error_frame_during_upload_is_propagated[decode_stalled/audio_too_long/inference_failed]` | 矩阵 4a | code 原样透传，未被改写成 timeout/成功 |
+| `test_connection_closed_without_error_frame_reports_connection_lost` | 矩阵 4b | `connection_lost` |
+| `test_error_frame_wins_over_final_sent_in_the_same_tick` | 矩阵 4c | 同轮 error+final 时 error 胜出 |
+| `test_explicit_deadline_total_still_wins_with_continuous_results` | 矩阵 5a | 连续结果下 `转录超过deadline_total` 仍生效 |
+| `test_cancellation_under_backpressure_reclaims_everything` | 矩阵 5b | CancelledError + 无遗留内部任务 |
+| `test_scenario_constants_match_the_real_frame_layout` | 反熵自检 | 场景帧数必须等于 SDK 真实帧布局 |
+
+生产改动（`sdk/capswriter_asr/client.py`）：
+
+- `idle_watch` 从连接建立就启动，删掉 `upload_done` 前置门（该 Event 已无消费方，整体删除）。
+- 删掉逐帧 `asyncio.wait({sender}, timeout=idle_timeout)`，改为直接 `await ws.send(frame)`；
+  发送异常仍由 upload 任务原样上抛，外层 `FIRST_COMPLETED` + `ordered` 裁决不变。
+- 新增 `_audio_frame_bytes` / `_audio_frame_count`：停滞消息要报「已发/总帧」，
+  分母必须在发送前算出（不物化整个切片列表，避免整份音频再复制一份）。
+- `_receive` 收窄：只有 `type ∈ {result, error}` **且** `task_id` 等于本次任务的帧才刷新 idle；
+  未知 type 与陌生 task_id 一律忽略且不刷新（`core/protocol.py` 里两种消息都必带 task_id）。
+- 停滞消息只报 SDK 掌握的事实：阶段 / 已发帧 / 总帧 / 中间结果条数 / 距最近进展秒数，
+  不推断网络或服务端责任。
+
+既有测试随语义变更同步（不是放宽断言）：
+
+- `test_sdk_client.py`：假服务端回帧补 `task_id`（协议必带）；
+  `test_receive_idle_budget_does_not_fire_during_slow_upload` → 改名为
+  `..._while_uploads_keep_succeeding` 并把「上传期未建 idle getter」翻转成「上传期已在监视」；
+  `test_blocked_send_uses_idle_timeout` → `test_blocked_send_with_silent_server_reports_idle_stall`，
+  断言从「发送音频帧」改为新的停滞事实消息；四个连接替身补 `transport` 出口。
+- `test_sdk_deadline_stage.py` / `test_sdk_samples_total.py`：假服务端回帧补 `task_id`。
+
+预算与默认值一字未动：自动预算仍是 `duration*4+120`，默认 `idle_timeout` 仍是 300，
+显式 `deadline_total` 仍是整次调用的绝对墙钟（含本地准备阶段），由
+`test_sdk_deadline_stage.py` 原有的公式锁与两段计时用例继续看守。
+
+---
+
+## 单元三：红验与文档
+
+### 红验（全部在 `git archive HEAD` 导出的隔离树里做，主树全程未动）
+
+| 注入 | 期望 | 实测 |
+| --- | --- | --- |
+| 恢复逐帧 `asyncio.wait({sender}, timeout=idle_timeout)` | 背压用例变红 | `3 failed, 11 passed`；`test_backpressure_with_continuous_results_survives_and_finalizes` 报 `AsrError: 发送音频帧超过 idle_timeout`（有合法中间结果仍被误杀）；另两条阻塞用例同样转红 |
+| 恢复 `idle_watch` 的 `await upload_done.wait()` 前置门 | 真正上传未完 + 下行静默的用例变红 | `1 failed, 13 passed`；`test_blocked_upload_with_silent_server_fails_on_idle_before_upload_done` 报 `发送阻塞且下行静默时调用没有在有界时间内结束`（只会在 `deadline_total=90` 才暴露） |
+| 去掉用例里的 `read_gate.clear()`（人为不造背压） | 前提断言自身变红 | `AssertionError: 被测前提不成立：上传其实已经发完（10/10），本用例没有造出背压` |
+
+三次都是真实的断言失败，没有 `ImportError`、没有拿外层 timeout 充数；注入确认生效后
+只还原被改的那几行，隔离树直接丢弃。
+
+### 稳定性
+
+`tests/test_sdk_progress_watchdog.py` 连续 5 轮，每轮 `14 passed`，退出码均为 0，耗时稳定在 40 秒
+（修掉收尾挂死前是 113 秒且有 3 条不返回）。
+
+### 全量
+
+`uv run ... python -m pytest tests/ -q -p no:cacheprovider` → **526 passed, 3 skipped**（347s）。
+派发时主干基线不可用（`gh api request failed`），所以**继承红未能判定**；本卡开工前先单独跑过
+窄测集合（除新增文件）确认是 62 passed，修改过程中出现的红全部由本卡自己的改动引入并已消除，
+无新增红面。
+
+### 文档
+
+- `sdk/README.md`：新增一段区分 `idle_timeout`（距上次真实进展的上限，从连接建立起覆盖上传）
+  与 `deadline_total` / 自动预算（绝对墙钟）；写明真实进展的两种形态、未知 `type` 与陌生
+  `task_id` 不刷新计时、以及停滞消息只陈述事实不推断责任。
+- `docs/reference/protocol.md`：只改 Python SDK 那一节，同步上述语义；服务端上行停滞看门狗
+  一节与错误码表一字未动（`git diff --name-only` 确认本卡只碰了这两个文档文件的对应段落）。
+
+### 未做（按卡面非目标）
+
+- 不改自动预算公式/默认值，不恢复 ping，不加 progress 协议，不加自动重试或 fallback。
+- 不碰 `PROTOCOL_ERROR_CODES`、SDK HTTP 客户端、服务端、`tests/harness/server.py`、
+  `tests/test_ws_progress_watchdog.py`、CI 配置与默认分支。
+- SDK 采用需下游 pin、以及是否关 #76，均留给主脑处置。
+---
+
+## 单元四：首审 verdict 后的有限收尾（冻结 H0=050b6dc5 → H1）
+
+首审 `docs/sessions/261006-issue-root-fixes/reviews/sdk-review1-verdict.md`（commit 299be40b，
+文件内容逐字节纳入本分支，commit `34a4ed9`）。按 P3 不阻塞、P2 必修的结论，只处理原目标
+未完成处，未追一般 P2/P3。
+
+### P2-1 绝对截止打断优雅 close 时没有 abort 连接
+
+`except BaseException` 只覆盖连接主体；成功拿到 final 之后进入 `connection.__aexit__()`，
+这时截止取消落在 `finally` 内的优雅 close 上，不经过原来的 abort 分支。首审实测：
+`caller_done=true final_sent=True exit_cancelled=True transport_closing=False`。
+
+修法（`sdk/capswriter_asr/client.py`）：`completed` 只由「已拿到最终结果」那条返回置真，
+用它区分该不该做优雅关闭；abort 纪律扩到整个连接生命周期 —— 异常/停滞/取消路径在
+`__aexit__` 之前中止（否则 close 卡在 drain，探针 E），成功路径的优雅 close 若被取消
+打断，则在其 `finally` 再补一次中止。没有新增 fallback、重复 close 或 watchdog；
+异常与取消语义不变，显式 `deadline_total` 仍是绝对边界。
+
+红验（隔离树，`git archive HEAD` 导出，只删掉那个兜底 abort，py3.11 + websockets 15.0.1）：
+`1 failed, 15 passed`，红的是
+`test_deadline_during_graceful_close_aborts_the_connection`，报
+`transport 未被中止，仍停在 CLOSING`，且底层 `_SelectorSocketTransport` 写缓冲仍积压
+`bufsize=1384987` —— 正是「优雅 close 卡在 drain」的现场。
+
+复现形态的关键是让 close 真的会卡：服务端在读到第 3 帧时就回 final 然后**彻底停止读取
+并保持连接**（探针 G 第一版让服务端读完就 `return` 关掉 writer，结果 close 秒完、根本没
+复现；改为保持连接不读后才成立）。用例用 `_CloseObserver` 只观测不动手，记录
+`exit_started / exit_cancelled / paused_at_exit`，并在 SDK 整个收尾之后读
+`transport.is_closing()` —— 读时点必须在 `__aexit__` 被取消之后的 finally 里，早读会
+误判。
+
+### P2-2 收到匹配结果没有刷新诊断用的最近进展时刻
+
+`last_at` 原先只由上传侧 `mark_progress()` 写，`_receive` 只往 idle 队列塞令牌，于是
+「距最近进展」把整段持续收到结果的时间都算进去。修法：`_receive` 改调既有
+`mark_progress(is_result=...)`，idle 计时与停滞文案读同一个 `last_at`，不新建镜像状态、
+不加 `time_source` 配置。同时给快照补了生产者/消费者说明（上传侧每成功发一帧、`_receive`
+每收一条匹配消息都经 `mark_progress` 写；`idle_watch` 读令牌、`stall_error` 读字段出文案）。
+
+红验（隔离树，还原成「只涨计数不刷时刻」，py3.11 + websockets 15.0.1）：
+`1 failed, 15 passed`，红的是
+`test_matching_results_refresh_the_diagnostic_last_progress`，报
+`「距最近进展」把停发前持续结果的时间算进去了：等待结果连续 1 秒没有进展：已发送 1/1 帧，
+收到中间结果 15 条，距最近进展 3 秒` —— 修后同一条用例报 1 秒。未知 `type` / 其他 task_id
+仍不更新，由既有的 `test_messages_that_are_not_task_progress_do_not_refresh_idle` 继续看守。
+
+### P2-3 夹具 result payload 不符合协议 schema
+
+raw WS 夹具的中间/final result 改用 `core.protocol.RecognitionMessage` / `ErrorMessage`
+的 `to_json()`（只读 import，不改 core），`time_start/time_submit/time_complete` 等必填
+字段由协议类自己给出。`tests/test_sdk_client.py::test_total_deadline_expires_despite_continuous_progress`
+原本的「持续进展」回帧缺 `task_id`，会被 `_receive` 当噪声滤掉，该用例其实跑的是
+「毫无进展」的假噪声路径；现已补真实 `task_id` + 完整 schema，并断言结果条数 ≥5。
+
+### P3-4 未修
+
+`_audio_frame_bytes` 的 `data_length` 参数未使用，按首审定级接受不修，不以此重构。
+
+### 本轮验证
+
+- Narrow-Verify（卡面 5 个文件）py3.12 / websockets 最新：`61 passed`，退出码 0。
+- 同一 Narrow-Verify py3.11 / websockets==15.0.1：`61 passed`，退出码 0。
+- `tests/test_sdk_progress_watchdog.py` 连续 5 轮（py3.11 + WS15.0.1）：
+  第 1 轮 `16 passed in 48.75s` 退出码 0；第 2 轮 `16 passed in 48.29s` 退出码 0；
+  第 3 轮 `16 passed in 48.36s` 退出码 0；第 4 轮 `16 passed in 48.15s` 退出码 0；
+  第 5 轮 `16 passed in 47.87s` 退出码 0。
+- 两次红验都在 `git archive HEAD` 的隔离树里做、只在被注入的那几行上动手，主树全程未改坏。
