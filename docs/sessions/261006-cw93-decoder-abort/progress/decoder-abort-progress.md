@@ -62,3 +62,17 @@
 - 本段结论：红验 a 在 68s 内 7 项 AssertionError、HTTP 仍绿、无残留 ffmpeg；红验 b 末帧两编码 11s 内 AssertionError；还原后 8 passed。Narrow-Verify 61 passed；Verify-Command 520 passed、3 skipped。
 - 关键决策与已否决方案：无新增决策。
 - 下一步唯一动作：推送 draft PR #94。
+
+## 里程碑 10：隔离通过路径的孤儿进程
+
+- 当前阶段：implementation / orphan fix
+- 本段结论：CI py3.12 全量 job 打完 `520 passed, 3 skipped` 后不退出，根因是 `_scenario_ws` 的 `multiprocessing.Manager()` 与 worker 没有显式关闭，子进程又以 `os._exit` 跳过 finalizer；这些孤儿继承 pytest 的 stdout/stderr 管道写端，管道读端拿不到 EOF。修法两条同时上：子进程 `finally` 里 `worker.join()` + `manager.shutdown()`，父进程 `_run_isolated` 在通过、场景报错、超时三条路径上都 `killpg` 回收整组。
+- 关键决策与已否决方案：`_kill_group` 杀掉后只等内核摘掉被 SIGKILL 的成员（不计僵尸），不靠等待进程自然退出；否决旧 `_reap_group` 里「扫全机 ffmpeg 逐个 kill」的兜底，它会误伤同机其他会话的 ffmpeg，且组内回收已覆盖；`_live_group_pids` 用 `/proc/<pid>/stat` 的 pgrp 判定，僵尸不计（僵尸不占文件描述符，挂不住管道）。
+- 下一步唯一动作：验证 `_run_isolated` 末尾的不变式断言非恒真，再推送。
+
+## 里程碑 11：孤儿修复验证
+
+- 当前阶段：verification / orphan closeout
+- 本段结论：b009903 上窄套件 `8 passed` 后 5 s 仍残留 5 个进程（4 个 `spawn_main` + 1 个 `resource_tracker`，pgid/sid 全指向已死的隔离子进程）；修后同一窄套件与三次全量管道模拟（`520 passed, 3 skipped`，退出码 0）残留探测均为 0，汇总行到管道结束 0.056 s。红验 a（`cancel()` 回退基线顺序）68.22 s 内 7 项 AssertionError、HTTP 仍绿、无残留。不变式断言有效性：把 `_kill_group` 改成只检测不杀并去掉子进程侧关闭后，4 个 WS 用例以 `AssertionError: ... leftover_group_pids=[<pid>]` 转红，pid 与 5 s 探测到的残留一致。
+- 关键决策与已否决方案：残留探测用 `CW93_PROBE` 标记读 `/proc/<pid>/environ` 归因，只认本轮运行衍生的进程，避免把同机其他项目同时起的 multiprocessing 进程算到自己头上；否决用 `ps` 差集直接归因，实测把别的项目的 `resource_tracker` 误计成残留。
+- 下一步唯一动作：推送 `card/caps-93-decoder-abort-261006`，由主脑验收与 PR 门禁主审复核。
