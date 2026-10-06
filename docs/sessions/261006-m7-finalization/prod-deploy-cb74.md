@@ -33,9 +33,17 @@
 - 环境重载：`pm2 startOrReload ecosystem.config.cjs --only qwen-asr-server --update-env`，退出码 `0`。
 - 更新后 `/health`：`{"status":"ok","git_sha":"cb74d8f","model":"qwen_asr_mlx","worker_alive":true}`；PM2 online；7017 正在监听。SDK 冒烟待后续统一执行。
 
+## 4. Mac Studio / capswriter-proxy / 6020
+
+- 升级前磁盘 HEAD `6b7a2b82fbc3ebe862250a8804902e5bf37f9211`；`/health`：`{"status":"ok","git_sha":"6b7a2b8","model":null,"worker_alive":null}`；PM2 online。
+- 升级前 `/status`：3 个后端，2 个健康的 v2 后端 SHA 为 cb74d8f，另 1 个 v1 后端不健康且无 SHA；活动任务数 0。
+- 更新命令：`DEPLOY_PYTHON="$PWD/.venv/bin/python" CW_MODEL_TYPE=proxy DEPLOY_PROCESS_NAME=capswriter-proxy DEPLOY_PORT=6020 ./deploy/update.sh cb74d8f2a333d231cbd7e36ccff8c305b4ab89b6`；退出码 `0`，最后输出 `更新完成：process=capswriter-proxy model=proxy port=6020 git_sha=cb74d8f`。无配置改动。
+- 更新后 `/health`：`{"status":"ok","git_sha":"cb74d8f","model":null,"worker_alive":null}`；PM2 online。
+- 更新后 `/status`：2 个健康 v2 后端均为 cb74d8f，1 个原有 v1 后端仍不健康且无 SHA；活动任务数 0。
+
 ## 结果与偏差
 
-原生 PowerShell 5.1 缺少更新脚本使用的 `-SkipHttpErrorCheck` 参数，切换 PowerShell 7 后 Windows 6016 更新成功。Windows 6016 与 Studio 两个 ASR（6016、6017）均已升级至 cb74，HTTP 监听已启用且健康检查通过。下一步为 proxy，再只读查询 Mac mini 并进行 HTTP 冒烟。
+原生 PowerShell 5.1 缺少更新脚本使用的 `-SkipHttpErrorCheck` 参数，切换 PowerShell 7 后 Windows 6016 更新成功。Windows 6016、Studio 两个 ASR、proxy 均已升级至 cb74 且健康端点通过；proxy `/status` 有 2 个健康 v2 后端。下一步只读查询 Mac mini，再进行 HTTP 冒烟。
 
 ## 收尾
 
