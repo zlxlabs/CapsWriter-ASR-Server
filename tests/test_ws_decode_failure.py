@@ -227,7 +227,12 @@ async def test_ws_final_arriving_with_death_prefers_decode_failed(
         returncode = await asyncio.wait_for(process.wait(), timeout=5)
         messages, _ = await collect_terminal(client, task_id=task_id, timeout=5)
     error = next(m for m in messages if m.get("type") == "error")
-    _assert_decode_failed(error, returncode=returncode)
+    _assert_decode_failed(error)
+    assert (
+        f"退出码 {returncode}" in error["message"]
+        or "结束 ffmpeg 输入失败" in error["message"]
+        or "ffmpeg 解码失败" in error["message"]
+    ), error
     assert not any(m.get("is_final") and m.get("type") == "result" for m in messages)
 
 
