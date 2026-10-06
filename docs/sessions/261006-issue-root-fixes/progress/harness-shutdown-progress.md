@@ -28,9 +28,15 @@ stop_seconds = 10.02     stop_error = AssertionError(服务主进程未在 5 秒
 server_exitcode = -15
 ```
 
-反证「挂死」：形态 C 的 pytest 主进程本身**有界退出**（退出码 1，19.6s）。
-早期一次 `timed_out=True` 是探针自身缺陷——用管道收输出，孤儿进程继承管道写端导致
-`communicate()` 永不等 EOF；改为写文件 + 轮询进程存亡后不成立。**不把探针故障当被测故障。**
+两件不同的事，分开记：
+
+1. **pytest 进程本身**：形态 C 下它有界退出（退出码 1，19.6s）。这是对「进程挂死」的直接反证。
+2. **外层收输出的管道**：早期一次 `timed_out=True` 是探针自身缺陷——管道模式下跑砸留下的
+   孤儿进程继承管道写端，`communicate()` 永远等不到 EOF。这是「收不到输出」，
+   **不构成**对第 1 点的证据；改成写文件 + 轮询 `/proc` 判存活后两者不再混淆。
+
+结论只到第 1 点：当前代码下 pytest 进程不会因为这个路径挂死；工单描述的「7 分钟以上
+挂住」在当前代码上没有对应现场。
 
 ## 阶段二：owner 侧根治
 
@@ -103,3 +109,21 @@ pytest 退出码 1，唯一失败是主体原断言「等待任务 … 终态超
 永远等不到 EOF。改写文件 + 轮询进程存亡后，pytest 主进程两次都被证明**有界退出**。
 E2E 用例因此也改成写文件 + `Popen.wait(timeout=...)`，判据落在进程本身而不是管道。
 
+## 阶段四：第一次有限收尾轮（原 owner / 查询 / producer 契约）
+
+固定 H0=`482cf9a`。独立首审 verdict（`bdba4fa5`，58 行）按原样 pick 进本分支，逐字未改。
+
+1. `stop()` 里 reclaim 包进 `try/finally`：reclaim 上抛时，原有的服务停止/join、
+   `info_queue.close()` 与 `manager.shutdown()` 通道仍走完；错误仍 fail loud
+   （finally 里不吞、不重试、不加超时配置）。
+2. 三处广捕 `OSError -> None` 缩窄为 `(FileNotFoundError, ProcessLookupError)`：
+   PermissionError/EIO 等未知读失败上抛。实测三态：有效 pid 返回事实、
+   不存在 pid 返回 None、注入 PermissionError 上抛（errno 13）。
+3. 内层 producer 把**真实 `sys.argv`** 与**白名单单个 `CW_HARNESS_SHUTDOWN_MARKER` 值**
+   写进 marker（不 dump 整个 environ）；父进程按真实 marker 字节比对 argv 与父进程
+   实际传入的实参、env 路径等于实际目标。变异：少写 argv 首项 -> exit=1（1 failed，
+   2.70s）；写错 marker env -> exit=1（1 failed，2.54s）；两次都是断言红，不是 ImportError。
+4. 未跟踪探针脚本（5 个，非卡面点名的 2 个）按原文件名/字节/sha256 精确移到本轮
+   report 的 evidence 目录，未删除、未 commit；`probe/` 只剩被 gitignore 的 `__pycache__`。
+5. 本轮不加进程组、不加看门狗、不加重试、不改生产/HTTP；没有真实 /proc 权限错误或
+   SIGKILL 后 D 态不可杀的现场，不升级 P1、不穷举畸形对象。

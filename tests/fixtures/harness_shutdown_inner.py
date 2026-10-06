@@ -40,10 +40,14 @@ MARKER = Path(os.environ["CW_HARNESS_SHUTDOWN_MARKER"])
 
 
 def _proc_row(pid):
-    """(comm, state, ppid)，全部读自 /proc/<pid>/stat；进程不在则 None。"""
+    """(comm, state, ppid)，全部读自 /proc/<pid>/stat。
+
+    只有「路径确实消失/进程确实不存在」才算 None；PermissionError 等未知读失败
+    上抛，不伪装成「进程已退」。
+    """
     try:
         stat = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8")
-    except OSError:
+    except (FileNotFoundError, ProcessLookupError):
         return None
     try:
         comm = stat[stat.index("(") + 1:stat.rindex(")")]
@@ -151,7 +155,11 @@ async def test_body_fails_while_holding_a_paused_decoder():
         server_config={"upload_idle_seconds": 100000.0}, monitor_interval=0.5
     )
     facts = {"server_pid": server.process.pid, "worker_pid": server.worker_pid,
-             "ffmpeg_pid": None}
+             "ffmpeg_pid": None,
+             # 跨进程契约：内层真正收到的 argv 与 marker env 原样写回（只这
+             # 一个白名单变量，不 dump 整个 environ），父进程按真实字节比对。
+             "argv": list(sys.argv),
+             "marker_env": os.environ.get("CW_HARNESS_SHUTDOWN_MARKER")}
     ffmpeg_pid = None
     pumping = None
     try:

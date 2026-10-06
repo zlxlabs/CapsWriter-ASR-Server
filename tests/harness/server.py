@@ -206,20 +206,25 @@ class ManagedFakeServerHarness:
             await asyncio.sleep(0.01)
 
     async def stop(self):
-        # 先收回本 owner fork 出来的解码子进程，再让服务主进程走正常收尾。
-        await self._reclaim_decoder_children()
-        if self.process.is_alive():
-            self.queue_in.put(None)
-            self.queue_out.put(None)
+        try:
+            # 先收回本 owner fork 出来的解码子进程，再让服务主进程走正常收尾。
+            await self._reclaim_decoder_children()
+        finally:
+            # reclaim 只能在服务主进程收尾之前发生（顺序是根治点），但它上抛时
+            # 原有的服务停止/join、IPC 队列 close 与 Manager shutdown 通道仍必须走完，
+            # 否则会把一次可见失败变成残留进程。错误仍 fail loud：finally 里不吞、不重试。
+            if self.process.is_alive():
+                self.queue_in.put(None)
+                self.queue_out.put(None)
+                await asyncio.to_thread(self.process.join, 5)
+            graceful_timeout = self.process.is_alive()
+            if graceful_timeout:
+                self.process.terminate()
             await asyncio.to_thread(self.process.join, 5)
-        graceful_timeout = self.process.is_alive()
-        if graceful_timeout:
-            self.process.terminate()
-        await asyncio.to_thread(self.process.join, 5)
-        assert not self.process.is_alive(), "服务主进程在 teardown 的 5 秒 join 后仍存活"
-        self.info_queue.close()
-        self.manager.shutdown()
-        assert not graceful_timeout, "服务主进程未在 5 秒内响应 worker 停止信号"
+            assert not self.process.is_alive(), "服务主进程在 teardown 的 5 秒 join 后仍存活"
+            self.info_queue.close()
+            self.manager.shutdown()
+            assert not graceful_timeout, "服务主进程未在 5 秒内响应 worker 停止信号"
 
     async def _reclaim_decoder_children(self, timeout: float = 5.0) -> None:
         """stop() 的第一步：把本服务主进程名下的解码子进程收干净。
@@ -261,10 +266,15 @@ class ManagedFakeServerHarness:
 
 
 def _proc_facts(pid: int):
-    """返回 (comm, state, ppid)，全部读自 /proc/<pid>/stat；进程不在则 None。"""
+    """返回 (comm, state, ppid)，全部读自 /proc/<pid>/stat。
+
+    只有「路径确实消失/进程确实不存在」才等价于 None（FileNotFoundError）；
+    PermissionError、EIO 等未知读失败**上抛**——它们不证明进程已退，
+    当成 None 就是把查询错误伪装成「已回收」。
+    """
     try:
         stat = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8")
-    except OSError:
+    except (FileNotFoundError, ProcessLookupError):
         return None
     try:
         comm = stat[stat.index("(") + 1:stat.rindex(")")]

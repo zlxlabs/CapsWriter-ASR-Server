@@ -51,10 +51,14 @@ STALLED_FOREVER = {"upload_idle_seconds": 100000.0}
 
 # ------------------------------------------------------------------ /proc 事实
 def _proc_row(pid):
-    """(comm, state, ppid)，全部读自 /proc/<pid>/stat；进程不在则 None。"""
+    """(comm, state, ppid)，全部读自 /proc/<pid>/stat。
+
+    只有「路径确实消失/进程确实不存在」才算 None；PermissionError 等未知读失败
+    上抛，不伪装成「进程已退」。
+    """
     try:
         stat = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8")
-    except OSError:
+    except (FileNotFoundError, ProcessLookupError):
         return None
     try:
         comm = stat[stat.index("(") + 1:stat.rindex(")")]
@@ -357,20 +361,46 @@ async def test_owner_never_signals_a_bystander_ffmpeg(tmp_path):
         bystander.wait(timeout=10)
 
 
+@pytest.mark.asyncio
+async def test_reclaim_failure_still_runs_the_original_cleanup_channels():
+    """已知 helper 异常下：原 owner 的清理通道仍走完，且异常仍然可见。"""
+    server = await ManagedFakeServerHarness.start(monitor_interval=0.5)
+
+    async def boom():
+        raise RuntimeError("injected reclaim failure")
+
+    server._reclaim_decoder_children = boom
+    try:
+        with pytest.raises(RuntimeError, match="injected reclaim failure"):
+            await server.stop()
+        assert server.process.exitcode is not None, (
+            "reclaim 上抛时服务主进程仍须被 join 回收"
+        )
+        assert server.manager._process.is_alive() is False, (
+            "reclaim 上抛时 Manager shutdown 通道仍须执行，"
+            f"实际 Manager 进程仍存活 exitcode={server.manager._process.exitcode}"
+        )
+    finally:
+        await _force_cleanup(server)
+
+
 @pytest.mark.skipif(sys.platform != "linux", reason="内层验收依赖 /proc 与真 ffmpeg")
 def test_failing_body_with_paused_decoder_exits_nonzero_and_reclaims(tmp_path):
     """E2E：独立 pytest 里主体断言必失败且持有已暂停解码子进程 → 有界非零退出。"""
     marker = tmp_path / "inner-facts.json"
     log = tmp_path / "inner-pytest.log"
+    # 父进程实际传给内层 pytest 的实参：内层必须把自己真正收到的 argv 与
+    # 唯一相关的 marker env 原样写回，父进程再按真实字节比对，不看本进程 flags。
+    inner_args = [
+        str(INNER_PYTEST), "-q", "-p", "no:cacheprovider",
+        "-o", "faulthandler_timeout=45",
+    ]
     started = time.monotonic()
     # 输出写文件而不是管道：内层跑砸时会选留下孤儿进程，孤儿继承管道写端会让
     # communicate() 永远等不到 EOF，把「pytest 已退出」误报成「pytest 挂死」。
     with open(log, "wb") as sink:
         inner = subprocess.Popen(
-            [
-                sys.executable, "-m", "pytest", str(INNER_PYTEST),
-                "-q", "-p", "no:cacheprovider", "-o", "faulthandler_timeout=45",
-            ],
+            [sys.executable, "-m", "pytest", *inner_args],
             cwd=REPO_ROOT,
             env={**os.environ, "CW_HARNESS_SHUTDOWN_MARKER": str(marker)},
             stdout=sink, stderr=subprocess.STDOUT,
@@ -413,3 +443,15 @@ def test_failing_body_with_paused_decoder_exits_nonzero_and_reclaims(tmp_path):
     assert _proc_row(facts["server_pid"]) is None, "服务主进程没被回收"
     assert _proc_row(facts["ffmpeg_pid"]) is None, "解码子进程没被回收"
     assert _proc_row(facts["worker_pid"]) is None, "识别子进程没被回收"
+
+    # 跨进程契约：内层真正跑起来的 argv 与它真正收到的 marker env（白名单单个变量）。
+    assert facts["marker_env"] == str(marker), (
+        f"内层记录的 marker env 与父进程实际传入的目标不符：{facts['marker_env']!r}"
+    )
+    reported_argv = facts["argv"]
+    assert reported_argv[1:] == inner_args, (
+        f"内层真实 argv 与父进程实际传入的实参不一致：{reported_argv!r}"
+    )
+    assert Path(reported_argv[0]).name == "__main__.py" and "pytest" in reported_argv[0], (
+        f"内层不是以 python -m pytest 起来的：argv[0]={reported_argv[0]!r}"
+    )
