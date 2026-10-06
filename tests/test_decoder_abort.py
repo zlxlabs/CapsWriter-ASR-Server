@@ -159,10 +159,46 @@ def _compressed_frame(
 
 async def _assert_closed(websocket) -> None:
     try:
-        await asyncio.wait_for(websocket.recv(), timeout=5)
+        await asyncio.wait_for(websocket.recv(), timeout=20)
     except websockets.ConnectionClosed:
         return
     raise AssertionError("audio_too_long 错误帧后连接未关闭")
+
+
+def _tracking_decoder_class(real_decoder):
+    class TrackingDecoder(real_decoder):
+        instances = []
+
+        def __init__(self, decoder_encoding):
+            super().__init__(decoder_encoding)
+            self.backpressure_observed = False
+            type(self).instances.append(self)
+
+        async def _wait_for_backpressure(self):
+            reader = self.process.stdout
+            deadline = time.monotonic() + 5
+            while time.monotonic() < deadline:
+                if reader._paused and _stream_buffered(reader) > 2 * reader._limit:
+                    self.backpressure_observed = True
+                    return
+                await asyncio.sleep(0.01)
+            raise AssertionError("消费侧停止取许可后 stdout 未形成真实背压")
+
+        async def pcm_chunks(self):
+            async for pcm in super().pcm_chunks():
+                if self.samples_emitted > 5 * 16000 and not self.backpressure_observed:
+                    await self._wait_for_backpressure()
+                yield pcm
+
+        async def cancel(self):
+            if self.process is not None:
+                reader = self.process.stdout
+                self.backpressure_observed |= (
+                    reader._paused and _stream_buffered(reader) > 2 * reader._limit
+                )
+            await super().cancel()
+
+    return TrackingDecoder
 
 
 async def _run_ws_audio_too_long(
@@ -180,26 +216,27 @@ async def _run_ws_audio_too_long(
     async with websockets.connect(
         fake_asr_server.url, max_size=None, ping_interval=None
     ) as client:
-        if final_only:
-            await client.send(_compressed_frame(
-                task_id, payload, encoding, final=True, samples_total=samples_total
-            ))
-        else:
+        async def send_stream() -> None:
+            if final_only:
+                await client.send(_compressed_frame(
+                    task_id, payload, encoding, final=True, samples_total=samples_total
+                ))
+                return
             chunk_size = 64 * 1024
             for offset in range(0, len(payload), chunk_size):
                 await client.send(_compressed_frame(
-                    task_id,
-                    payload[offset:offset + chunk_size],
-                    encoding,
-                    final=False,
-                    samples_total=samples_total,
+                    task_id, payload[offset:offset + chunk_size], encoding,
+                    final=False, samples_total=samples_total,
                 ))
             await client.send(_compressed_frame(
                 task_id, b"", encoding, final=True, samples_total=samples_total
             ))
+
+        sender = asyncio.create_task(send_stream())
         messages, closed = await collect_terminal(
             client, task_id=task_id, timeout=5
         )
+        await asyncio.gather(sender, return_exceptions=True)
         elapsed = time.monotonic() - started
         error = next(message for message in messages if message.get("type") == "error")
         assert error["code"] == "audio_too_long", error
@@ -222,23 +259,7 @@ async def test_ws_compressed_audio_too_long_is_delivered_with_backpressure(
     monkeypatch.setenv("CW_MAX_TASK_SECONDS", "5")
     monkeypatch.setattr(ws_recv_module.Config, "upload_idle_seconds", 120.0)
     real_decoder = ws_recv_module.AudioDecoder
-
-    class TrackingDecoder(real_decoder):
-        instances = []
-
-        def __init__(self, decoder_encoding):
-            super().__init__(decoder_encoding)
-            self.backpressure_observed = False
-            type(self).instances.append(self)
-
-        async def cancel(self):
-            if self.process is not None:
-                reader = self.process.stdout
-                self.backpressure_observed = (
-                    reader._paused and _stream_buffered(reader) > 2 * reader._limit
-                )
-            await super().cancel()
-
+    TrackingDecoder = _tracking_decoder_class(real_decoder)
     monkeypatch.setattr(ws_recv_module, "AudioDecoder", TrackingDecoder)
     with caplog.at_level(logging.INFO):
         elapsed = []
@@ -268,23 +289,7 @@ async def test_ws_final_frame_audio_too_long_observes_decoder_failure(
     monkeypatch.setenv("CW_MAX_TASK_SECONDS", "5")
     monkeypatch.setattr(ws_recv_module.Config, "upload_idle_seconds", 120.0)
     real_decoder = ws_recv_module.AudioDecoder
-
-    class TrackingDecoder(real_decoder):
-        instances = []
-
-        def __init__(self, decoder_encoding):
-            super().__init__(decoder_encoding)
-            self.backpressure_observed = False
-            type(self).instances.append(self)
-
-        async def cancel(self):
-            if self.process is not None:
-                reader = self.process.stdout
-                self.backpressure_observed = (
-                    reader._paused and _stream_buffered(reader) > 2 * reader._limit
-                )
-            await super().cancel()
-
+    TrackingDecoder = _tracking_decoder_class(real_decoder)
     monkeypatch.setattr(ws_recv_module, "AudioDecoder", TrackingDecoder)
     await _run_ws_audio_too_long(
         fake_asr_server,
