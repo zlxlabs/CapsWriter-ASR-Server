@@ -112,6 +112,33 @@ async def test_cancel_drains_backpressured_ffmpeg_pipes(
 
 
 @pytest.mark.asyncio
+async def test_external_finish_cancellation_propagates(
+    long_compressed_audio,
+):
+    _, encoded = long_compressed_audio
+    decoder = AudioDecoder("flac")
+    await decoder.feed(b"")
+    process = decoder.process
+    feed_task = asyncio.create_task(decoder.feed(encoded["flac"]))
+    try:
+        await _wait_for_backpressure(process)
+        finish_task = asyncio.create_task(decoder.finish())
+        await asyncio.sleep(0)
+        finish_task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await finish_task
+        assert process.returncode is not None
+    finally:
+        if not feed_task.done():
+            feed_task.cancel()
+        await asyncio.gather(feed_task, return_exceptions=True)
+        await _force_reap(
+            process,
+            (decoder._writer_task, decoder._reader_task, decoder._stderr_task),
+        )
+
+
+@pytest.mark.asyncio
 async def test_http_decoder_close_drains_backpressured_ffmpeg_pipes(
     tmp_path: Path, long_compressed_audio, caplog
 ):
@@ -263,7 +290,7 @@ async def test_ws_compressed_audio_too_long_is_delivered_with_backpressure(
     monkeypatch.setattr(ws_recv_module, "AudioDecoder", TrackingDecoder)
     with caplog.at_level(logging.INFO):
         elapsed = []
-        for _ in range(5):
+        for round_number in range(1, 6):
             result, _ = await _run_ws_audio_too_long(
                 fake_asr_server,
                 encoded[encoding],
@@ -273,6 +300,11 @@ async def test_ws_compressed_audio_too_long_is_delivered_with_backpressure(
                 decoder_class=TrackingDecoder,
             )
             elapsed.append(result)
+            print(
+                f"cw93_e2e_latency encoding={encoding} round={round_number} "
+                f"elapsed_s={result:.6f}",
+                flush=True,
+            )
     assert all(item <= 5 for item in elapsed), elapsed
     assert any(
         f"code=audio_too_long" in record.getMessage()
