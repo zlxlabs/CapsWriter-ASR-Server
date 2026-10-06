@@ -95,16 +95,38 @@ def _ffmpeg_pids() -> set[int]:
     return pids
 
 
-def _reap_group(pid: int, extra: set[int]) -> None:
-    try:
-        os.killpg(pid, signal.SIGKILL)
-    except ProcessLookupError:
-        pass
-    for ffmpeg_pid in extra | _ffmpeg_pids():
+def _live_group_pids(pgid: int) -> list[int]:
+    """列出该进程组内仍活着的 pid；僵尸不计，它不占文件描述符、挂不住管道。"""
+    pids = []
+    for entry in Path("/proc").iterdir():
+        if not entry.name.isdigit():
+            continue
         try:
-            os.kill(ffmpeg_pid, signal.SIGKILL)
-        except ProcessLookupError:
-            pass
+            stat = Path(f"/proc/{entry.name}/stat").read_text()
+        except OSError:
+            continue
+        # comm 里可能带空格和右括号，只能从最后一个 ")" 之后开始切
+        fields = stat[stat.rindex(")") + 2:].split()
+        if fields[0] != "Z" and int(fields[2]) == pgid:
+            pids.append(int(entry.name))
+    return sorted(pids)
+
+
+def _kill_group(pgid: int, timeout: float = 5.0) -> list[int]:
+    """SIGKILL 整个隔离子进程组；返回杀完仍存活的 pid。
+
+    等的是内核把被 SIGKILL 的成员摘掉，不是等它自己正常退出。
+    """
+    try:
+        os.killpg(pgid, signal.SIGKILL)
+    except ProcessLookupError:
+        return []
+    deadline = time.monotonic() + timeout
+    while True:
+        leftover = _live_group_pids(pgid)
+        if not leftover or time.monotonic() >= deadline:
+            return leftover
+        time.sleep(0.02)
 
 
 def _isolated_child(kind: str, args: tuple, conn) -> None:
@@ -124,38 +146,40 @@ def _isolated_child(kind: str, args: tuple, conn) -> None:
 
 
 def _run_isolated(kind: str, args: tuple, timeout: float = ISOLATED_TIMEOUT_SECONDS):
-    """在独立进程组跑场景；超时由父进程杀组，不依赖被测 cleanup 返回。"""
+    """在独立进程组跑场景；子进程一停就回收整个组，通过路径也不留孤儿进程。
+
+    孤儿会继承 pytest 的 stdout/stderr 管道写端，CI 里 `pytest | cat` 拿不到 EOF，
+    步骤就在汇总行之后一直挂着。
+    """
     ctx = multiprocessing.get_context("spawn")
     parent_conn, child_conn = ctx.Pipe(duplex=False)
     before = _ffmpeg_pids()
     proc = ctx.Process(target=_isolated_child, args=(kind, args, child_conn))
     proc.start()
     child_conn.close()
-    proc.join(timeout)
-    leftover = _ffmpeg_pids() - before
-    if proc.is_alive():
-        _reap_group(proc.pid, leftover)
-        proc.join(5)
-        leftover = sorted(_ffmpeg_pids() - before)
-        raise AssertionError(
-            f"expected isolated {kind} to finish in {timeout:g}s, "
-            f"actual hung pid={proc.pid} leftover_ffmpeg={leftover}"
-        )
-    if leftover:
-        _reap_group(proc.pid, leftover)
-        leftover = sorted(_ffmpeg_pids() - before)
-        if leftover:
+    try:
+        proc.join(timeout)
+        if proc.is_alive():
             raise AssertionError(
-                f"expected isolated {kind} to reap ffmpeg, actual leftover={leftover}"
+                f"expected isolated {kind} to finish in {timeout:g}s, "
+                f"actual hung pid={proc.pid} "
+                f"leftover_ffmpeg={sorted(_ffmpeg_pids() - before)}"
             )
-    if not parent_conn.poll(0.2):
-        raise AssertionError(
-            f"expected isolated {kind} result pipe, actual exitcode={proc.exitcode}"
-        )
-    status, payload = parent_conn.recv()
-    if status != "ok":
-        raise AssertionError(f"isolated {kind} failed: {payload}")
-    return payload
+        if not parent_conn.poll(0.2):
+            raise AssertionError(
+                f"expected isolated {kind} result pipe, actual exitcode={proc.exitcode}"
+            )
+        status, payload = parent_conn.recv()
+        if status != "ok":
+            raise AssertionError(f"isolated {kind} failed: {payload}")
+        return payload
+    finally:
+        leftover_group_pids = _kill_group(proc.pid)
+        if leftover_group_pids:
+            raise AssertionError(
+                f"expected isolated {kind} to leave no live process, "
+                f"actual pgid={proc.pid} leftover_group_pids={leftover_group_pids}"
+            )
 
 
 async def _isolated_scenario(kind: str, args: tuple):
@@ -342,8 +366,10 @@ async def _scenario_ws(encoding, payload, samples_total, final_only, rounds):
     finally:
         server.close()
         worker.kill()
+        worker.join(5)
         if not sender.done():
             sender.cancel()
+        manager.shutdown()
 
 
 @pytest.mark.parametrize("encoding", ["flac", "ogg_opus"])
