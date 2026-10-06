@@ -390,7 +390,24 @@ async def message_handler(websocket, msg: AudioMessage, cache: AudioCache, app) 
 
     if msg.source == 'mic':
         status_mic.stop()
-    await cache.decoder.finish()
+    finish = asyncio.create_task(cache.decoder.finish())
+    try:
+        done, _ = await asyncio.wait(
+            (finish, cache.decoder_task), return_when=asyncio.FIRST_COMPLETED
+        )
+        if cache.decoder_task in done:
+            consumer_result = cache.decoder_task.result()
+            if not consumer_result:
+                if not finish.done():
+                    finish.cancel()
+                    await asyncio.gather(finish, return_exceptions=True)
+                return False
+        await finish
+    except BaseException:
+        if not finish.done():
+            finish.cancel()
+        await asyncio.gather(finish, return_exceptions=True)
+        raise
     if not await cache.decoder_task:
         return False
     record.samples_total = cache.decoder.samples_emitted
@@ -428,9 +445,6 @@ async def _cancel_audio_cache(cache: AudioCache) -> None:
     if cache.decoder_task is not None:
         await asyncio.gather(cache.decoder_task, return_exceptions=True)
     if cache.decoder is not None:
-        process = cache.decoder.process
-        if process is not None and process.returncode is None:
-            process.kill()
         await cache.decoder.cancel()
 
 

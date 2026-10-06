@@ -5,7 +5,10 @@ import shutil
 
 import numpy as np
 
-_CANCEL_TIMEOUT_SECONDS = 5.0
+
+async def drain_subprocess_pipes(process: asyncio.subprocess.Process) -> None:
+    """排空子进程输出管道，避免中止时 wait 依赖暂停的读侧。"""
+    await asyncio.gather(process.stdout.read(), process.stderr.read())
 
 
 class AudioDecodeError(Exception):
@@ -215,20 +218,13 @@ class AudioDecoder:
 
     async def cancel(self) -> None:
         self._input_finished = True
-        if self.process is None:
+        process = self.process
+        if process is None:
             return
-        if not self.process.stdin.is_closing():
-            self.process.stdin.close()
-        if self.process.returncode is None:
-            if self._writer_task and not self._writer_task.done():
-                self._writer_task.cancel()
-            try:
-                await asyncio.wait_for(
-                    asyncio.shield(self.process.wait()), timeout=_CANCEL_TIMEOUT_SECONDS
-                )
-            except asyncio.TimeoutError:
-                self.process.kill()
-                await self.process.wait()
+        if process.returncode is None:
+            process.kill()
+        if not process.stdin.is_closing():
+            process.stdin.close()
         for task in (self._writer_task, self._reader_task, self._stderr_task):
             if task and not task.done():
                 task.cancel()
@@ -236,6 +232,8 @@ class AudioDecoder:
             *(task for task in (self._writer_task, self._reader_task, self._stderr_task) if task),
             return_exceptions=True,
         )
+        await drain_subprocess_pipes(process)
+        await process.wait()
 
 
 def available_encodings() -> list[str]:
