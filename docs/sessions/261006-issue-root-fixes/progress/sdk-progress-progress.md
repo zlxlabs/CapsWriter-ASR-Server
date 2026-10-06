@@ -115,6 +115,42 @@ contextlib.py:217  _AsyncGeneratorContextManager.__aexit__
 
 ---
 
-## 单元三：异常、取消与文档
+## 单元三：红验与文档
 
-（待补：红验与文档）
+### 红验（全部在 `git archive HEAD` 导出的隔离树里做，主树全程未动）
+
+| 注入 | 期望 | 实测 |
+| --- | --- | --- |
+| 恢复逐帧 `asyncio.wait({sender}, timeout=idle_timeout)` | 背压用例变红 | `3 failed, 11 passed`；`test_backpressure_with_continuous_results_survives_and_finalizes` 报 `AsrError: 发送音频帧超过 idle_timeout`（有合法中间结果仍被误杀）；另两条阻塞用例同样转红 |
+| 恢复 `idle_watch` 的 `await upload_done.wait()` 前置门 | 真正上传未完 + 下行静默的用例变红 | `1 failed, 13 passed`；`test_blocked_upload_with_silent_server_fails_on_idle_before_upload_done` 报 `发送阻塞且下行静默时调用没有在有界时间内结束`（只会在 `deadline_total=90` 才暴露） |
+| 去掉用例里的 `read_gate.clear()`（人为不造背压） | 前提断言自身变红 | `AssertionError: 被测前提不成立：上传其实已经发完（10/10），本用例没有造出背压` |
+
+三次都是真实的断言失败，没有 `ImportError`、没有拿外层 timeout 充数；注入确认生效后
+只还原被改的那几行，隔离树直接丢弃。
+
+### 稳定性
+
+`tests/test_sdk_progress_watchdog.py` 连续 5 轮，每轮 `14 passed`，退出码均为 0，耗时稳定在 40 秒
+（修掉收尾挂死前是 113 秒且有 3 条不返回）。
+
+### 全量
+
+`uv run ... python -m pytest tests/ -q -p no:cacheprovider` → **526 passed, 3 skipped**（347s）。
+派发时主干基线不可用（`gh api request failed`），所以**继承红未能判定**；本卡开工前先单独跑过
+窄测集合（除新增文件）确认是 62 passed，修改过程中出现的红全部由本卡自己的改动引入并已消除，
+无新增红面。
+
+### 文档
+
+- `sdk/README.md`：新增一段区分 `idle_timeout`（距上次真实进展的上限，从连接建立起覆盖上传）
+  与 `deadline_total` / 自动预算（绝对墙钟）；写明真实进展的两种形态、未知 `type` 与陌生
+  `task_id` 不刷新计时、以及停滞消息只陈述事实不推断责任。
+- `docs/reference/protocol.md`：只改 Python SDK 那一节，同步上述语义；服务端上行停滞看门狗
+  一节与错误码表一字未动（`git diff --name-only` 确认本卡只碰了这两个文档文件的对应段落）。
+
+### 未做（按卡面非目标）
+
+- 不改自动预算公式/默认值，不恢复 ping，不加 progress 协议，不加自动重试或 fallback。
+- 不碰 `PROTOCOL_ERROR_CODES`、SDK HTTP 客户端、服务端、`tests/harness/server.py`、
+  `tests/test_ws_progress_watchdog.py`、CI 配置与默认分支。
+- SDK 采用需下游 pin、以及是否关 #76，均留给主脑处置。
