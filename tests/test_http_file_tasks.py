@@ -70,10 +70,10 @@ async def _async_chunks(*chunks: bytes):
 
 
 @asynccontextmanager
-async def running_server(tmp_path: Path, inference: bool = False, pause_hook=None):
-    """在 port 0 上起真实 aiohttp listener，退出时收尾。"""
+async def running_server(tmp_path: Path, inference: bool = False, pause_hook=None, port: int = 0):
+    """在指定端口起真实 aiohttp listener；port=0 时由系统分配。"""
     loop = asyncio.get_running_loop()
-    server = HttpServer(_StubApp(loop), "127.0.0.1", 0, tmp_path / "httpdata")
+    server = HttpServer(_StubApp(loop), "127.0.0.1", port, tmp_path / "httpdata")
     # 只切换「协调者是否已装配」这一个开关，不替换被测实现
     server.inference_available = inference
     server.prepare()
@@ -86,7 +86,7 @@ async def running_server(tmp_path: Path, inference: bool = False, pause_hook=Non
 
         server._store.append_bytes = hooked
     await server._runner.setup()
-    site = server._web.TCPSite(server._runner, "127.0.0.1", 0)
+    site = server._web.TCPSite(server._runner, "127.0.0.1", port)
     await site.start()
     port = site._server.sockets[0].getsockname()[1]
     server._site = site
@@ -318,6 +318,100 @@ async def test_resume_after_failed_patch_only_sends_unconfirmed_suffix(tmp_path)
             server.data_dir, "SELECT state FROM uploads WHERE upload_id=?", (stored["upload_id"],)
         )
         assert states[0]["state"] == "COMMITTED"
+        assert len(_read_db(server.data_dir, "SELECT job_id FROM jobs")) == 1
+
+
+@pytest.mark.asyncio
+async def test_http_binary_payload_survives_append_recovery_and_commit_replay(tmp_path):
+    """真实 SDK 的 PATCH 字节经确认、恢复与 commit 重放后仍逐字节不变。"""
+    payload = b"\x00A\nB\r\nC\x1aD\xff" + bytes(range(1, 32))
+    source = tmp_path / "producer.bin"
+    source.write_bytes(payload)
+    recovery = tmp_path / "resume.json"
+    patches: list[tuple[int, bytes]] = []
+
+    async with running_server(tmp_path, inference=True) as (server, base_url):
+        resume_port = int(base_url.rsplit(":", 1)[1])
+        append_bytes = server._store.append_bytes
+        calls = 0
+
+        def interrupt_second_patch(upload_id, token, offset, data):
+            nonlocal calls
+            calls += 1
+            patches.append((offset, bytes(data)))
+            if calls == 2:
+                raise RuntimeError("模拟第二段 PATCH 在服务端确认前失败")
+            return append_bytes(upload_id, token, offset, data)
+
+        server._store.append_bytes = interrupt_second_patch
+        await _expect_error(
+            submit_file_http(source, base_url, resume_path=recovery, chunk_bytes=7),
+            "internal_error",
+        )
+        stored = json.loads(recovery.read_text(encoding="utf-8"))
+        upload_id = stored["upload_id"]
+        disk_path = server.data_dir / "sources" / f"{upload_id}.bin"
+        assert stored["confirmed_offset"] == 7
+        physical_prefix = disk_path.read_bytes()
+        assert physical_prefix == payload[:7], (
+            "SDK PATCH bytes differ at the confirmed physical prefix: "
+            f"confirmed_offset={stored['confirmed_offset']} "
+            f"source_size={len(payload)} physical_size={len(physical_prefix)} "
+            f"source_prefix_sha256={sha256(payload[:7]).hexdigest()} "
+            f"physical_prefix_sha256={sha256(physical_prefix).hexdigest()} "
+            f"source_prefix_hex={payload[:7].hex()} physical_prefix_hex={physical_prefix.hex()}"
+        )
+
+        # 造出物理尾长于服务端确认 offset 的现场，恢复请求必须先按 offset 截断。
+        with disk_path.open("ab") as stream:
+            stream.write(b"unacknowledged-tail")
+
+    # 关闭后重启真实 listener/store，确认未确认尾按数据库 offset 恢复。
+    async with running_server(tmp_path, inference=True, port=resume_port) as (server, base_url):
+        append_bytes = server._store.append_bytes
+
+        def record_resumed_patch(upload_id, token, offset, data):
+            patches.append((offset, bytes(data)))
+            return append_bytes(upload_id, token, offset, data)
+
+        server._store.append_bytes = record_resumed_patch
+        handle = await resume_file_http(source, base_url, resume_path=recovery)
+        assert handle.state == "QUEUED"
+        assert handle.job_id is not None
+
+        # append_bytes 收到的是 HTTP handler 从真实 PATCH 请求体读取的 bytes。
+        assert patches == [
+            (0, payload[:7]),
+            (7, payload[7:14]),
+            (7, payload[7:]),
+        ]
+        assert disk_path.read_bytes() == source.read_bytes()
+        assert disk_path.stat().st_size == len(payload)
+        assert sha256(disk_path.read_bytes()).hexdigest() == stored["sha256"]
+
+        auth = {"Authorization": f"Bearer {stored['token']}"}
+        async with httpx.AsyncClient(trust_env=False, follow_redirects=False) as client:
+            commit = await client.post(
+                f"{base_url}/v1/uploads/{upload_id}/commit",
+                headers=auth,
+                content=b"",
+            )
+            assert commit.status_code == 200
+            assert commit.json()["job_id"] == handle.job_id
+            upload = await client.get(
+                f"{base_url}/v1/uploads/{upload_id}",
+                headers=auth,
+            )
+            assert upload.json()["confirmed_offset"] == len(payload)
+
+        row = _read_db(
+            server.data_dir,
+            "SELECT state, confirmed_offset, size_bytes, sha256 FROM uploads WHERE upload_id=?",
+            (upload_id,),
+        )[0]
+        assert row["state"] == "COMMITTED"
+        assert row["confirmed_offset"] == row["size_bytes"] == len(payload)
+        assert row["sha256"] == sha256(source.read_bytes()).hexdigest()
         assert len(_read_db(server.data_dir, "SELECT job_id FROM jobs")) == 1
 
 
