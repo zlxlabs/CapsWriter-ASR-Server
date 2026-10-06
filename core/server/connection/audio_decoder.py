@@ -178,6 +178,14 @@ class AudioDecoder:
                 await self._read_permits.put(None)
             item = await self._output.get()
             if item is self._END:
+                if self._reader_error is not None:
+                    error = self._reader_error
+                    if isinstance(error, AudioDecodeError):
+                        raise error
+                    raise AudioDecodeError(
+                        "decode_failed",
+                        f"ffmpeg 解码失败：{type(error).__name__}: {error}",
+                    ) from error
                 return
             if isinstance(item, bytes):
                 item = np.frombuffer(item, dtype="<f4")
