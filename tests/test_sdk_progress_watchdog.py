@@ -450,12 +450,14 @@ async def test_idle_fires_after_upload_completes_without_any_result(short_s16le_
 
 
 @pytest.mark.asyncio
-async def test_backpressure_with_continuous_results_survives_and_finalizes(long_s16le_audio):
+async def test_backpressure_with_continuous_results_survives_and_finalizes(long_s16le_audio, monkeypatch):
     """正常背压：服务端停止读取但仍在回中间结果 → 超过一个 idle 也不误杀，松开后能 final。"""
     async with FakeRemoteServer(
         progress_kind="matched", progress_interval=0.4, on_upload_complete="final"
     ) as server:
         remote = server.remote
+        observer = _CloseObserver()
+        monkeypatch.setattr(sdk_client.websockets, "connect", observer.connect)
         caller = asyncio.create_task(
             transcribe_file(long_s16le_audio, server.url, encoding="s16le",
                             idle_timeout=IDLE, deadline_total=120,
@@ -463,19 +465,26 @@ async def test_backpressure_with_continuous_results_survives_and_finalizes(long_
         )
         await _wait_for_frames(remote, 2, timeout=20)
         remote.read_gate.clear()  # 真实背压：客户端 ws.send 阻塞
-        await asyncio.sleep(IDLE * 3)
+        await asyncio.sleep(IDLE + 0.5)
+        results_after_idle = remote.results_sent
+        await asyncio.sleep(IDLE * 2)
         alive_under_backpressure = not caller.done()
+        send_pending_under_backpressure = observer.send_pending
         results_under_backpressure = remote.results_sent
         frames_under_backpressure = remote.frames_read
         remote.read_gate.set()  # 解除背压
         done, _ = await asyncio.wait({caller}, timeout=60)
         leaked = _pending_sdk_tasks()
         transcript = caller.result() if caller in done else None
+        send_pending_after_completion = observer.send_pending
 
     assert alive_under_backpressure, "有持续合法中间结果时被背压误杀"
-    assert results_under_backpressure >= 5, (
-        f"背压期间没有持续收到合法中间结果（{results_under_backpressure} 条），"
-        "被测前提不成立"
+    assert send_pending_under_backpressure is True, "观察点没有真实未完成的 ws.send"
+    assert results_after_idle >= 5, (
+        f"跨过一个 idle 窗口前没有持续收到合法中间结果（{results_after_idle} 条）"
+    )
+    assert results_under_backpressure > results_after_idle, (
+        f"跨过 idle 窗口后结果未继续到达（{results_after_idle} → {results_under_backpressure}）"
     )
     assert frames_under_backpressure < FRAME_TOTAL, (
         f"背压期间上传其实已经发完（{frames_under_backpressure}/{FRAME_TOTAL}），"
@@ -485,6 +494,7 @@ async def test_backpressure_with_continuous_results_survives_and_finalizes(long_
     assert isinstance(transcript, Transcript) and transcript.text == "背压之后的结果。"
     assert transcript.task_id == remote.task_id
     assert remote.frames[-1]["is_final"] is True
+    assert send_pending_after_completion is False, "真实 ws.send 完成后观察状态未清理"
     assert leaked == [], f"SDK 内部任务未回收：{leaked}"
 
 
@@ -519,23 +529,56 @@ async def test_messages_that_are_not_task_progress_do_not_refresh_idle(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("code", ["decode_stalled", "audio_too_long", "inference_failed"])
-async def test_server_error_frame_during_upload_is_propagated(long_s16le_audio, code):
-    """上传途中到达的 error 帧按原 code 透传，不被改写成 timeout 或成功。"""
+async def test_server_error_frame_during_upload_is_propagated(long_s16le_audio, code, monkeypatch):
+    """上传 send 未完成时主动发真实 error 帧，按原 code 透传并回收任务。"""
     async with FakeRemoteServer(
         progress_kind="none", on_upload_complete="error", error_code=code
     ) as server:
         remote = server.remote
-        with pytest.raises(AsrError) as caught:
-            await transcribe_file(long_s16le_audio, server.url, encoding="s16le",
-                                  idle_timeout=IDLE, deadline_total=60)
+        observer = _CloseObserver()
+        monkeypatch.setattr(sdk_client.websockets, "connect", observer.connect)
+        caller = asyncio.create_task(
+            transcribe_file(long_s16le_audio, server.url, encoding="s16le",
+                            idle_timeout=IDLE, deadline_total=60)
+        )
+        assert await _wait_for_frames(remote, 1, timeout=20), "服务端没有收到第一帧"
+        remote.read_gate.clear()  # 后续读取停止，保留真实 socket 背压
+        loop = asyncio.get_running_loop()
+        send_deadline = loop.time() + 20
+        while not observer.send_pending and loop.time() < send_deadline:
+            await asyncio.sleep(0.01)
+        send_pending_before_error = observer.send_pending
+        frames_before_error = remote.frames_read
+        last_frame_final_before_error = remote.frames[-1]["is_final"]
+        await server._finish(server._writers[-1])  # 生产 ErrorMessage 序列化并真实发出
+        done, _ = await asyncio.wait({caller}, timeout=20)
+        caller_finished = caller in done
+        error = None
+        if caller_finished:
+            with pytest.raises(AsrError) as caught:
+                caller.result()
+            error = caught.value
+        else:
+            caller.cancel()
+            await asyncio.gather(caller, return_exceptions=True)
+        leaked = _pending_sdk_tasks()
+        send_pending_after_error = observer.send_pending
 
-    assert caught.value.code == code
-    assert caught.value.message == f"服务端拒绝：{code}"
+    assert send_pending_before_error is True, "error 到达前真实 ws.send 尚未进入 pending"
+    assert frames_before_error < FRAME_TOTAL, frames_before_error
+    assert last_frame_final_before_error is False, "error 到达前最后读取帧已是 final"
+    assert caller_finished, "服务端 error 后调用没有在有界时间内结束"
+    assert isinstance(error, AsrError)
+    assert error.code == code
+    assert error.message == f"服务端拒绝：{code}"
     assert remote.error_sent == {
         "type": "error", "task_id": remote.task_id,
         "code": code, "message": f"服务端拒绝：{code}", "retryable": False,
     }
     assert remote.final_sent is False
+    assert remote.session_ended is True, "error 收尾后假服务端会话仍存活"
+    assert send_pending_after_error is False, "error 收尾后真实 ws.send 观察状态未清理"
+    assert leaked == [], f"SDK 内部任务未回收：{leaked}"
 
 
 @pytest.mark.asyncio
@@ -723,12 +766,13 @@ async def test_deadline_during_graceful_close_aborts_the_connection(
 
 
 class _CloseObserver:
-    """只观测不动手：记录 __aexit__ 是否被取消、退出后 transport 是否真的被中止。"""
+    """只观测不动手：记录真实 send 与 __aexit__ 的收尾状态。"""
 
     def __init__(self) -> None:
         self.exit_started = None
         self.exit_cancelled = None
         self.paused_at_exit = None
+        self.send_pending = False
         self.ws = None
         self._cm = None
         self._ws = None
@@ -757,7 +801,11 @@ class _CloseObserver:
                 return result
 
             async def send(self_, message):
-                return await outer._ws.send(message)
+                outer.send_pending = True
+                try:
+                    return await outer._ws.send(message)
+                finally:
+                    outer.send_pending = False
 
             async def recv(self_):
                 return await outer._ws.recv()
