@@ -28,3 +28,4 @@ merged_pr: 83
 - 审查资格：H1 两份完整审查 + H2 精确增量审查（p2-only，无应用 P1），不靠新增验收文档刷审查次数。
 - 证据定位与分层（含真实 P2 与 unknown、假引擎不等于 ASR 质量、schema-only 消费者不等于认证任意 JSON）：`docs/sessions/261003-http-completion/m6-final-merged-acceptance.md`。
 - 本次只回写里程碑状态；M7、生产部署、Windows 平台与真实 ASR 质量未被此验收代替，仍未完成。
+- 冻结边界：本条完成结论只覆盖合并主干 `796104c3` 及其真实运行与审查。此后主干已前移到 `d251618e`（改了 `core/`、`sdk/`、`tests/` 运行源码），不在上述非文档 340 集合等价、全量 511 passed 双臂、裸壳与 Hosted 真五轮的覆盖内；本 Goal 记的是「M6 在 `796104c3` 历史时点真实完成」，不是「在最新主干上再次全量验证 M6」。
