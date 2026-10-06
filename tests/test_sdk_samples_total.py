@@ -162,6 +162,7 @@ async def _capture_server():
             if frame["is_final"]:
                 await ws.send(json.dumps({
                     "type": "result",
+                    "task_id": frame["task_id"],
                     "is_final": True,
                     "text": "ok",
                     "duration": 0.0,

@@ -236,13 +236,23 @@ async def _check_server(url: str, encoding: str, model: str | None = None) -> No
         raise AsrError("bad_request", f"请求模型 {model!r} 与服务端模型 {health.get('model')!r} 不符")
 
 
-def _audio_frames(data: bytes, encoding: str):
+def _audio_frame_bytes(data_length: int, encoding: str) -> int:
+    """单帧字节上限：原始 PCM 按 60 秒切，压缩流按固定块切。"""
     if encoding in {"f32le", "s16le"}:
         sample_bytes = 4 if encoding == "f32le" else 2
-        frame_bytes = _RAW_SAMPLE_RATE * _RAW_FRAME_SECONDS * sample_bytes
-    else:
-        frame_bytes = _CHUNK_BYTES
-    count = max(1, (len(data) + frame_bytes - 1) // frame_bytes)
+        return _RAW_SAMPLE_RATE * _RAW_FRAME_SECONDS * sample_bytes
+    return _CHUNK_BYTES
+
+
+def _audio_frame_count(data_length: int, encoding: str) -> int:
+    """总帧数。停滞消息要报「已发/总帧」，所以在发送前就能算出分母。"""
+    frame_bytes = _audio_frame_bytes(data_length, encoding)
+    return max(1, (data_length + frame_bytes - 1) // frame_bytes)
+
+
+def _audio_frames(data: bytes, encoding: str):
+    frame_bytes = _audio_frame_bytes(len(data), encoding)
+    count = _audio_frame_count(len(data), encoding)
     for index in range(count):
         yield data[index * frame_bytes:(index + 1) * frame_bytes], index == count - 1
 
@@ -298,24 +308,38 @@ def _transcript(result: dict) -> Transcript:
     )
 
 
-async def _receive(ws, *, on_progress, idle_messages: asyncio.Queue) -> Transcript:
+async def _receive(
+    ws,
+    *,
+    task_id: str,
+    on_progress,
+    idle_messages: asyncio.Queue,
+    progress: dict,
+) -> Transcript:
     while True:
         try:
             message = await ws.recv()
         except (OSError, websockets.exceptions.WebSocketException) as exc:
             raise AsrError("connection_lost", f"服务端关闭连接且未发送错误帧: {exc}") from exc
+        result = json.loads(message)
+        kind = result.get("type")
+        # 协议只定义了 result / error 两种服务端消息（core/protocol.py），且两者都必带
+        # task_id。未知 type 与陌生 task_id 一律忽略，且**不**刷新 idle：否则只发垃圾帧的
+        # 服务端能把停滞一路藏到绝对墙钟总预算才暴露，而不是在 idle 上暴露。
+        if kind not in {"result", "error"} or result.get("task_id") != task_id:
+            continue
         if not idle_messages.full():
             idle_messages.put_nowait(None)
-        result = json.loads(message)
-        if result.get("type") == "error":
+        if kind == "error":
             raise AsrError(
                 result["code"],
                 result.get("message", "服务端转录失败"),
                 result.get("retryable", False),
             )
-        if result.get("type") == "result" and result.get("is_final", False):
+        if result.get("is_final", False):
             return _transcript(result)
-        if result.get("type") == "result" and on_progress is not None:
+        progress["results"] += 1
+        if on_progress is not None:
             on_progress(result)
 
 
@@ -339,9 +363,38 @@ async def _transcribe_connected(
     task_id = str(uuid.uuid4())
     time_start = time.time()
     idle_messages: asyncio.Queue = asyncio.Queue(maxsize=1)
-    upload_done = asyncio.Event()
+    # 进展快照：只放 SDK 自己掌握的事实（阶段/已发帧/中间结果条数/最近进展时刻）。
+    # 超时消息按这些事实措辞，不据此推断网络状况或服务端责任。
+    progress = {
+        "stage": "上传",
+        "frames_sent": 0,
+        "frames_total": _audio_frame_count(len(data), encoding),
+        "results": 0,
+        "last_at": time.monotonic(),
+    }
 
-    async with websockets.connect(url, **connect_options) as ws:
+    def mark_progress() -> None:
+        progress["last_at"] = time.monotonic()
+        if not idle_messages.full():
+            idle_messages.put_nowait(None)
+
+    def stall_error() -> AsrError:
+        return AsrError(
+            "timeout",
+            f"{progress['stage']}连续 {idle_timeout:.0f} 秒没有进展："
+            f"已发送 {progress['frames_sent']}/{progress['frames_total']} 帧，"
+            f"收到中间结果 {progress['results']} 条，"
+            f"距最近进展 {time.monotonic() - progress['last_at']:.0f} 秒",
+        )
+
+    # 不用 `async with`：异常路径上对端可能已经停止读取（正常背压或挂死），而
+    # websockets 的 close() 会先 send_data()+drain()，drain() 等的是一个永远不来的
+    # TCP 写窗口 —— 证据见 docs/sessions/261006-issue-root-fixes/progress/
+    # sdk-progress-progress.md 探针 E：那一次 idle 失败就卡死在这里，调用永不返回。
+    # 所以自己接管进入/退出：成功路径仍走优雅关闭，异常/取消路径直接中止传输。
+    connection = websockets.connect(url, **connect_options)
+    ws = await connection.__aenter__()
+    try:
         async def upload() -> None:
             for chunk, is_final in _audio_frames(data, encoding):
                 frame = _audio_frame(
@@ -357,28 +410,20 @@ async def _transcribe_connected(
                     context=context,
                     model=model,
                 )
-                # 用 asyncio.wait 而不是 asyncio.wait_for：后者在 Python ≤3.11 上会在
-                # 「Future 完成与 task.cancel() 落在同一 tick」时吞掉取消
-                # （asyncio/tasks.py：except CancelledError: if fut.done(): return fut.result()），
-                # 本协程吞掉这一轮取消后会带着已发送的帧进入下一帧全新等待，而那次取消
-                # 已被消费，于是外层 gather 永久挂起（issue #67）。
-                # asyncio.wait 的内部 _wait 没有这个分支，取消一定向上抛。
-                sender = asyncio.ensure_future(ws.send(frame))
-                try:
-                    done, _ = await asyncio.wait({sender}, timeout=idle_timeout)
-                    if sender in done:
-                        # 发送失败仍通过 Future 的结果上抛，不在这里另开异常通道。
-                        sender.result()
-                    else:
-                        raise AsrError("timeout", "发送音频帧超过 idle_timeout")
-                finally:
-                    # 与 idle_watch 的 getter 同构：超时分支只 cancel 不额外 await，
-                    # 回收由外层 finally 的 gather 把事件循环驱动到收尾。
-                    sender.cancel()
-            upload_done.set()
+                # 逐帧 send 时限已删除：一次 send 耗时长只说明这一帧进了内核发送缓冲，
+                # 不是任务是否推进的证据——服务端停止读取但仍在回中间结果时（正常背压）
+                # 会被旧判据误杀。真正的判据在 idle_watch：距上次**真实进展**的上限。
+                # 这里直接 await：发送异常原样上抛到 upload 任务，由外层 FIRST_COMPLETED
+                # 按 upload → receive → idle 的固定顺序裁决，不另开异常通道。
+                await ws.send(frame)
+                progress["frames_sent"] += 1
+                # 上传阶段的进展只认「这一帧真的发送成功」；上传结束后不再有 send，
+                # 于是发送自然不再刷新（progress["stage"] 也随之切到等待结果）。
+                mark_progress()
+            progress["stage"] = "等待结果"
 
         async def idle_watch() -> None:
-            await upload_done.wait()
+            # 从连接建立就监视，覆盖上传阶段：上传中同样可能双向静默。
             while True:
                 # 用 asyncio.wait 而不是 asyncio.wait_for：后者在 Python ≤3.11 上会在
                 # 「令牌到达与 task.cancel() 落在同一 tick」时吞掉取消
@@ -390,7 +435,7 @@ async def _transcribe_connected(
                 try:
                     done, _ = await asyncio.wait({getter}, timeout=idle_timeout)
                     if not done:
-                        raise AsrError("timeout", "上传结束后等待服务端消息超时")
+                        raise stall_error()
                 finally:
                     # 实测：只 cancel 不 await 在本代码结构下也不会留下可观测的 pending
                     # getter（外层 finally 的 gather 会把事件循环驱动到它收尾），因此不额外
@@ -399,7 +444,13 @@ async def _transcribe_connected(
 
         upload_task = asyncio.create_task(upload())
         receive_task = asyncio.create_task(
-            _receive(ws, on_progress=on_progress, idle_messages=idle_messages)
+            _receive(
+                ws,
+                task_id=task_id,
+                on_progress=on_progress,
+                idle_messages=idle_messages,
+                progress=progress,
+            )
         )
         idle_task = asyncio.create_task(idle_watch())
         # ordered 决定多个任务同时完成时的上抛顺序；tasks 只交给 asyncio.wait。
@@ -426,6 +477,14 @@ async def _transcribe_connected(
             for task in tasks:
                 task.cancel()
             await asyncio.gather(*tasks, return_exceptions=True)
+    except BaseException:
+        # 服务端错误帧、idle 停滞、显式预算到点、调用方取消都走这里：调用已经结束，
+        # 再为一个可能已停读的连接做无界关闭没有意义。中止传输让 close() 立刻走
+        # 「连接已断」分支（成功路径不在这里，仍是优雅关闭）。
+        ws.transport.abort()
+        raise
+    finally:
+        await connection.__aexit__(None, None, None)
 
 
 def _auto_budget(duration: float) -> float:
