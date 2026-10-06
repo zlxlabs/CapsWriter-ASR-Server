@@ -71,6 +71,50 @@
 
 numpy/rich/colorama/soundfile 在原收据中未钉版本，其历史实际值不可得；上表为本卡新建受控对照值，**不冒充历史重现**。
 
+## 两端 collection 对照（各跑一次，rc 均为 0）
+
+两端用同一冻结解释器、同一依赖闭包、独立 TMPDIR，入口 `python -m pytest tests/ --collect-only -q`。
+
+| 端 | SHA | 收集节点数 | rc |
+| --- | --- | ---: | --- |
+| 基线 master | `e849c217` | 515 | 0 |
+| PR82 head | `fce9131a` | 503 | 0 |
+
+**计数与集合差异必须分开看**，本卡按节点多重集比对：**仅基线有 18 个、仅 head 有 6 个、交集非全等**。
+
+- 仅 `e849`：`test_http_qa_repeat_matrix.py` 12 个、`test_ws_progress_watchdog.py` 5 个、`test_protocol_v2.py::test_compressed_backpressure_does_not_extend_any_deadline` 1 个。
+- 仅 `fce`：`test_backpressure.py` 3 个、`test_error_contract.py::test_segment_watchdog_errors_and_exits_main_nonzero`、`test_http_file_tasks.py::test_http_binary_payload_survives_append_recovery_and_commit_replay`、`test_protocol_v2.py::test_compressed_consumer_backpressure_pauses_upload_idle`。
+- `tests/test_http_cleanup.py` 的 19 个节点在两端**逐条相同**，4 个 `naked-shell` 参数化节点两端均在。
+
+该比对判据已用 canary 自检：向基线多重集注入一个已知不存在的节点后，判据正确报 `equal=False`，非恒真。
+
+`fce` 的 503 与 CI 的 `500 passed + 3 skipped` 相等；`e849` 的 515 说明主干含 PR82 已删除的两个文件，**两端不是单变量的 O_BINARY 父子关系**，不可把差异整体归给 PR82。
+
+## ≤4 次定向节点对照
+
+入口 `python -m pytest <node> -q -rs -p no:cacheprovider`，单次外层 180s，独立 TMPDIR，各自进程组。
+
+| # | 节点 | `e849` | `fce` |
+| --- | --- | --- | --- |
+| A | `test_http_cleanup.py::test_fatal_cleanup_exits_process_and_reaps_children[naked-shell]` | 1 passed (0.94s) | 1 passed (0.67s) |
+| B | `test_http_supervision.py::test_result_producer_payload_and_done_survive_new_process` | 1 passed (0.82s) | 1 passed (0.77s) |
+
+四次全绿且**均为真实 passed 而非 skip**（输出为 `1 passed`，非 `s`）。
+
+三点必须随绿一起记录，否则会读成假结论：
+
+1. **A、B 都是「新候选，非历史原节点」**。原 nodeid 集合不可复原，无法证明它们属于原 55 failed。
+2. **隔离绿 ≠ 全量绿**。原收据自己就记过 `test_options_missing_and_none_default_but_falsy_wrong_types_are_rejected` 在全量中 409≠400、隔离复跑却 passed。EOFError 族本就只在全量出现。
+3. **naked-shell 不是 `env -i`**。读消费方代码确认：`tests/test_http_cleanup.py:948` 为 `env = dict(os.environ)` 再 `env.update(self.env)`，即整体继承父环境；而同文件 `_probe_env`（872 行）的 docstring 自称「只白名单传…不整体继承测试环境」，**docstring 与实现相反**。真正接近干净消费环境的是 `systemd-unit` 分支（逐键 `--setenv`）。该继承行为两端逐字节相同，故不构成本卡两端的差异变量，但本卡覆盖的是 naked 分支，**不构成 env 对照**。
+
+## child 因果信号：不可得
+
+节点 A、B 本次为绿，无 EOF 可追，故 child 首次异常仍 **unknown**。检查夹具能力后确认结构性缺口：
+
+`ProbeRun`（`tests/test_http_cleanup.py:898`）只暴露**启动器自身**的 `self._process.returncode` 与 `.pid`（982、994、999 行），**不暴露识别子进程 / `multiprocessing.Manager` 子进程的 PID、退出码或独立 stderr**。原收据中「探针以『再见！』rc=1 退出」正是启动器层症状；其后的 child 首异常在现有夹具下原理上取不到。
+
+按卡面要求，本卡不越界改测试源码，改为交出精确探针位置：需在 `ProbeRun.start()` 成功之后、`run_managed_fake_server()` 真实 `ProcessManager.start()` 返回处，写出 launcher/recognizer/manager 三方 PID、父子关系与各自退出码，并令 `wait_report` 失败分支（978–986 行）把该三元组并入异常消息，使启动器 rc=1 时能定位到首个死掉的 child。
+
 ## 未决
 
 原 55/24 的节点级根因仍 **unknown**。本卡不声称 PR82 就绪、不声称 M7 完成、不标 ready、不合并。

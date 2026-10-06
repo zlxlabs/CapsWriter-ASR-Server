@@ -20,6 +20,15 @@ verifying（本卡只诊断，不改运行源码）。
 - 定向节点一律标注「新候选，非历史原节点」，因原 nodeid 集合不可复原。
 - 已否决（承卡面）：blind full/grid、延长 timeout/sleep、重试刷绿、以当前负载推历史原因、以计数相等推节点集合相同、伪造原失败 node、半段 env 或错 phase 关联当因果、绕闸、跨仓改工具、生产操作。
 
+## 本段结论（续）
+
+- 两端 collect-only 均 rc=0，但节点多重集**不相等**：`e849` 515 / `fce` 503，仅基线有 18 个、仅 head 有 6 个。`test_http_cleanup.py` 19 个节点两端逐条相同。比对判据经 canary 自检非恒真。
+- 4 次定向运行（A：naked-shell cleanup 节点；B：跨进程 result producer 节点）全绿，且为真实 passed 非 skip。A、B 均为**新候选，非历史原节点**。
+- child 首异常仍 **unknown**：节点绿故无 EOF 可追；且 `ProbeRun` 只暴露启动器 PID/returncode，原理上取不到识别子进程与 Manager 子进程的退出信息。已交出精确探针位置（`tests/test_http_cleanup.py:898` `ProbeRun.start()` 与 `wait_report` 978–986 行），本卡不改测试源码。
+- 顺带发现实现与自述矛盾：`tests/test_http_cleanup.py:872` `_probe_env` docstring 称「不整体继承测试环境」，但 948 行实为 `dict(os.environ)` 全量继承。两端相同，非本卡差异变量，但使 naked-shell 不能充当 `env -i` 对照。
+
 ## 下一步唯一动作
 
 在**同一冻结 venv、同一台机、同一入口**下，只变一个变量跑两次全量：websockets 钉 `15.0.1` 与不钉（实际 17.2），各留 nodeid 级 JUnit。这是当前唯一能把「本机 55/24」与「CI 绿」之间的混淆变量收敛掉的动作，且原收据明确缺这一维。归属下一张修复卡，本卡不实施。
+
+若该单变量对照不能复现红，则 websockets 版本被排除，下一步才轮到 child 探针（位置已交）。两者不可并行猜。
