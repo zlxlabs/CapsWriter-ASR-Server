@@ -17,7 +17,28 @@
 ---
 
 - 当前阶段：阶段三「人类导航」完成，三阶段全部结束；本卡产物已提交并推送，开 draft PR（不自动关闭 #81）。
-- 本段结论：`docs/development/known-issues/artifact-disposition-261006.md` 写明范围/四条原则/两套口径/判据与对照/9 类去向的关单谓词/六资产逐项需求边界与重开条件/已知误用风险；`docs/development/testing.md:18` 已由「单测与 lint 由 ci.yml 跑」订正为「单测由 ci.yml 跑（只有 pytest 步骤，没有 lint 步骤）」，未新增任何 lint 流程。
-- 交付校验：`verify_deliverables.py` 通过——本卡 4 份文档的相对链接全部可解析；TSV 147 行、每行 5 栏、`disposition` 与证据格无空缺；known-issues 里的 9 类计数与 TSV 实际逐项相等；负控（空证据格）被判不合格为 True。
+- 本段结论：`docs/development/known-issues/artifact-disposition-261006.md` 写明范围/四条原则/两套口径/判据与对照/10 类去向的关单谓词（六项旧资产逐项需求边界与重开条件）/已知误用风险；`docs/development/testing.md:18` 已由「单测与 lint 由 ci.yml 跑」订正为「单测由 ci.yml 跑（只有 pytest 步骤，没有 lint 步骤）」，未新增任何 lint 流程。
+- 交付校验：`verify_deliverables.py` 通过——本卡 4 份文档的相对链接全部可解析；TSV 147 行、每行 5 栏、`disposition` 与证据格无空缺；known-issues 里的 10 类计数与 TSV 实际逐项相等；负控（空证据格）被判不合格为 True。
 - 关键决策与已否决方案：六资产写「本轮有意不恢复 + 重开条件」，不写「永久退役」也不写「已被取代」；不新增扫描工具/常驻状态/第二套门禁；不复制日志、retro、memory、egg-info、代理工具配置内容；不改 #81 状态、不关单、不回洗 M6 验收。
 - 下一步唯一动作：Pi 主脑核对本卡证据后，在 #81 记录决定人与日期，再按 known-issues 文档里的关单谓词关单。
+
+---
+
+## 阶段四：独立审查 verdict（`reviews/artifact-review1-verdict.md`，commit `6633b74e`）的分诊与有限修复
+
+- 固定审查范围 `e849c21..ca370b88`；verdict 全文以 cherry-pick（`391d1d1`）原样纳入，**未改写一个字**，
+  包括其中对本卡不成立的 P2-4。审查者自报 outcome failed（调查超 25 次/15 分钟），其源对象复算与摘录
+  字节检查在本卡采纳，但不因此把那次审查当作完整通过。
+
+| finding | 分诊 | 实际动作与输出 |
+| --- | --- | --- |
+| P2-1 源状态被基线状态代替 | **采纳** | 449 条 source 记录逐条重查源 entry：`BLOB_SAME_AS_BASE` 22、`BLOB_DIFF_FROM_BASE` 28、`BLOB_BASE_MISSING` **360**、`NO_PATH` 39；`OBJECT_UNAVAILABLE` 与 `QUERY_ERROR` 独立成态。六项资产现在显示源里确有 blob（如 `scripts/gate-quality` = `031664bd8e46…`），不再是「MISSING」。承恢复谓词的 147 个路径**全部**至少有一个可读精确来源（`paths_without_readable_source=0`） |
+| P2-2 同 blob 被归「已被更新版取代」 | **采纳** | `progress/m4-plan-progress.md` 改判 `superseded-in-baseline` → `content-in-baseline-no-action`：其唯一含内容的来源 `7ab35518…` 与基线同 blob `eae8afb6…`，另一来源 `ff0f2ddd…` 是 `NO_PATH`，无任何不同 blob 支持「取代」。全表重算后仅此 1 处去向变化 |
+| P2-3 复核脚本只在本机 `/tmp` | **采纳** | known-issues 新增「公开自包含复算入口」代码块（只校已冻结 inventory 与引用，不新增扫描器/CI/依赖）；本卡树内按该入口实跑一次，输出见下。本机 `/tmp` 脚本降为副产物 |
+| P2-4 硬预算 350 超限 | **不成立（反驳）** | 350 是**审查卡**给新增 verdict 的预算，不是本实现卡的预算；本卡 `Diff-Lines-Hard=1500`，冻结 diff 为 392 行（391+1），未超。verdict 自身 61 行也未超 350。**因此不缩表、不造修复**，按分诊记录，不改实现 |
+| P3-1 disposition 类别数不一致 | **采纳** | 修后实际为 **10 类**，计数 17/17/77/2/1/18/6/1/4/4 = 147，文档与逐行解析相等；同批修掉两处过强事实：「非祖先」改为「无法仅凭祖先关系判定」、全路径字面检索 0 命中不再宣称「无人引用」，337 refs 明确为**当次扫描运行记录**而非冻结分母 |
+
+- 不动的边界：原工单 65/38 口径、六资产本轮不恢复边界与重开条件、`#82` 在途标注、历史适用 SHA
+  （`d52f8687` / `69bee18d` / `4565bfcc` / `9024008` vs `796104c`）均**未变**。
+- 本阶段验证：公开入口实跑 `RESULT: PASS`（449 条来源记录状态不符 0、三个负控成立、5 段摘录逐行一致、
+  文档链接断链 0）；`git diff --check` 干净。
