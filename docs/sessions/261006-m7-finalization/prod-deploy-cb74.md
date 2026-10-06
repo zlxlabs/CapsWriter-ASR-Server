@@ -24,9 +24,18 @@
 - 环境重载：`pm2 startOrReload ecosystem.config.cjs --only capswriter-server --update-env`，退出码 `0`。
 - 更新后 `/health`：`{"status":"ok","git_sha":"cb74d8f","model":"paraformer","worker_alive":true}`；PM2 online；7016 正在监听。SDK 冒烟待后续统一执行。
 
+## 3. Mac Studio / qwen-asr-server / 6017
+
+- 升级前 `/health`：`{"status":"ok","git_sha":"1d00130","model":"qwen_asr_mlx","worker_alive":true}`；磁盘 HEAD `1d00130c1cd1ad8717008adb9d95bd1c7f0a0ab7`；7017 无监听；llama b10621 三个 macOS 动态库均存在。
+- 备份：`实例目录\ecosystem.config.cjs.bak-20261006-cb74`；SHA-256 `4aceb59a007b5976cf4d563aea8f0b4153958ea96ebd44da9306d32188294adf`。
+- 配置新增 `CW_HTTP_PORT=7017`、`CW_HTTP_DATA_DIR=HTTP 数据目录（卡面约定值）`，保留 `CW_MAX_TASK_SECONDS=28800`；数据目录已创建。
+- 更新命令：`DEPLOY_PYTHON="$PWD/venv/bin/python" CW_MODEL_TYPE=qwen_asr_mlx DEPLOY_PROCESS_NAME=qwen-asr-server DEPLOY_PORT=6017 ./deploy/update.sh cb74d8f2a333d231cbd7e36ccff8c305b4ab89b6`；退出码 `0`，最后输出 `更新完成：process=qwen-asr-server model=qwen_asr_mlx port=6017 git_sha=cb74d8f`。
+- 环境重载：`pm2 startOrReload ecosystem.config.cjs --only qwen-asr-server --update-env`，退出码 `0`。
+- 更新后 `/health`：`{"status":"ok","git_sha":"cb74d8f","model":"qwen_asr_mlx","worker_alive":true}`；PM2 online；7017 正在监听。SDK 冒烟待后续统一执行。
+
 ## 结果与偏差
 
-原生 PowerShell 5.1 缺少更新脚本使用的 `-SkipHttpErrorCheck` 参数，切换 PowerShell 7 后 Windows 6016 更新成功。Windows 6016 与 Studio 6016 均已升级至 cb74，HTTP 监听已启用且健康检查通过。下一步为 Studio 6017、proxy，再只读查询 Mac mini 并进行 HTTP 冒烟。
+原生 PowerShell 5.1 缺少更新脚本使用的 `-SkipHttpErrorCheck` 参数，切换 PowerShell 7 后 Windows 6016 更新成功。Windows 6016 与 Studio 两个 ASR（6016、6017）均已升级至 cb74，HTTP 监听已启用且健康检查通过。下一步为 proxy，再只读查询 Mac mini 并进行 HTTP 冒烟。
 
 ## 收尾
 
