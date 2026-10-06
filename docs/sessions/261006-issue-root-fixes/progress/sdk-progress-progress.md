@@ -154,3 +154,72 @@ contextlib.py:217  _AsyncGeneratorContextManager.__aexit__
 - 不碰 `PROTOCOL_ERROR_CODES`、SDK HTTP 客户端、服务端、`tests/harness/server.py`、
   `tests/test_ws_progress_watchdog.py`、CI 配置与默认分支。
 - SDK 采用需下游 pin、以及是否关 #76，均留给主脑处置。
+---
+
+## 单元四：首审 verdict 后的有限收尾（冻结 H0=050b6dc5 → H1）
+
+首审 `docs/sessions/261006-issue-root-fixes/reviews/sdk-review1-verdict.md`（commit 299be40b，
+文件内容逐字节纳入本分支，commit `34a4ed9`）。按 P3 不阻塞、P2 必修的结论，只处理原目标
+未完成处，未追一般 P2/P3。
+
+### P2-1 绝对截止打断优雅 close 时没有 abort 连接
+
+`except BaseException` 只覆盖连接主体；成功拿到 final 之后进入 `connection.__aexit__()`，
+这时截止取消落在 `finally` 内的优雅 close 上，不经过原来的 abort 分支。首审实测：
+`caller_done=true final_sent=True exit_cancelled=True transport_closing=False`。
+
+修法（`sdk/capswriter_asr/client.py`）：`completed` 只由「已拿到最终结果」那条返回置真，
+用它区分该不该做优雅关闭；abort 纪律扩到整个连接生命周期 —— 异常/停滞/取消路径在
+`__aexit__` 之前中止（否则 close 卡在 drain，探针 E），成功路径的优雅 close 若被取消
+打断，则在其 `finally` 再补一次中止。没有新增 fallback、重复 close 或 watchdog；
+异常与取消语义不变，显式 `deadline_total` 仍是绝对边界。
+
+红验（隔离树，`git archive HEAD` 导出，只删掉那个兜底 abort，py3.11 + websockets 15.0.1）：
+`1 failed, 15 passed`，红的是
+`test_deadline_during_graceful_close_aborts_the_connection`，报
+`transport 未被中止，仍停在 CLOSING`，且底层 `_SelectorSocketTransport` 写缓冲仍积压
+`bufsize=1384987` —— 正是「优雅 close 卡在 drain」的现场。
+
+复现形态的关键是让 close 真的会卡：服务端在读到第 3 帧时就回 final 然后**彻底停止读取
+并保持连接**（探针 G 第一版让服务端读完就 `return` 关掉 writer，结果 close 秒完、根本没
+复现；改为保持连接不读后才成立）。用例用 `_CloseObserver` 只观测不动手，记录
+`exit_started / exit_cancelled / paused_at_exit`，并在 SDK 整个收尾之后读
+`transport.is_closing()` —— 读时点必须在 `__aexit__` 被取消之后的 finally 里，早读会
+误判。
+
+### P2-2 收到匹配结果没有刷新诊断用的最近进展时刻
+
+`last_at` 原先只由上传侧 `mark_progress()` 写，`_receive` 只往 idle 队列塞令牌，于是
+「距最近进展」把整段持续收到结果的时间都算进去。修法：`_receive` 改调既有
+`mark_progress(is_result=...)`，idle 计时与停滞文案读同一个 `last_at`，不新建镜像状态、
+不加 `time_source` 配置。同时给快照补了生产者/消费者说明（上传侧每成功发一帧、`_receive`
+每收一条匹配消息都经 `mark_progress` 写；`idle_watch` 读令牌、`stall_error` 读字段出文案）。
+
+红验（隔离树，还原成「只涨计数不刷时刻」，py3.11 + websockets 15.0.1）：
+`1 failed, 15 passed`，红的是
+`test_matching_results_refresh_the_diagnostic_last_progress`，报
+`「距最近进展」把停发前持续结果的时间算进去了：等待结果连续 1 秒没有进展：已发送 1/1 帧，
+收到中间结果 15 条，距最近进展 3 秒` —— 修后同一条用例报 1 秒。未知 `type` / 其他 task_id
+仍不更新，由既有的 `test_messages_that_are_not_task_progress_do_not_refresh_idle` 继续看守。
+
+### P2-3 夹具 result payload 不符合协议 schema
+
+raw WS 夹具的中间/final result 改用 `core.protocol.RecognitionMessage` / `ErrorMessage`
+的 `to_json()`（只读 import，不改 core），`time_start/time_submit/time_complete` 等必填
+字段由协议类自己给出。`tests/test_sdk_client.py::test_total_deadline_expires_despite_continuous_progress`
+原本的「持续进展」回帧缺 `task_id`，会被 `_receive` 当噪声滤掉，该用例其实跑的是
+「毫无进展」的假噪声路径；现已补真实 `task_id` + 完整 schema，并断言结果条数 ≥5。
+
+### P3-4 未修
+
+`_audio_frame_bytes` 的 `data_length` 参数未使用，按首审定级接受不修，不以此重构。
+
+### 本轮验证
+
+- Narrow-Verify（卡面 5 个文件）py3.12 / websockets 最新：`61 passed`，退出码 0。
+- 同一 Narrow-Verify py3.11 / websockets==15.0.1：`61 passed`，退出码 0。
+- `tests/test_sdk_progress_watchdog.py` 连续 5 轮（py3.11 + WS15.0.1）：
+  第 1 轮 `16 passed in 48.75s` 退出码 0；第 2 轮 `16 passed in 48.29s` 退出码 0；
+  第 3 轮 `16 passed in 48.36s` 退出码 0；第 4 轮 `16 passed in 48.15s` 退出码 0；
+  第 5 轮 `16 passed in 47.87s` 退出码 0。
+- 两次红验都在 `git archive HEAD` 的隔离树里做、只在被注入的那几行上动手，主树全程未改坏。
