@@ -15,7 +15,7 @@ uv run --no-project --python 3.12 --with numpy --with rich --with websockets --w
 ## PR 模型门禁
 
 - [.github/workflows/gate.yml](../../.github/workflows/gate.yml) 是 Required Gate v2 的**调用方**：只声明触发事件、权限、`tier=internal` / `runner=self` / `has_ui=false`，以及透传 `SILO_ACCESS_KEY` / `SILO_SECRET_KEY` / `FEISHU_CI_WEBHOOK`。门禁逻辑本身在 `zlxlabs/gate`，改门禁要去 gate 仓。
-- 上游单测与 lint 由 [ci.yml](../../.github/workflows/ci.yml) 跑；`gate.yml` 只管模型主审与门禁聚合，不替代单元测试。
+- 上游单测由 [ci.yml](../../.github/workflows/ci.yml) 跑（该工作流目前只有 pytest 相关步骤，包括五轮矩阵工件结构校验，**没有 lint 步骤**）；`gate.yml` 只管模型主审与门禁聚合，不替代单元测试。
 - **前提**：本公开仓需自行配置 repository secrets `SILO_ACCESS_KEY` / `SILO_SECRET_KEY`；缺失时 gate-v2 的 S3 步骤 fail-loud（`SILO_ACCESS_KEY 未传入`），不会静默降级。`runner: self` 依赖 org `ci` runner 组（自建机+tailnet 访问 Silo），换成 hosted 会让主审整job skip。
 
 ## 真实服务验证脚本

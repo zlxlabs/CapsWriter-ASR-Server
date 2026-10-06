@@ -13,3 +13,11 @@
 - 逐字校验：`verify_sources.py` 报 5 块全部 `missing=0`，每个块的负控（改首行一个字符）均不再命中；`cross_control.py` 把每块放到另外两个证据源，全部匹配失败（判据有约束力，不是恒真）。校验只依赖 `git show` 的对象字节。
 - 关键决策与已否决方案：`design.md:5` 的「独立规划终审历史没有完整覆盖」是泛称，`eng-outside-verdict.md` 与它的关联**未证实**，如实标注不升级为证据；两份 m6-repeat-matrix 过程 verdict 只留指针（当前 H1/H2 三审在基线有同名文件，非同一文件，全仓 0 引用）；#82 的三份 Windows 证据标在途，不复制不重复交付。
 - 下一步唯一动作：阶段三写人类消费者文档 `docs/development/known-issues/artifact-disposition-261006.md`，并只订正 `docs/development/testing.md` 里「单测与 lint 由 ci.yml 跑」这一处与实际 CI 不符的描述。
+
+---
+
+- 当前阶段：阶段三「人类导航」完成，三阶段全部结束；本卡产物已提交并推送，开 draft PR（不自动关闭 #81）。
+- 本段结论：`docs/development/known-issues/artifact-disposition-261006.md` 写明范围/四条原则/两套口径/判据与对照/9 类去向的关单谓词/六资产逐项需求边界与重开条件/已知误用风险；`docs/development/testing.md:18` 已由「单测与 lint 由 ci.yml 跑」订正为「单测由 ci.yml 跑（只有 pytest 步骤，没有 lint 步骤）」，未新增任何 lint 流程。
+- 交付校验：`verify_deliverables.py` 通过——本卡 4 份文档的相对链接全部可解析；TSV 147 行、每行 5 栏、`disposition` 与证据格无空缺；known-issues 里的 9 类计数与 TSV 实际逐项相等；负控（空证据格）被判不合格为 True。
+- 关键决策与已否决方案：六资产写「本轮有意不恢复 + 重开条件」，不写「永久退役」也不写「已被取代」；不新增扫描工具/常驻状态/第二套门禁；不复制日志、retro、memory、egg-info、代理工具配置内容；不改 #81 状态、不关单、不回洗 M6 验收。
+- 下一步唯一动作：Pi 主脑核对本卡证据后，在 #81 记录决定人与日期，再按 known-issues 文档里的关单谓词关单。
