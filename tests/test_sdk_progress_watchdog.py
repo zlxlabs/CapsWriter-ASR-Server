@@ -347,7 +347,10 @@ def _pending_sdk_tasks() -> list[str]:
     pending = []
     for task in asyncio.all_tasks():
         qualname = getattr(task.get_coro(), "__qualname__", "")
-        if qualname.startswith(("_transcribe_connected.", "transcribe_file.", "_operation.")):
+        if (
+            qualname == sdk_client._receive.__qualname__
+            or qualname.startswith(("_transcribe_connected.", "transcribe_file.", "_operation."))
+        ):
             if not task.done():
                 pending.append(qualname)
     return pending
@@ -672,12 +675,14 @@ async def test_cancellation_under_backpressure_reclaims_everything(long_s16le_au
         )
         await _wait_for_frames(remote, 1, timeout=20)
         remote.read_gate.clear()
+        pending_before_cancel = _pending_sdk_tasks()
         await asyncio.sleep(IDLE / 2)
         caller.cancel()
         done, _ = await asyncio.wait({caller}, timeout=20)
         leaked = _pending_sdk_tasks()
 
     assert caller in done and caller.cancelled(), "调用方取消没有传播为 CancelledError"
+    assert sdk_client._receive.__qualname__ in pending_before_cancel, pending_before_cancel
     assert leaked == [], f"取消后 SDK 内部任务未回收：{leaked}"
 
 
@@ -765,6 +770,70 @@ async def test_deadline_during_graceful_close_aborts_the_connection(
     assert leaked == [], f"SDK 内部任务未回收：{leaked}"
 
 
+@pytest.mark.asyncio
+async def test_cancel_at_real_cleanup_gather_aborts_after_final(
+    long_s16le_audio, monkeypatch
+):
+    """真实 cleanup gather 等待子任务回收时被取消，也必须先中止 transport。"""
+    async with FakeRemoteServer(
+        progress_kind="none", on_upload_complete="final", final_after_frames=3
+    ) as server:
+        remote = server.remote
+        observer = _CloseObserver()
+        monkeypatch.setattr(sdk_client.websockets, "connect", observer.connect)
+        original_gather = sdk_client.asyncio.gather
+        operation = None
+        cleanup_gather_called = False
+        cancel_scheduled = False
+
+        def observe_gather(*aws, **kwargs):
+            nonlocal cleanup_gather_called, cancel_scheduled
+            has_upload = any(
+                isinstance(task, asyncio.Task)
+                and getattr(task.get_coro(), "__qualname__", "")
+                == "_transcribe_connected.<locals>.upload"
+                for task in aws
+            )
+            gathered = original_gather(*aws, **kwargs)
+            if has_upload and not cancel_scheduled:
+                cleanup_gather_called = True
+                cancel_scheduled = True
+                # 人工控制的是原 operation 在真实 gather await 点被取消，
+                # 不是替换 gather 或人为延迟任一子任务。
+                asyncio.get_running_loop().call_soon(operation.cancel)
+            return gathered
+
+        monkeypatch.setattr(sdk_client.asyncio, "gather", observe_gather)
+        operation = asyncio.create_task(
+            transcribe_file(
+                long_s16le_audio, server.url, encoding="s16le",
+                idle_timeout=30, deadline_total=90,
+            )
+        )
+        started = time.monotonic()
+        try:
+            done, _ = await asyncio.wait({operation}, timeout=20)
+            finished = operation in done
+        finally:
+            remote.read_gate.set()
+            if not operation.done():
+                operation.cancel()
+            await original_gather(operation, return_exceptions=True)
+        elapsed = time.monotonic() - started
+        leaked = _pending_sdk_tasks()
+
+    assert finished, "真实 cleanup gather 被取消后调用没有在有界时间内结束"
+    assert operation.cancelled(), "cleanup gather 处的取消没有传播到原 operation"
+    assert cleanup_gather_called, "没有命中包含真实 upload_task 的 cleanup gather"
+    assert remote.final_sent is True, "被测前提不成立：final 没真实到达客户端"
+    assert remote.frames_read == 3
+    assert observer.send_pending_seen is True, "没有观察到真实 ws.send pending"
+    assert observer.paused_at_exit is True, "close 开始时 socket 没有真实 paused"
+    assert observer.ws.transport.is_closing() is True, "取消收尾后 transport 未中止"
+    assert elapsed < 20, f"取消收尾未有界结束，实际 {elapsed:.1f}s"
+    assert leaked == [], f"取消后 SDK 内部任务未回收：{leaked}"
+
+
 class _CloseObserver:
     """只观测不动手：记录真实 send 与 __aexit__ 的收尾状态。"""
 
@@ -773,6 +842,7 @@ class _CloseObserver:
         self.exit_cancelled = None
         self.paused_at_exit = None
         self.send_pending = False
+        self.send_pending_seen = False
         self.ws = None
         self._cm = None
         self._ws = None
@@ -801,6 +871,7 @@ class _CloseObserver:
                 return result
 
             async def send(self_, message):
+                outer.send_pending_seen = True
                 outer.send_pending = True
                 try:
                     return await outer._ws.send(message)

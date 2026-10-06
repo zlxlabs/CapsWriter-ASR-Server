@@ -164,7 +164,10 @@ def _pending_sdk_tasks() -> list[str]:
     pending = []
     for task in asyncio.all_tasks():
         qualname = getattr(task.get_coro(), "__qualname__", "")
-        if qualname.startswith(("_transcribe_connected.", "transcribe_file.", "_operation.")):
+        if (
+            qualname == sdk_client._receive.__qualname__
+            or qualname.startswith(("_transcribe_connected.", "transcribe_file.", "_operation."))
+        ):
             if not task.done():
                 pending.append(qualname)
     return pending
@@ -411,6 +414,7 @@ async def test_final_result_returns_without_server_close(
         getter_waiter = asyncio.create_task(getter_created.wait())
         getter_done, _ = await asyncio.wait({getter_waiter}, timeout=5)
         getter_observed = getter_waiter in getter_done
+        pending_before_final = _pending_sdk_tasks()
         allow_final.set()
         done, _ = await asyncio.wait({caller}, timeout=10)
         release.set()
@@ -424,6 +428,7 @@ async def test_final_result_returns_without_server_close(
         f"final 已到达服务端但 transcribe_file 10 秒内没有返回（issue #65）；outcome={outcome}"
     )
     assert getter_observed, "final 返回路径没有观察到 SDK 创建的 Queue.get Task"
+    assert sdk_client._receive.__qualname__ in pending_before_final, pending_before_final
     assert getter_tasks and all(task.done() for task in getter_tasks), getter_tasks
     assert "error" not in outcome, outcome.get("error")
     assert leaked == [], f"SDK 内部任务未被回收：{leaked}"

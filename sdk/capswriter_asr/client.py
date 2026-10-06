@@ -478,13 +478,14 @@ async def _transcribe_connected(
                         raise error
                 if receive_task in done:
                     result = receive_task.result()
-                    completed = True
-                    return result
+                    break
                 tasks.difference_update(done)
         finally:
             for task in tasks:
                 task.cancel()
             await asyncio.gather(*tasks, return_exceptions=True)
+        completed = True
+        return result
     finally:
         # 中止传输覆盖整个连接生命周期，不只是连接主体：
         # · 异常/停滞/取消（completed 为假）先中止，否则 close() 会卡在 drain 上等一个
