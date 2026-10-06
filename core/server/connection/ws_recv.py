@@ -396,12 +396,18 @@ async def message_handler(websocket, msg: AudioMessage, cache: AudioCache, app) 
             (finish, cache.decoder_task), return_when=asyncio.FIRST_COMPLETED
         )
         if cache.decoder_task in done:
-            cache.decoder_task.result()
+            consumer_result = cache.decoder_task.result()
+            if not consumer_result:
+                if not finish.done():
+                    finish.cancel()
+                    await asyncio.gather(finish, return_exceptions=True)
+                return False
             if not finish.done():
-                finish.cancel()
-                await asyncio.gather(finish, return_exceptions=True)
-            return False
-        await finish
+                await finish
+            else:
+                finish.result()
+        else:
+            await finish
     except BaseException:
         if not finish.done():
             finish.cancel()

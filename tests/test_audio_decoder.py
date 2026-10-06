@@ -233,7 +233,6 @@ async def test_cancel_kills_and_waits_for_unresponsive_ffmpeg(tmp_path, monkeypa
     wrapper.write_text(f"#!{sys.executable}\nimport time\ntime.sleep(60)\n")
     wrapper.chmod(0o755)
     monkeypatch.setenv("PATH", str(tmp_path))
-    monkeypatch.setattr(audio_decoder, "_CANCEL_TIMEOUT_SECONDS", 0.05)
     decoder = AudioDecoder("flac")
     await decoder.feed(b"wait")
     process = decoder.process
