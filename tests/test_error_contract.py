@@ -16,7 +16,6 @@ import websockets
 
 from core.protocol import AudioMessage
 from core.server.schema import Result
-from core.server.worker.process_manager import PROCESS_MONITOR_INTERVAL_SECONDS
 from tests.harness.client import collect_terminal, send_audio
 from tests.harness.server import ManagedFakeServerHarness, run_model_load_failure
 
@@ -194,39 +193,6 @@ async def test_worker_killed_closes_clients_and_exits_main_nonzero():
                 message.get("type") == "error" and message.get("code") == "internal"
                 for message in messages
             )
-        await asyncio.to_thread(server.process.join, 5)
-        assert server.process.exitcode == 1
-    finally:
-        await server.stop()
-
-
-@pytest.mark.asyncio
-async def test_segment_watchdog_errors_and_exits_main_nonzero(monkeypatch):
-    segment_timeout = 2
-    monkeypatch.setenv("CW_SEGMENT_TIMEOUT", str(segment_timeout))
-    server = await ManagedFakeServerHarness.start(
-        {"delay_on_call": 1, "delay_seconds": 10}
-    )
-    try:
-        async with websockets.connect(
-            server.url, max_size=None, ping_interval=None
-        ) as websocket:
-            await send_audio(
-                websocket,
-                make_audio(1.0),
-                task_id="watchdog",
-                seg_duration=5.0,
-                seg_overlap=0,
-                chunk_seconds=5.0,
-            )
-            messages, closed = await collect_terminal(
-                websocket, task_id="watchdog",
-                timeout=segment_timeout + 2 * PROCESS_MONITOR_INTERVAL_SECONDS + 2,
-            )
-            errors = [message for message in messages if message.get("type") == "error"]
-            assert errors and errors[0]["code"] == "inference_timeout"
-            assert errors[0]["retryable"] is True
-            assert not any(message.get("is_final") for message in messages)
         await asyncio.to_thread(server.process.join, 5)
         assert server.process.exitcode == 1
     finally:

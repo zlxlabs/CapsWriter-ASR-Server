@@ -13,6 +13,8 @@ import time
 from multiprocessing import Process, Manager
 from typing import TYPE_CHECKING
 from ..state import console
+from ..state import PHASE_LABELS, PROGRESS_LABELS
+from config_server import ServerConfig as Config
 from . import start_worker
 from .check_model import check_model
 from . import logger
@@ -20,6 +22,71 @@ if TYPE_CHECKING:
     from ..app import CapsWriterServer
 
 PROCESS_MONITOR_INTERVAL_SECONDS = 1
+
+# 停滞看门狗的消息：同时写出「最后一次进展在哪个阶段」和「任务当前在哪个阶段」。
+# 只报其中一个都会在另一种停滞上误导：只报最后阶段，末帧后卡在 finish() 的解码
+# 会被说成「上传阶段」（而客户端确实已经发完了）；只报当前阶段，客户端主动停发
+# 又会被说成「解码阶段」。
+_IDLE_STALL_MESSAGE = (
+    "上行停滞 {idle:.1f}s（最后进展：{progress}阶段；当前：{phase}阶段）；"
+    "任务无在途识别片段，服务端已回收该连接的接收协程与解码子进程并关闭连接"
+)
+
+
+async def _cancel_ws_handler(state, key) -> None:
+    """看门狗到点后真正回收接收协程（只关 socket 解不开解码阶段的互等）。
+
+    cancel 之后必须等它跑完 finally：那里才会 kill ffmpeg 子进程并摘除任务记录。
+    """
+    handler = state.handler_tasks.get(key[1])
+    if handler is None or handler.done():
+        return
+    handler.cancel()
+    await asyncio.wait({handler})
+    logger.warning(f"进展看门狗到点，已回收接收协程 task={key[2]} owner={key[1]}")
+
+
+async def _fail_stalled_ws_uploads(state, now: float) -> None:
+    """无在途片段的 WS 任务：最近一次进展超过上限即判定停滞。
+
+    I-owner：每个非终态 WS 任务在任意时刻恰好有一个看门狗负责——
+    ``pending_segments`` 非空时归 CW_SEGMENT_TIMEOUT，否则归这里。两者互斥且
+    无缝交接（提交片段与确认结果两处打点都刷新 last_progress_at），因此不存在
+    「两边都不管」的时间窗，也不存在用状态推迟超时的空间。
+    """
+    limit = float(Config.upload_idle_seconds)
+    stalled = [
+        (record.last_progress_at, key)
+        for key, record in state.tasks.items()
+        if key[0] == 'ws'
+        and record.status not in {'DONE', 'FAILED'}
+        and not state.pending_segments.get(key)
+        and now - record.last_progress_at > limit
+    ]
+    for idle_at, key in sorted(stalled):
+        websocket = state.sockets.get(key[1])
+        if websocket is None:
+            # 无连接的 ws 任务由 ws_recv 的 finally 收尾（那里也会置终态并
+            # kill ffmpeg），看门狗无从发帧，不在这里重复释放。
+            continue
+        from ..connection.ws_send import schedule_error_close
+        record = state.tasks[key]
+        await schedule_error_close(
+            state,
+            websocket,
+            key[1],
+            key[2],
+            'decode_stalled',
+            _IDLE_STALL_MESSAGE.format(
+                idle=now - idle_at,
+                progress=PROGRESS_LABELS.get(
+                    record.progress_stage, record.progress_stage
+                ),
+                phase=PHASE_LABELS.get(record.phase, record.phase),
+            ),
+            True,
+        )
+        await _cancel_ws_handler(state, key)
 
 
 class ProcessManager:
@@ -116,7 +183,7 @@ class ProcessManager:
         raise SystemExit(1)
 
     async def monitor(self):
-        """就绪后监控推理进程存活和最老的未完成推理段。"""
+        """就绪后监控推理进程存活、上行停滞与最老的未完成推理段。"""
         from ..state import ensure_server_runtime
         ensure_server_runtime(self.app.state)
         state = self.app.state
@@ -128,8 +195,9 @@ class ProcessManager:
                 await fail_active_tasks(state, 'internal', message)
                 raise SystemExit(1)
 
-            timeout = float(os.environ.get('CW_SEGMENT_TIMEOUT', '600'))
             now = time.monotonic()
+            await _fail_stalled_ws_uploads(state, now)
+            timeout = float(os.environ.get('CW_SEGMENT_TIMEOUT', '600'))
             expired = [
                 (key, submitted[0])
                 for key, submitted in state.pending_segments.items()
@@ -157,7 +225,11 @@ class ProcessManager:
                         True,
                     )
                     await timeout_close
-                elif key[0] == 'http':
+                    # 单个任务超时不得把整个服务拉下：worker 可能只是被一段慢
+                    # 推理卡住，其余任务仍可继续。只终结本任务并回收其接收协程。
+                    await _cancel_ws_handler(state, key)
+                    continue
+                if key[0] == 'http':
                     # HTTP 分支：先可靠落库 FAILED，成功后才释放 owner/唤醒
                     # 等待者；落库超时或失败不释放，随后仍 SystemExit(1)
                     # 非零退出，交由重启收敛兜底。

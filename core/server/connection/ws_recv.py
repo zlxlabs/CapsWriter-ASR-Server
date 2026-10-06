@@ -18,11 +18,16 @@ import websockets
 from ..state import console
 from ..state import (
     CounterUnavailable,
+    PHASE_DECODE,
+    PROGRESS_DECODE,
+    PROGRESS_UPLOAD,
     begin_task,
     count_active_tasks,
     ensure_server_runtime,
     make_task_key,
+    note_ws_progress,
     register_segment_submission,
+    set_ws_phase,
     transition_terminal,
     set_task_draining,
 )
@@ -161,14 +166,10 @@ async def _acquire_segment_slot(state, key, websocket) -> bool:
     terminal = asyncio.create_task(record.terminal_event.wait())
     closed = asyncio.create_task(websocket.wait_closed())
     waiters = (acquire, terminal, closed)
-    paused_at = None
+    # 等名额不再记账、不再推迟任何超时：「信号量被占满」本身就等价于
+    # 「有 max_inflight_segments 个片段已提交未确认」，那种时刻本任务由
+    # CW_SEGMENT_TIMEOUT 负责（pending_segments 非空），空闲看门狗不适用。
     try:
-        if not acquire.done():
-            paused_at = asyncio.get_running_loop().time()
-            async with record.idle_state_condition:
-                record.backpressured = True
-                record.idle_state_version += 1
-                record.idle_state_condition.notify_all()
         done, _ = await asyncio.wait(waiters, return_when=asyncio.FIRST_COMPLETED)
         if terminal in done or closed in done or record.status in {'DONE', 'FAILED'}:
             if acquire.done() and acquire.result():
@@ -178,13 +179,6 @@ async def _acquire_segment_slot(state, key, websocket) -> bool:
             return False
         return True
     finally:
-        if paused_at is not None:
-            if record.status == 'RECEIVING' and record.idle_deadline is not None:
-                record.idle_deadline += asyncio.get_running_loop().time() - paused_at
-            async with record.idle_state_condition:
-                record.backpressured = False
-                record.idle_state_version += 1
-                record.idle_state_condition.notify_all()
         for waiter in waiters:
             if not waiter.done():
                 waiter.cancel()
@@ -245,6 +239,7 @@ def _check_task_duration(samples: int) -> None:
 async def _consume_compressed_pcm(websocket, msg, cache, app) -> bool:
     key = make_task_key('ws', msg.task_id, str(websocket.id))
     async for pcm in cache.decoder.pcm_chunks():
+        note_ws_progress(app.state, key, PROGRESS_DECODE)
         data = pcm.astype('<f4', copy=False).tobytes()
         cache.chunks += data
         cache.byte_count += len(data)
@@ -382,6 +377,7 @@ async def message_handler(websocket, msg: AudioMessage, cache: AudioCache, app) 
         cache.decoder_task = asyncio.create_task(
             _consume_compressed_pcm(websocket, msg, cache, app)
         )
+        set_ws_phase(state, key, PHASE_DECODE)
     if not await _feed_compressed(cache, data):
         return False
     if not msg.is_final:
@@ -402,44 +398,28 @@ async def message_handler(websocket, msg: AudioMessage, cache: AudioCache, app) 
     return await _submit_final_audio(websocket, msg, cache, app, key[1])
 
 
-async def _receive_compressed_frame(websocket, record, consumer):
+async def _receive_compressed_frame(websocket, consumer):
+    """压缩任务的上行读取：只等两件事——下一帧到达，或消费协程提前结束。
+
+    这里不做任何超时判定：解码阶段的停滞发生在本函数之外（_feed_compressed
+    与 pcm_chunks 两处无时限 await 互等，接收协程根本回不到这里），超时统一
+    交给 worker 监控协程的进展看门狗。
+    """
     receive = asyncio.create_task(websocket.recv())
-    changed = None
     try:
-        while True:
-            if consumer.done():
-                consumer.result()
-                raise RuntimeError('压缩音频消费协程在末帧前结束')
-            seen_idle_state_version = record.idle_state_version
-            timeout = None if record.backpressured else max(
-                0.0, record.idle_deadline - asyncio.get_running_loop().time()
-            )
-
-            async def wait_for_idle_state_change():
-                async with record.idle_state_condition:
-                    await record.idle_state_condition.wait_for(
-                        lambda: record.idle_state_version != seen_idle_state_version
-                    )
-
-            changed = asyncio.create_task(wait_for_idle_state_change())
-            done, _ = await asyncio.wait(
-                (receive, changed, consumer),
-                timeout=timeout,
-                return_when=asyncio.FIRST_COMPLETED,
-            )
-            if not done:
-                raise TimeoutError
-            if changed in done:
-                continue
-            if consumer in done:
-                consumer.result()
-                raise RuntimeError('压缩音频消费协程在末帧前结束')
-            return receive.result()
+        done, _ = await asyncio.wait(
+            (receive, consumer), return_when=asyncio.FIRST_COMPLETED
+        )
+        if consumer in done and not receive.done():
+            receive.cancel()
+            await asyncio.gather(receive, return_exceptions=True)
+            consumer.result()
+            raise RuntimeError('压缩音频消费协程在末帧前结束')
+        return receive.result()
     finally:
-        for task in (receive, changed):
-            if task is not None and not task.done():
-                task.cancel()
-        await asyncio.gather(*(task for task in (receive, changed) if task is not None), return_exceptions=True)
+        if not receive.done():
+            receive.cancel()
+        await asyncio.gather(receive, return_exceptions=True)
 
 
 async def _cancel_audio_cache(cache: AudioCache) -> None:
@@ -478,6 +458,7 @@ async def ws_recv(websocket, app) -> None:
     state.out_queues[socket_id] = outbound
     sender = asyncio.create_task(_send_connection(websocket, outbound, socket_id))
     state.sender_tasks[socket_id] = sender
+    state.handler_tasks[socket_id] = asyncio.current_task()
 
     # 创建音频缓冲区
     cache = AudioCache()
@@ -490,25 +471,26 @@ async def ws_recv(websocket, app) -> None:
             try:
                 if cache.decoder_task is not None and record is not None:
                     raw_message = await _receive_compressed_frame(
-                        websocket, record, cache.decoder_task
+                        websocket, cache.decoder_task
                     )
-                elif record is not None and record.status == 'RECEIVING':
-                    remaining = max(
-                        0.0,
-                        record.idle_deadline - asyncio.get_running_loop().time(),
-                    )
-                    raw_message = await asyncio.wait_for(
-                        websocket.recv(), timeout=remaining
-                    )
-                else:
+                elif record is not None:
                     raw_message = await websocket.recv()
-            except TimeoutError:
-                if active is not None:
-                    await _cancel_audio_cache(cache)
-                    await queue_error_and_close(
-                        state, websocket, socket_id, active[2], 'bad_request',
-                        'upload idle timeout', False,
+                else:
+                    # 连接级上传看门狗：连接上没有任务时，它不占任何任务名额却能
+                    # 无限期挂住，所以按同一上限要求客户端连上就开始上行。
+                    raw_message = await asyncio.wait_for(
+                        websocket.recv(), timeout=Config.upload_idle_seconds
                     )
+            except TimeoutError:
+                # 只有「连接上没有活动任务」这一条路径会到达；有任务的停滞超时
+                # 统一由 worker 监控协程的进展看门狗判定。
+                await _cancel_audio_cache(cache)
+                await queue_error_and_close(
+                    state, websocket, socket_id, '', 'decode_stalled',
+                    f"上传阶段未推进：连接上没有活动任务，"
+                    f"{Config.upload_idle_seconds:g}s 内未收到任何上行音频帧",
+                    True,
+                )
                 return
             except AudioDecodeError as e:
                 if active is not None:
@@ -520,6 +502,12 @@ async def ws_recv(websocket, app) -> None:
                 return
             except websockets.ConnectionClosedOK:
                 break
+
+            # 进展打点之一：读到一帧上行数据。首帧之前任务尚未登记，
+            # begin_task 构造 TaskLifecycle 时即写入本任务的初始进展时刻。
+            active = state.connection_tasks.get(socket_id)
+            if active is not None:
+                note_ws_progress(state, active, PROGRESS_UPLOAD)
 
             task_id = ''
             try:
@@ -603,11 +591,6 @@ async def ws_recv(websocket, app) -> None:
                     '同一任务的 encoding 不可改变', False,
                 )
                 return
-            if record.status == 'RECEIVING':
-                record.idle_deadline = (
-                    asyncio.get_running_loop().time() + Config.upload_idle_seconds
-                )
-
             if record.status in {'DONE', 'FAILED'}:
                 logger.warning(f"丢弃终态任务 {msg.task_id} 的迟到上行帧")
                 continue
@@ -687,6 +670,7 @@ async def ws_recv(websocket, app) -> None:
         state.connection_tasks.pop(socket_id, None)
         state.out_queues.pop(socket_id, None)
         state.sender_tasks.pop(socket_id, None)
+        state.handler_tasks.pop(socket_id, None)
         if not sender.done():
             sender.cancel()
             try:
