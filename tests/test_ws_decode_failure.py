@@ -116,6 +116,9 @@ async def test_ws_kill_while_waiting_next_frame_sends_decode_failed():
     try:
         known = _direct_children(server.process.pid)
         task_id = str(uuid.uuid4())
+        log_path = Path(__file__).resolve().parents[1] / "logs" / "server_latest.log"
+        initial_log = log_path.read_text(encoding="utf-8") if log_path.exists() else ""
+        assert task_id not in initial_log
         started = time.monotonic()
         async with websockets.connect(
             server.url, max_size=None, ping_interval=None
@@ -142,6 +145,15 @@ async def test_ws_kill_while_waiting_next_frame_sends_decode_failed():
         await _wait_pid_reaped(ffmpeg_pid)
         await _wait_active_tasks(server.url, 0)
         assert server.process.is_alive()
+        log_delta = log_path.read_text(encoding="utf-8")[len(initial_log):]
+        task_end_lines = [
+            line for line in log_delta.splitlines()
+            if "task_end " in line and f"task={task_id}" in line
+        ]
+        assert len(task_end_lines) == 1, log_delta
+        task_end_log = task_end_lines[0]
+        assert "status=failed" in task_end_log, task_end_log
+        assert "code=decode_failed" in task_end_log, task_end_log
     finally:
         if ffmpeg_pid is not None and Path(f"/proc/{ffmpeg_pid}").exists():
             os.kill(ffmpeg_pid, signal.SIGKILL)
