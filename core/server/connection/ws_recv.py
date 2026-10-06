@@ -402,12 +402,7 @@ async def message_handler(websocket, msg: AudioMessage, cache: AudioCache, app) 
                     finish.cancel()
                     await asyncio.gather(finish, return_exceptions=True)
                 return False
-            if not finish.done():
-                await finish
-            else:
-                finish.result()
-        else:
-            await finish
+        await finish
     except BaseException:
         if not finish.done():
             finish.cancel()
