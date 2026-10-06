@@ -51,4 +51,36 @@ jobs:
         run: python -c "import websockets; print(websockets.__version__)"
 
       - name: 运行 pytest
-        run: python -m pytest ${{ matrix.pytest-targets }} -q
+        env:
+          M6_REPEAT_MATRIX_ARTIFACT_DIR: ${{ runner.temp }}/m6-repeat-matrix
+        run: |
+          mkdir -p "$M6_REPEAT_MATRIX_ARTIFACT_DIR"
+          python -m pytest ${{ matrix.pytest-targets }} -q
+
+      - name: 校验五轮矩阵工件结构
+        if: always() && matrix.python-version == '3.12'
+        env:
+          M6_REPEAT_MATRIX_ARTIFACT_DIR: ${{ runner.temp }}/m6-repeat-matrix
+        run: |
+          python - <<'PY'
+          import importlib.util
+          import os
+          from pathlib import Path
+
+          spec = importlib.util.spec_from_file_location(
+              "m6_repeat_matrix", Path("tests/test_http_qa_repeat_matrix.py"),
+          )
+          module = importlib.util.module_from_spec(spec)
+          spec.loader.exec_module(module)
+          module.consume_repeat_matrix_trace(
+              Path(os.environ["M6_REPEAT_MATRIX_ARTIFACT_DIR"]) / "trace.json",
+          )
+          PY
+
+      - name: 保存五轮矩阵工件
+        if: always() && matrix.python-version == '3.12'
+        uses: actions/upload-artifact@v4
+        with:
+          name: m6-repeat-matrix-py312
+          path: ${{ runner.temp }}/m6-repeat-matrix/
+          if-no-files-found: error

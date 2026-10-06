@@ -1,0 +1,69 @@
+# M6 五轮矩阵进度
+
+阶段：implementing → 已提交 Draft，等待主脑独立审生产者红绿与 CI artifact。
+结论：具名入口在同一 `persistent-httpdata` 上机械跑满 5 轮（并发 / 取消交错 / 受控重启 / 旧 WS），
+CI 3.12 与无会话 `env -i` 各消费一份工件；**不是** 12 组各 5 遍，也不是 500 条测试重复 5 次。
+假引擎只锁边界，不是 ASR 质量。Draft 绿 ≠ M6 Done。
+
+## 入口与同服务身份
+
+- 测试：`tests/test_http_qa_repeat_matrix.py::test_five_round_same_service_concurrency_cancel_restart_ws`
+- 循环：`REPEAT_COUNT = 5`，`REQUIRED_PHASES = (concurrency, cancel_io, restart, legacy_ws)`
+- 同服务：五轮共用一个 `httpdata`；重启只换 PID，不换目录。
+- 复用 `running_runner_server` + `ws_recv`（QA）与 `ManagedHttpServerHarness`（supervision），未改 harness / App / SDK / 旧 tests。（H0 当时事实。H1 最小授权改 harness WS，见 H1 节；不是把本句改成「H0 已经改过」。）
+
+## 工件消费者
+
+- `M6_REPEAT_MATRIX_ARTIFACT_DIR` 必须由调用方给出已存在目录。
+- `consume_repeat_matrix_trace` 读文件字节：缺第 5 轮、缺 cancel/restart、只改 round 号而 IDs 仍属旧相位均 `AssertionError`。结构通过不认证真实执行。
+- CI 3.12：同一次 `pytest tests/` 写出工件 → `importlib` 再读同一函数 → `upload-artifact`（`if-no-files-found: error`）。不第二次跑该模块。
+- py3.11 仍只跑 SDK，不计五轮。
+
+## 验证（HEAD `c57ca9d`，含 origin/master `6aa76f6`）
+
+| 环境 | 命令要点 | 计数 | 新模块 skip |
+|---|---|---|---|
+| 会话 uv 具名入口 | `pytest tests/test_http_qa_repeat_matrix.py` | 6 passed / 22 s | 0 |
+| 无会话 `env -i` | 白名单 HOME/PATH/TMPDIR/工件目录，无 DELEGATE_* | 6 passed / 11.74 s；消费者 `[1,2,3,4,5]` sha=`c57ca9d` | 0 |
+| 全量 pin `websockets==15.0.1` | flock 600 + timeout 900 | **505 passed, 3 skipped** / 260 s；wait 0.002 s | 0 |
+| 全量 unpin（解析到 17.2） | 同上 | **505 passed, 3 skipped** / 282 s；wait 0.002 s | 0 |
+
+3 个 skip 身份与历史相同：`test_aligner_integration.py:53/:62`（ForceAligner 模型未装）、`test_segmenter.py:208`（silero-VAD / onnxruntime）。没有 HTTP/ffmpeg/aiohttp 类 skip。
+
+卡面记载的 `test_http_baseline` 两条 CLI 失败在本机这两次 Linux uv 全量**未出现**；独立补诊 `dlg-20261005-104647-038013` 仍在进行，**本卡不宣称 root 已修**，也没有把它们从套件里排除。
+
+Hosted CI 尚未跑齐，不能用 Draft 检查绿代替 artifact 五轮。
+
+## 主干
+
+`git ls-remote origin refs/heads/master` → `6aa76f6`（相对基线 902 只多 `docs/maintainers/project-memory.md`，无 Win App flag）。已 `with-merge-lease.sh --record-merge` 合入本分支。
+
+## H1 续修（dispatch `dlg-20261005-121000-45baf4`）
+
+只读 verdict `03e8e48`：`failure-visibility: skipped`，M6 未达，无应用 P1。H0 裸环境与 Hosted run `37302715605` / artifact `11342646375` 仍是真实五轮记录，不是假证；缺的是同服务完整循环。
+
+H1 补测试契约，不改 App/SDK/旧 tests/原 verdict 正文：
+
+1. `ManagedHttpServerHarness` 最小真实 `ws_recv`（opt-in `enable_ws`，info_queue 仍二元组）。
+2. `legacy_ws` 连仍存活的 second，不再 stop 后另起 `running_runner_server`。
+3. 重启前后 `GET /result` 全 payload 相等；`engine_calls_after_restart==0`。
+4. 源文件与落盘逐字节；PCM SHA 对独立 ffmpeg oracle。
+5. io-first 记真实 mailbox/pending（槽已归还）；每轮 `ffmpeg_log_offset` + 本轮 start 数。
+
+普通 pytest 工件默认 `tmp_path`；CI/裸环境仍必须显式 `M6_REPEAT_MATRIX_ARTIFACT_DIR`。H1 全量计数见本续修验证段（未跑完前不改上方 H0 的 505/3）。
+
+## H1 验证（HEAD `d5b5717323eac858b95cdfacec125cfc9ee0012f`）
+
+| 环境 | 命令要点 | 计数 | 新模块 skip |
+|---|---|---|---|
+| 无会话 `env -i` 具名入口 | 白名单 HOME/PATH/TMPDIR/工件目录，无 DELEGATE_* | 11 passed / 31.87 s；消费 rounds `[1,2,3,4,5]` sha=`d5b5717…`；ffmpeg_offsets `[0,6,13,19,25]` 递增；io_first slot_held 全 false；WS 全 `ws_on_restarted_instance` | 0 |
+| 全量 pin `websockets==15.0.1` | flock 600 + timeout 900 | **510 passed, 3 skipped** / 292.87 s | 0 |
+| 全量 unpin（解析到 17.2） | 同上 | **510 passed, 3 skipped** / 303.28 s | 0 |
+
+相对 H0 的 505：本模块从 6 条加到 11 条消费者/变异锁。3 个 skip 身份未变（aligner ×2、segmenter silero）。没有 HTTP/ffmpeg/aiohttp 类 skip。
+
+Hosted CI 新 head 待读取，不把 H0 run `37302715605` 当本 head 证据。master 仍 `6aa76f6`，无 Win82 合入。
+
+## H2 证明边界（schema-only）
+
+独立审计：same JSON 可全面重写，消费者不能单独认证执行次数。已删「自贴标签都必须拒」强承诺；只改 round 号、IDs 仍属旧相位仍拒。`test_trace_consumer_accepts_fully_relabeled_clone_is_not_execution_proof` 记录结构有效副本≠真实五轮。不改 producer 循环/相位断言。CI 结构校验不自证真实性。
