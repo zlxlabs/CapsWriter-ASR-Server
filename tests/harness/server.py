@@ -206,18 +206,102 @@ class ManagedFakeServerHarness:
             await asyncio.sleep(0.01)
 
     async def stop(self):
-        if self.process.is_alive():
-            self.queue_in.put(None)
-            self.queue_out.put(None)
+        try:
+            # 先收回本 owner fork 出来的解码子进程，再让服务主进程走正常收尾。
+            await self._reclaim_decoder_children()
+        finally:
+            # reclaim 只能在服务主进程收尾之前发生（顺序是根治点），但它上抛时
+            # 原有的服务停止/join、IPC 队列 close 与 Manager shutdown 通道仍必须走完，
+            # 否则会把一次可见失败变成残留进程。错误仍 fail loud：finally 里不吞、不重试。
+            if self.process.is_alive():
+                self.queue_in.put(None)
+                self.queue_out.put(None)
+                await asyncio.to_thread(self.process.join, 5)
+            graceful_timeout = self.process.is_alive()
+            if graceful_timeout:
+                self.process.terminate()
             await asyncio.to_thread(self.process.join, 5)
-        graceful_timeout = self.process.is_alive()
-        if graceful_timeout:
-            self.process.terminate()
-        await asyncio.to_thread(self.process.join, 5)
-        assert not self.process.is_alive(), "服务主进程在 teardown 的 5 秒 join 后仍存活"
-        self.info_queue.close()
-        self.manager.shutdown()
-        assert not graceful_timeout, "服务主进程未在 5 秒内响应 worker 停止信号"
+            assert not self.process.is_alive(), "服务主进程在 teardown 的 5 秒 join 后仍存活"
+            self.info_queue.close()
+            self.manager.shutdown()
+            assert not graceful_timeout, "服务主进程未在 5 秒内响应 worker 停止信号"
+
+    async def _reclaim_decoder_children(self, timeout: float = 5.0) -> None:
+        """stop() 的第一步：把本服务主进程名下的解码子进程收干净。
+
+        被 SIGSTOP 停住的 ffmpeg 读不动 stdin，服务端写侧与读侧就此互等，
+        接收协程回不到 ``websocket.recv()``，主进程在 ``wait_closed()`` 上
+        永远等不到全部连接关闭 → 正常收尾整条路径失效。实测（探针
+        probe/test_counterfactual_owner.py）：两次 5s join 之后只能 SIGTERM
+        强杀，随后抛出与服务故障无关的「未在 5 秒内响应 worker 停止信号」，
+        把主体真正的断言盖掉。
+
+        所有权判据是 ppid —— 只认本 harness 启动的这一棵进程树里、服务主进程
+        的直接 ffmpeg 子进程，不按进程名全局搜，也不碰别的会话的解码器。
+        SIGKILL 对 T 态进程同样生效，不需要先 SIGCONT。
+        """
+        if self.process.pid is None or not self.process.is_alive():
+            # 主进程已退出：子进程已被 init 收养，本 owner 再按名字猜就跨界了。
+            return
+        pids = _decoder_children(self.process.pid)
+        if not pids:
+            return
+        for pid in pids:
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass  # 刚好自己退出了，与「已回收」同义
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + timeout
+        while True:
+            alive = [pid for pid in pids if _still_running(pid)]
+            if not alive:
+                return
+            if loop.time() >= deadline:
+                raise AssertionError(
+                    f"解码子进程 {alive} 在 SIGKILL 后 {timeout}s 内仍未停止："
+                    f"{[_proc_facts(pid) for pid in alive]!r}"
+                )
+            await asyncio.sleep(0.05)
+
+
+def _proc_facts(pid: int):
+    """返回 (comm, state, ppid)，全部读自 /proc/<pid>/stat。
+
+    只有「路径确实消失/进程确实不存在」才等价于 None（FileNotFoundError）；
+    PermissionError、EIO 等未知读失败**上抛**——它们不证明进程已退，
+    当成 None 就是把查询错误伪装成「已回收」。
+    """
+    try:
+        stat = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8")
+    except (FileNotFoundError, ProcessLookupError):
+        return None
+    try:
+        comm = stat[stat.index("(") + 1:stat.rindex(")")]
+        fields = stat[stat.rindex(") ") + 2:].split()
+        return comm, fields[0], int(fields[1])
+    except (ValueError, IndexError):
+        return None
+
+
+def _still_running(pid: int) -> bool:
+    """进程是否还在占用资源（T 停止态也算）；已被 SIGKILL 还没 reap 的僵尸不算。"""
+    facts = _proc_facts(pid)
+    return facts is not None and facts[1] != "Z"
+
+
+def _decoder_children(server_pid: int) -> list[int]:
+    """服务主进程名下的 ffmpeg 直接子进程（非 Linux 无 /proc，返回空）。"""
+    if not Path("/proc").is_dir():
+        return []
+    found = []
+    for entry in Path("/proc").iterdir():
+        if not entry.name.isdigit():
+            continue
+        facts = _proc_facts(int(entry.name))
+        if facts is not None and facts[0] == "ffmpeg" and facts[2] == server_pid:
+            found.append(int(entry.name))
+    return found
 
 
 class _FaultyPutQueue:
