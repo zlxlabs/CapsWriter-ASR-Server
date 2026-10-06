@@ -58,7 +58,7 @@
 | disposition | 数量 | 关单谓词 |
 | --- | --- | --- |
 | `content-in-baseline-no-action` | 17 | 所有可读来源与基线**同 blob**：内容已在基线树，无需动作。同 blob 只证明内容在底座，不证明合并方式 |
-| `superseded-in-baseline` | 17 | 存在与基线**不同 blob 的可读来源**，且基线该路径最后修改提交**晚于**该来源提交：据此判基线为后续版本。每行写明采用比较对象 `ref@fullsha` 与两个时间；无时间证据或无可读来源时构建脚本 fail fast，不静默分类 |
+| `baseline-has-later-divergent-content` | 17 | 存在与基线**不同 blob 的可读来源**，且基线该路径最后修改提交**晚于**该来源提交。每行写明采用比较对象 `ref@fullsha` 与两个时间。**只断言内容层事实**（同路径、基线较晚、内容不同），未逐条做语义核查，**不等于语义上已被取代**；无时间证据或无可读来源时构建脚本 fail fast，不静默分类 |
 | `archive-pointer-old-process` | 77 | 纯旧过程：`git show` 指针可读，不进主干，不复制 |
 | `archive-pointer-current-dependency` | 2 | 当前结论依赖的历史证据，已进 appendix 逐字摘录 |
 | `archive-pointer-association-unverified` | 1 | 泛称引用关联未证实，如实标注，不升级为证据 |
@@ -72,8 +72,13 @@
 
 把下面代码块存成 `verify_artifact_disposition.py` 放在仓库根，运行 `python3 verify_artifact_disposition.py`。
 它**只校已冻结的交付物**（TSV 的 449 条来源记录、附录 5 段摘录、本仓文档链接），不扫描整机 refs、
-不重审历史报告、不引入任何依赖或 CI 步骤。四道关：逐条复算 source_state、三个负控（虚构路径 / 假 SHA /
-同 blob 不得判取代）、摘录逐字 + 首字符变异、文档链接。退出码 0 = 全过。
+不重审历史报告、不引入任何依赖或 CI 步骤。四道关：逐条复算 source_state（**来源不可核即失败，不默认 PASS**）、三个负控（虚构路径 / 假 SHA /
+同 blob 不得判「基线含较晚不同内容」）、摘录按**连续完整行字节**核对（含顺序/相邻/空行）并带首字符变异负控、
+文档链接。退出码 0 = 全过。
+
+反例对照（本卡在真实树实测，非沙箱逻辑判断）：把 TSV 任一来源 SHA 换成不存在的 SHA → 报
+`来源不可核` 并退出非零；把附录某段摘录的两行换序 → 报「不是连续原文」并退出非零；两者还原后回到
+`RESULT: PASS`。
 
 ```python
 #!/usr/bin/env python3
@@ -93,8 +98,10 @@ DOCS = [
     "docs/sessions/261006-issue-root-fixes/artifact-history-appendix.md",
     "docs/sessions/261006-issue-root-fixes/progress/artifact-disposition-progress.md",
     "docs/sessions/261006-issue-root-fixes/reviews/artifact-review1-verdict.md",
+    "docs/sessions/261006-issue-root-fixes/reviews/artifacts-review2-verdict.md",
 ]
 READABLE = ("BLOB_SAME_AS_BASE", "BLOB_DIFF_FROM_BASE", "BLOB_BASE_MISSING")
+DIFF_CONTENT = "baseline-has-later-divergent-content"
 fail = []
 
 
@@ -142,18 +149,20 @@ for i, line in enumerate(rows[1:], start=2):
         sha = ref_sha.split("@", 1)[1]
         got, _blob = observed(sha, path)
         if got == "OBJECT_UNAVAILABLE" or got.startswith("QUERY_ERROR"):
+            # 真·来源不可核：走既有 fail 渠道，不得默认 PASS（合法态只有 NO_PATH 与各 BLOB_*）
             unavailable += 1
             print(f"  UNAVAILABLE {path} {sha[:12]} recorded={state} observed={got}")
+            fail.append(f"line {i}: {path} {sha[:12]} 来源不可核（{got}），本轮不能算通过")
             continue
         checked += 1
         if got != state:
             fail.append(f"line {i}: {path} {sha[:12]} 记录 {state} 与实况 {got} 不符")
-print(f"[1] 冻结盘点表：复算 {checked} 条来源记录，状态不符 {len(fail)} 条；"
-      f"对象不可用/查询错 {unavailable} 条（不算通过，按不可用记账）")
+print(f"[1] 冻结盘点表：已核 {checked} 条来源记录，状态不符 {len(fail)} 条；"
+      f"来源不可核 {unavailable} 条（不可核即失败，不计入通过）")
 
 any_sha = rows[1].split("\t")[2].split(" ")[0].rpartition("=")[0].split("@", 1)[1]
 k1, _ = tree(any_sha, "docs/__no_such_file_261006__.md")
-print(f"[2a] 负控 有效SHA+虚构路径 → {k1}（期望 NO_PATH）")
+print(f"[2a] 负控 有效SHA+虚构路径 → {k1}（期望 NO_PATH；这是预期查询，不是来源不可核）")
 if k1 != "NO_PATH":
     fail.append(f"负控 2a 不成立：{k1}")
 k2, _ = tree("0" * 40, "docs/README.md")
@@ -164,34 +173,43 @@ mis = []
 for line in rows[1:]:
     path, _b, srcs, _ev, disp = line.split("\t")
     states = [e.rpartition("=")[2] for e in srcs.split(" ")]
-    if disp == "superseded-in-baseline":
+    if disp == DIFF_CONTENT:
         readable = [s for s in states if s in READABLE]
         if not any(s == "BLOB_DIFF_FROM_BASE" for s in readable):
             mis.append(path)
-print(f"[2c] 负控 同blob+缺来源 不得判 superseded：违例 {len(mis)} 条 {mis[:3]}")
+print(f"[2c] 负控 同blob+缺来源 不得判「基线含较晚不同内容」：违例 {len(mis)} 条 {mis[:3]}")
 if mis:
     fail.append(f"负控 2c 违例：{mis[:3]}")
 
 text = open(os.path.join(REPO, APPENDIX), encoding="utf-8").read()
 blocks = re.findall(r"<!-- source-check: (\S+) (\S+) (\S+) -->\n```text\n(.*?)\n```\n", text, re.S)
-print(f"[3] 摘录 {len(blocks)} 段")
+print(f"[3] 摘录 {len(blocks)} 段（按连续完整行字节核对：顺序/相邻/空行都算）")
 if not blocks:
     fail.append("附录未解析到任何 source-check 摘录")
-for refsha, apath, _ident, body in blocks:
+for refsha, apath, ident, body in blocks:
     sha = refsha.split("@", 1)[1]
     c = git("show", f"{sha}:{apath}")
     if c.returncode != 0:
-        fail.append(f"摘录源不可读：{sha}:{apath}")
+        fail.append(f"摘录源不可读 {ident}: {sha}:{apath}")
         continue
-    src = set(c.stdout.split("\n"))
-    lines = [x for x in body.split("\n") if x]
-    missing = [x for x in lines if x not in src]
-    if missing:
-        fail.append(f"摘录与源不符 {apath}: {missing[:1]}")
-    first = lines[0]
-    if ("X" + first[1:]) in src:
-        fail.append(f"摘录判据恒真（变异后仍匹配）{apath}")
-print("[3] 摘录逐字+首字符变异负控完成")
+    src = c.stdout
+    block_lines = body.split("\n")
+    if not any(x.strip() for x in block_lines):
+        fail.append(f"摘录 {ident} 为空")
+        continue
+    needle = "\n".join(block_lines) + "\n"
+    if needle not in src:
+        loose = [x for x in block_lines if (x + "\n") not in src]
+        if loose:
+            why = f"缺行 {loose[0][:40]!r}"
+        else:
+            why = "行都在但顺序/相邻关系或空行被改动（字符成员相同不等于连续原文）"
+        fail.append(f"摘录 {ident} 与源对象不是连续原文：{why}")
+        continue
+    mutated_lines = ["X" + block_lines[0][1:]] + block_lines[1:]
+    if ("\n".join(mutated_lines) + "\n") in src:
+        fail.append(f"摘录判据对 {ident} 不敏感（首字符变异后仍连续匹配，判据恒真）")
+print("[3] 摘录连续性 + 首字符变异负控完成")
 
 broken = []
 for d in DOCS:

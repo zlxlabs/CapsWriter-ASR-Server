@@ -114,13 +114,19 @@ H2 精确增量审查」在基线树已有同名文件（`reviews/m6-h1-full-rev
 
 ## 6. 摘录逐字校验
 
-`source-check` 注释后的围栏内容必须**逐行**出现在对应 source 的 Git 对象字节中（不是子串包含）。
-随仓复算入口：[`docs/development/known-issues/artifact-disposition-261006.md`](../../development/known-issues/artifact-disposition-261006.md)
+`source-check` 注释后的围栏内容必须与对应 source 的 Git 对象**连续完整行字节**一致（顺序、相邻关系、
+空行都参与判定；不是行集合，也不是子串包含）。随仓复算入口：
+[`docs/development/known-issues/artifact-disposition-261006.md`](../../development/known-issues/artifact-disposition-261006.md)
 的「公开自包含复算入口」一节——把那段代码存成 `verify_artifact_disposition.py` 放仓库根即可运行，
 第 3 关就校这 5 段摘录，并带首字符变异负控。校验只依赖 Git 对象，不依赖工作区文件。
 
 第 3 节的 `EV-C1` 原文行在首轮是截断的（只取到「……改变 WS 契约。」），本轮已改为**整行原文**
-（后续半句一并保留），以便逐行判定成立。
+（后续半句一并保留），以便连续字节判定成立。后续审查又发现「行集合」判据会放过重排，现已改为连续字节判定，
+并实测换序反例会失败。
+
+**摘录的用途边界**：这 5 段只用于**指定的历史判断 + 适用 SHA**（PCM 量化 P2 的分级、M6 两个时点的并列）。
+它们**不是完整审查结论**；承担完整审查结论的文件仍以原对象指针为准
+（`git show d52f8687cb2ed90114547674d84875244576126e:docs/sessions/261001-http-files/reviews/E1-owner-review-A-verdict.md`）。
 
 覆盖限制：该入口依赖**持有本地归档对象的仓库**；新克隆未取齐历史对象时，对应来源报
 `OBJECT_UNAVAILABLE`（对象不可用），不是「来源缺路径」，脚本逐条打印、不静默通过。
