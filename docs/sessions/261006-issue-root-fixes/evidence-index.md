@@ -15,6 +15,8 @@
 | [reviews/harness-review2-verdict.md](reviews/harness-review2-verdict.md) | `3d59382c141c5e02ef3ce370baf90acdecb13b05` | `b6cfb02090d62f562cfed539009e6d6f83b63305` | `e849c21748..e2755ed8a8` | 本地窄测+源码 | status=reviewed_fallback / complete / deepseek | 归属84295d;旧隔离任务failed/seal冲突保历史，不冒独立合格 | PR #91 (3ebcb72) |
 | [reviews/harness-review1-verdict.md](reviews/harness-review1-verdict.md) | `f357fc986f26c89523f287d6f333bca11bcb9327` | `9f757303ccbeabff95ef926a738ff1c403fddd9d` | `e849c21748..482cf9ae72` | 源码+窄测 | status=reviewed / complete / minimax | 历史代码PR已含入仓，本索引仅引用不二次copy | PR #91 (3ebcb72) |
 | [reviews/sdk-review1-verdict.md](reviews/sdk-review1-verdict.md) | `34a4ed9ff49d56530c6a99d942f5fd3373693797` | `3068b668bbc2fc67fde87d7e143a84e38467c7e4` | `e849c21748..050b6dc5f4` | 源码+探针 | status=reviewed_fallback / complete / deepseek | 历史代码PR已含入仓，本索引仅引用不二次copy | PR #90 (dccca73) |
+| [progress/decode-log-verification.md](progress/decode-log-verification.md) | `a155d7b58be4b5dc3e03ef30ce1388c427f16460` | `008221f5bae1e55d3394fd1f24e4c80f13e0ccd8` | `#87 真实日志验证` | 真实跨进程 WS/ffmpeg + fake ASR worker | N/A (runtime取证) | 正常 INFO 实际 `server_latest.log` 含同 task 的 `task_end ... decode_failed`；长期 SIGKILL file-log 断言已随 PR #98 合入且 #87 已关闭；非生产、不是历史退出因果 | PR #98 (fdfa530) |
+| [progress/sdk-long-audio-boundary.md](progress/sdk-long-audio-boundary.md) | `73445403b6bafd50557e02d57be64daef79b2572` | `b71cd0a9ee3e7c5409c8e175f45c441fd26fb1cb` | `#76 17501s 长音频本地边界` | 真实 SDK + server/ffmpeg + fake ASR worker + wire | N/A (runtime取证) | `budget=70124s`、真实 `audio_too_long`、3s final；额外 FileHandler/INFO 仅作采集，不代表原部署 logger/真实 ASR 性能/下游 pin；纠正版 wire 非 final 无 `samples_total`，仅 final=`280016000`；旧 b52 证据保留但不作当前主文档 | 本卡独立 docs-only draft PR（Refs #76） |
 
 ## 约束与失效说明
 
