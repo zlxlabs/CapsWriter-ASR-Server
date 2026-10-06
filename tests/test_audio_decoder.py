@@ -326,6 +326,7 @@ async def test_pcm_chunks_raises_decode_failed_on_nonzero_ffmpeg_without_finish(
     assert "ffmpeg stderr 末尾：" in caught.value.message
 
 
+@pytest.mark.skipif(not hasattr(signal, "SIGKILL"), reason="本平台没有 SIGKILL")
 @pytest.mark.asyncio
 async def test_pcm_chunks_raises_when_ffmpeg_killed_after_progress(compressed_audio):
     """上传途中 SIGKILL 真 ffmpeg 后，迭代即抛 decode_failed；不得用垃圾输入冒充。"""

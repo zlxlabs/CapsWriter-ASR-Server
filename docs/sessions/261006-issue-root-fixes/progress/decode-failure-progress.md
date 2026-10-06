@@ -34,3 +34,13 @@
     收到 `internal` / `RuntimeError: 压缩音频消费协程在末帧前结束`。
   - WS 故障文件连续 5 轮退出码：0/0/0/0/0。
 - 下一步唯一动作：draft PR Refs #87。
+
+## 里程碑 4：续修收尾（平台标记 + 同 tick 优先级）
+
+- 阶段：repairing
+- 本段结论：
+  - `.capture_payload.py` 移出工作树到本续修信封 `evidence/capture_payload.py`，hash 不变，不进仓。
+  - 依赖 `/proc` 的 WS 用例标 Linux skip；SIGKILL 用例在无该信号的平台 skip；正常 flac 仍可在 macOS 跑。
+  - `test_receive_compressed_frame_same_tick_prefers_decode_failed` 锁真实 helper 在两任务同 tick 都 done 时让 `AudioDecodeError` 压过帧。
+  - 生产 8+11 行本轮未改。不宣称已坐实原生产 ffmpeg 死亡触发原因。
+- 下一步唯一动作：窄测、同 tick 撤回红验、push PR #89。

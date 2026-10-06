@@ -6,6 +6,7 @@ import asyncio
 import json
 import os
 import signal
+import sys
 import time
 import uuid
 from pathlib import Path
@@ -15,12 +16,22 @@ import numpy as np
 import pytest
 import websockets
 
+from core.server.connection.audio_decoder import AudioDecodeError
+
 import core.server.connection.ws_recv as ws_recv_module
 from tests.harness.client import collect_terminal
 from tests.harness.server import ManagedFakeServerHarness
 from tests.test_protocol_v2 import _encode_flac, _frame
 
 FORBIDDEN = {"internal", "connection_lost", "decode_stalled"}
+_LINUX_PROC = pytest.mark.skipif(
+    sys.platform != "linux",
+    reason="定位 ffmpeg 子进程依赖 /proc/<pid>/stat",
+)
+_HAS_SIGKILL = pytest.mark.skipif(
+    not hasattr(signal, "SIGKILL"),
+    reason="本平台没有 SIGKILL",
+)
 
 
 def _direct_children(ppid: int) -> set[int]:
@@ -94,6 +105,8 @@ def _long_flac(seconds: float = 12.0):
     return samples, _encode_flac(samples)
 
 
+@_LINUX_PROC
+@_HAS_SIGKILL
 @pytest.mark.asyncio
 async def test_ws_kill_while_waiting_next_frame_sends_decode_failed():
     """等下一帧时 SIGKILL 真 ffmpeg：客户端秒级收到 decode_failed，任务与进程回收。"""
@@ -135,6 +148,7 @@ async def test_ws_kill_while_waiting_next_frame_sends_decode_failed():
         await server.stop()
 
 
+@_HAS_SIGKILL
 @pytest.mark.asyncio
 async def test_ws_kill_while_feeding_sends_decode_failed(fake_asr_server, monkeypatch):
     """正在 feed 下一帧时 ffmpeg 死亡：走 _feed_compressed，仍发 decode_failed。"""
@@ -181,6 +195,7 @@ async def test_ws_kill_while_feeding_sends_decode_failed(fake_asr_server, monkey
     assert returncode not in (None, 0)
 
 
+@_HAS_SIGKILL
 @pytest.mark.asyncio
 async def test_ws_final_arriving_with_death_prefers_decode_failed(
     fake_asr_server, monkeypatch,
@@ -229,3 +244,47 @@ async def test_ws_normal_flac_still_gets_final(fake_asr_server):
         messages, _ = await collect_terminal(client, task_id=task_id, timeout=15)
     assert messages[-1]["type"] == "result" and messages[-1]["is_final"] is True
     assert all(m.get("code") != "decode_failed" for m in messages)
+
+
+@pytest.mark.asyncio
+async def test_receive_compressed_frame_same_tick_prefers_decode_failed(monkeypatch):
+    """consumer 与 recv 同 tick 都完成时，真实 helper 必须让 AudioDecodeError 压过帧。"""
+    loop = asyncio.get_running_loop()
+    recv_fut = loop.create_future()
+    consume_fut = loop.create_future()
+    seen = {}
+
+    class ImmediatePairSocket:
+        async def recv(self):
+            return await recv_fut
+
+    async def consume():
+        await consume_fut
+
+    real_wait = ws_recv_module.asyncio.wait
+
+    async def spy_wait(aws, *args, **kwargs):
+        done, pending = await real_wait(aws, *args, **kwargs)
+        seen["n_done"] = len(done)
+        seen["both_done"] = all(task.done() for task in aws)
+        return done, pending
+
+    monkeypatch.setattr(ws_recv_module.asyncio, "wait", spy_wait)
+    consumer = asyncio.create_task(consume())
+    helper = asyncio.create_task(
+        ws_recv_module._receive_compressed_frame(ImmediatePairSocket(), consumer)
+    )
+    await asyncio.sleep(0)
+    consume_fut.set_exception(AudioDecodeError("decode_failed", "same-tick"))
+    recv_fut.set_result('{"is_final": true}')
+    try:
+        result = await helper
+    except AudioDecodeError as exc:
+        caught = exc
+    else:
+        raise AssertionError(
+            f"同 tick 已知 decode_failed 必须压过 receive 结果，实际得到 {result!r}"
+        )
+    assert caught.code == "decode_failed"
+    assert seen.get("n_done") == 2, seen
+    assert seen.get("both_done") is True, seen
