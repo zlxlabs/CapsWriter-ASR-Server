@@ -154,7 +154,10 @@ async def test_ws_kill_while_feeding_sends_decode_failed(fake_asr_server, monkey
     """正在 feed 下一帧时 ffmpeg 死亡：走 _feed_compressed，仍发 decode_failed。"""
     _, flac = _long_flac(8)
     decoders = []
-    feed_started = asyncio.Event()
+    feed_entered = asyncio.Event()
+    feed_release = asyncio.Event()
+    feed_wait_entered = asyncio.Event()
+    wait_state = {}
 
     class TrackingDecoder(ws_recv_module.AudioDecoder):
         def __init__(self, encoding):
@@ -163,10 +166,34 @@ async def test_ws_kill_while_feeding_sends_decode_failed(fake_asr_server, monkey
 
         async def feed(self, data: bytes) -> None:
             if self.samples_emitted > 0:
-                feed_started.set()
+                feed_entered.set()
+                await feed_release.wait()
             await super().feed(data)
 
     monkeypatch.setattr(ws_recv_module, "AudioDecoder", TrackingDecoder)
+    real_wait = ws_recv_module.asyncio.wait
+
+    async def observe_feed_wait(awaitables, *args, **kwargs):
+        tasks = tuple(awaitables)
+        feeds = [
+            task for task in tasks
+            if isinstance(task, asyncio.Task)
+            and task.get_coro().__qualname__.endswith("TrackingDecoder.feed")
+        ]
+        if not feeds:
+            return await real_wait(tasks, *args, **kwargs)
+        waiter = asyncio.create_task(real_wait(tasks, *args, **kwargs))
+        await asyncio.sleep(0)
+        wait_state.update(
+            task_count=len(tasks),
+            feed_pending=all(not task.done() for task in feeds),
+            consumer_pending=all(not task.done() for task in tasks if task not in feeds),
+            wait_pending=not waiter.done(),
+        )
+        feed_wait_entered.set()
+        return await waiter
+
+    monkeypatch.setattr(ws_recv_module.asyncio, "wait", observe_feed_wait)
     task_id = str(uuid.uuid4())
     split = max(64 * 1024, len(flac) // 3)
     async with websockets.connect(
@@ -183,13 +210,23 @@ async def test_ws_kill_while_feeding_sends_decode_failed(fake_asr_server, monkey
         sending = asyncio.create_task(
             client.send(_frame(task_id, flac[split:], encoding="flac", final=False))
         )
-        await asyncio.wait_for(feed_started.wait(), timeout=5)
+        await asyncio.wait_for(feed_wait_entered.wait(), timeout=5)
+        assert feed_entered.is_set(), "测试闸必须卡在下一次 decoder.feed 入口"
+        assert wait_state == {
+            "task_count": 2,
+            "feed_pending": True,
+            "consumer_pending": True,
+            "wait_pending": True,
+        }, wait_state
         os.kill(pid, signal.SIGKILL)
+        feed_release.set()
         returncode = await asyncio.wait_for(process.wait(), timeout=5)
         await asyncio.gather(sending, return_exceptions=True)
         messages, _ = await collect_terminal(client, task_id=task_id, timeout=5)
+    feed_release.set()
     error = next(m for m in messages if m.get("type") == "error")
-    _assert_decode_failed(error, returncode=returncode)
+    _assert_decode_failed(error)
+    assert error.get("task_id") == task_id, error
     assert not any(m.get("is_final") for m in messages), messages
     assert process.pid == pid
     assert returncode not in (None, 0)
@@ -197,10 +234,10 @@ async def test_ws_kill_while_feeding_sends_decode_failed(fake_asr_server, monkey
 
 @_HAS_SIGKILL
 @pytest.mark.asyncio
-async def test_ws_final_arriving_with_death_prefers_decode_failed(
+async def test_ws_final_after_decoder_death_does_not_send_success(
     fake_asr_server, monkeypatch,
 ):
-    """末帧与解码失败同时到达时失败优先，不得发出成功 final。"""
+    """SIGKILL 后邻近到达的末帧仍见 decode_failed；同 tick 由独立单元用例锁定。"""
     samples, flac = _long_flac(6)
     decoders = []
 
@@ -228,6 +265,8 @@ async def test_ws_final_arriving_with_death_prefers_decode_failed(
         messages, _ = await collect_terminal(client, task_id=task_id, timeout=5)
     error = next(m for m in messages if m.get("type") == "error")
     _assert_decode_failed(error)
+    assert error.get("task_id") == task_id, error
+    assert returncode not in (None, 0)
     assert (
         f"退出码 {returncode}" in error["message"]
         or "结束 ffmpeg 输入失败" in error["message"]
