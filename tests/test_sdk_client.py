@@ -543,10 +543,10 @@ async def test_upload_failure_is_not_masked_by_final_when_both_tasks_done(
     failing_connect.__signature__ = inspect.signature(original_connect)
     monkeypatch.setattr(sdk_client.websockets, "connect", failing_connect)
 
-    async def tracked_receive(ws, *, task_id, on_progress, idle_messages, progress):
+    async def tracked_receive(ws, *, task_id, on_progress, idle_messages, mark_progress):
         result = await original_receive(
             ws, task_id=task_id, on_progress=on_progress,
-            idle_messages=idle_messages, progress=progress,
+            idle_messages=idle_messages, mark_progress=mark_progress,
         )
         receive_ready.set()
         # Queue both task resumptions before asyncio.wait handles either completion.
@@ -1028,12 +1028,24 @@ async def test_blocked_send_with_silent_server_reports_idle_stall(tmp_path, monk
 
 @pytest.mark.asyncio
 async def test_total_deadline_expires_despite_continuous_progress(tmp_path):
+    """即使匹配本任务的中间结果一直到达，显式 deadline_total 仍按用户要求终止。
+
+    回帧必须走真实协议 schema 且带 task_id，否则会被 _receive 当噪声滤掉，
+    本用例就从「持续进展」退化成「毫无进展」，成了假噪声路径。
+    """
+    from core.protocol import RecognitionMessage
+
     audio_path = make_audio(tmp_path / "source.wav")
+    sent = {"progress": 0}
 
     async def progress_forever(ws, _state):
-        await ws.recv()
+        frame = json.loads(await ws.recv())
         while True:
-            await ws.send(json.dumps({"type": "result", "is_final": False, "text": "进度"}))
+            await ws.send(RecognitionMessage(
+                task_id=frame["task_id"], is_final=False, duration=0.0,
+                time_start=0.0, time_submit=0.0, time_complete=0.0, text="进度",
+            ).to_json())
+            sent["progress"] += 1
             await asyncio.sleep(0.05)
 
     async with fake_v2_server(progress_forever) as (url, _):
@@ -1046,6 +1058,9 @@ async def test_total_deadline_expires_despite_continuous_progress(tmp_path):
                 on_progress=lambda _result: None,
             )
     assert caught.value.code == "timeout"
+    assert "转录超过deadline_total" in caught.value.message
+    # 被测前提：确实是「持续有效进展」而不是噪声路径。
+    assert sent["progress"] >= 5, sent
 
 
 @pytest.mark.asyncio

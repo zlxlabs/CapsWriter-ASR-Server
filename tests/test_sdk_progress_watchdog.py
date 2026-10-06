@@ -32,6 +32,10 @@ import numpy as np
 import pytest
 import soundfile as sf
 
+# 只读导入服务端协议定义，让夹具发出去的 result 帧就是生产协议真实序列化的形状
+# （含 time_start/time_submit/time_complete 等必填字段），而不是手搓一个子集。
+from core.protocol import ErrorMessage, RecognitionMessage
+
 from sdk.capswriter_asr import AsrError, Transcript, transcribe_file
 from sdk.capswriter_asr import client as sdk_client
 
@@ -95,10 +99,16 @@ class FakeRemote:
         self.final_sent = False
         self.error_sent: dict | None = None
         self.session_ended = False
+        # 对端 socket 实际怎么结束的：eof（读到干净 EOF）/ reset（被 RST）/ None（还活着）
+        self.peer_read_end: str | None = None
         # 读闸：清零后对端不再从 socket 取数据，内核接收窗口随即关闭，
         # 客户端 ws.send 会在真实背压下阻塞。
         self.read_gate = asyncio.Event()
         self.read_gate.set()
+        # 下行结果闸：关掉后 keep_sending_results 停止发帧，用于把「最后一刻进展」
+        # 与 idle 触发时刻分开观察。
+        self.progress_gate = asyncio.Event()
+        self.progress_gate.set()
 
     @property
     def frames_read(self) -> int:
@@ -125,12 +135,15 @@ class FakeRemoteServer:
         progress_interval: float = 0.4,
         on_upload_complete: str = "final",
         error_code: str = "decode_stalled",
+        final_after_frames: int | None = None,
     ) -> None:
         self.read_interval = read_interval
         self.progress_kind = progress_kind
         self.progress_interval = progress_interval
         self.on_upload_complete = on_upload_complete
         self.error_code = error_code
+        # None = 等 is_final 帧；给整数则在读到第 N 帧时就发 final 并停止读取。
+        self.final_after_frames = final_after_frames
         self.remote = FakeRemote()
         self._server: asyncio.AbstractServer | None = None
         self._writers: list[asyncio.StreamWriter] = []
@@ -141,7 +154,11 @@ class FakeRemoteServer:
     async def _read_frame(self, reader: asyncio.StreamReader) -> dict | None:
         try:
             header = await reader.readexactly(2)
-        except (asyncio.IncompleteReadError, ConnectionResetError):
+        except asyncio.IncompleteReadError:
+            self.remote.peer_read_end = "eof"
+            return None
+        except ConnectionResetError:
+            self.remote.peer_read_end = "reset"
             return None
         length = header[1] & 0x7F
         try:
@@ -151,7 +168,11 @@ class FakeRemoteServer:
                 length = int.from_bytes(await reader.readexactly(8), "big")
             mask = await reader.readexactly(4)
             payload = await reader.readexactly(length)
-        except (asyncio.IncompleteReadError, ConnectionResetError):
+        except asyncio.IncompleteReadError:
+            self.remote.peer_read_end = "eof"
+            return None
+        except ConnectionResetError:
+            self.remote.peer_read_end = "reset"
             return None
         return json.loads(_unmask(payload, mask))
 
@@ -162,16 +183,17 @@ class FakeRemoteServer:
         if self.progress_kind == "unknown":
             return json.dumps({"type": "heartbeat", "task_id": remote.task_id})
         task_id = remote.task_id if self.progress_kind == "matched" else "ffffffff-not-mine"
-        return json.dumps({
-            "type": "result", "task_id": task_id, "is_final": False,
-            "text": "进度", "duration": 0.0,
-        })
+        return RecognitionMessage(
+            task_id=task_id, is_final=False, duration=0.0,
+            time_start=0.0, time_submit=0.0, time_complete=0.0, text="进度",
+        ).to_json()
 
     async def _session(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
         remote = self.remote
 
         async def keep_sending_results() -> None:
             while True:
+                await remote.progress_gate.wait()
                 await asyncio.sleep(self.progress_interval)
                 payload = self._progress_payload()
                 if payload is None or (remote.task_id is None and self.progress_kind != "unknown"):
@@ -195,6 +217,13 @@ class FakeRemoteServer:
                     return
                 remote.frames.append(frame)
                 remote.task_id = frame["task_id"]
+                if self.final_after_frames is not None and len(remote.frames) >= self.final_after_frames:
+                    await self._finish(writer)
+                    # 首审 P2-1 形态：回完 final 保持连接、且不再读取。客户端剩余上传帧
+                    # 堆在内核写缓冲里，优雅 close 会卡在 drain 上直到绝对截止取消它。
+                    remote.read_gate.clear()
+                    await remote.read_gate.wait()
+                    return
                 if not frame["is_final"]:
                     continue
                 await self._finish(writer)
@@ -213,19 +242,20 @@ class FakeRemoteServer:
     async def _finish(self, writer: asyncio.StreamWriter) -> None:
         remote = self.remote
         if self.on_upload_complete == "final":
-            writer.write(_encode_server_text(json.dumps({
-                "type": "result", "task_id": remote.task_id, "is_final": True,
-                "text": "背压之后的结果。", "tokens": [], "timestamps": [], "duration": 1.0,
-            })))
+            writer.write(_encode_server_text(RecognitionMessage(
+                task_id=remote.task_id, is_final=True, duration=1.0,
+                time_start=0.0, time_submit=0.0, time_complete=1.0,
+                text="背压之后的结果。",
+            ).to_json()))
             await writer.drain()
             remote.final_sent = True
         elif self.on_upload_complete == "error":
-            remote.error_sent = {
-                "type": "error", "task_id": remote.task_id,
-                "code": self.error_code, "message": f"服务端拒绝：{self.error_code}",
-                "retryable": False,
-            }
-            writer.write(_encode_server_text(json.dumps(remote.error_sent)))
+            error = ErrorMessage(
+                task_id=remote.task_id, code=self.error_code,
+                message=f"服务端拒绝：{self.error_code}", retryable=False,
+            )
+            remote.error_sent = json.loads(error.to_json())
+            writer.write(_encode_server_text(error.to_json()))
             await writer.drain()
         elif self.on_upload_complete == "close":
             # 提前关闭且不发 error/final：客户端必须报 connection_lost。
@@ -606,6 +636,139 @@ async def test_cancellation_under_backpressure_reclaims_everything(long_s16le_au
 
     assert caller in done and caller.cancelled(), "调用方取消没有传播为 CancelledError"
     assert leaked == [], f"取消后 SDK 内部任务未回收：{leaked}"
+
+
+@pytest.mark.asyncio
+async def test_matching_results_refresh_the_diagnostic_last_progress(short_s16le_audio):
+    """连续匹配结果停止后：idle 与诊断消息读同一个 last_at，两者都约等于 1 秒。
+
+    旧实现里 last_at 只由上传侧写，_receive 只发令牌不刷新，于是结果明明一秒前刚到，
+    消息却把整段持续结果的时间算进「距最近进展」（首审 P2-2 的实测：报 2 秒）。
+    """
+    idle = 1.0
+    async with FakeRemoteServer(
+        progress_kind="matched", progress_interval=0.1, on_upload_complete="silent"
+    ) as server:
+        remote = server.remote
+        remote.progress_gate.clear()
+        caller = asyncio.create_task(
+            transcribe_file(short_s16le_audio, server.url, encoding="s16le",
+                            idle_timeout=idle, deadline_total=60,
+                            on_progress=lambda _r: None)
+        )
+        assert await _wait_for_frames(remote, 1, timeout=20)
+        remote.progress_gate.set()
+        await asyncio.sleep(idle * 1.5)  # 先让匹配结果流一段时间
+        flowing = remote.results_sent
+        remote.progress_gate.clear()  # 停发；最后一刻进展就在这一刻
+        stopped_at = time.monotonic()
+        done, _ = await asyncio.wait({caller}, timeout=30)
+        elapsed = time.monotonic() - stopped_at
+
+    assert flowing >= 5, f"被测前提不成立：没有持续到达的匹配结果（{flowing} 条）"
+    assert caller in done
+    error = caller.exception()
+    assert isinstance(error, AsrError) and error.code == "timeout", error
+    # 真正过了 idle 这么久才失败（不是「一停就死」，也不是拖到总预算）。
+    assert idle * 0.6 < elapsed < idle * 2.5, f"停发后 {elapsed:.2f}s 才失败，应约等于 idle"
+    results = _parse_stall_counts(error.message)[2]
+    assert results >= 5, f"被测前提不成立：中途结果计数只有 {results} 条"
+    gap = re.search(r"距最近进展 (\d+) 秒", error.message)
+    assert gap, error.message
+    # 诊断口径与 idle 口径必须是同一个事实：都约等于一个 idle 窗口。
+    assert int(gap.group(1)) <= 1, (
+        f"「距最近进展」把停发前持续结果的时间算进去了：{error.message}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_deadline_during_graceful_close_aborts_the_connection(
+    long_s16le_audio, monkeypatch
+):
+    """绝对截止打断优雅 close 时，连接必须被中止回收，而不是停在 CLOSING。
+
+    复现形态（首审 P2-1）：服务端在上传中途就回 final 然后彻底停止读取，客户端剩余
+    上传帧堆在内核写缓冲里；SDK 拿到 final 后进入优雅 close，close 卡在 drain 上，
+    这时 deadline_total 到点把取消打进 __aexit__。移除修法时下面两条断言必须变红。
+    """
+    async with FakeRemoteServer(
+        progress_kind="none", on_upload_complete="final", final_after_frames=3
+    ) as server:
+        remote = server.remote
+        observer = _CloseObserver()
+        monkeypatch.setattr(sdk_client.websockets, "connect", observer.connect)
+        started = time.monotonic()
+        with pytest.raises(AsrError) as caught:
+            await transcribe_file(long_s16le_audio, server.url, encoding="s16le",
+                                  idle_timeout=30, deadline_total=5)
+        elapsed = time.monotonic() - started
+        leaked = _pending_sdk_tasks()
+
+    assert remote.final_sent is True, "被测前提不成立：final 没真实到达客户端"
+    assert remote.frames_read == 3, remote.frames_read
+    assert caught.value.code == "timeout"
+    assert "转录超过deadline_total" in caught.value.message
+    # 优雅 close 确实被截止打断了（而不是提前 close 完事）：
+    assert observer.exit_started is True and observer.exit_cancelled is True, observer.__dict__
+    # 关键断言：打断之后连接确实被中止回收，而不是停在 CLOSING 让对端会话继续存活。
+    # 读时点必须在 SDK 整个收尾之后 —— 中止发生在 __aexit__ 被取消之后的 finally 里。
+    assert observer.ws.transport.is_closing() is True, (
+        "优雅 close 被截止打断后 transport 未被中止，仍停在 CLOSING（首审 P2-1）"
+    )
+    assert observer.paused_at_exit is True, (
+        f"被测前提不成立：close 开始时写缓冲没有积压（paused={observer.paused_at_exit}）"
+    )
+    assert elapsed < 20, f"显式 deadline_total=5 未在有界时间内终止，实际 {elapsed:.1f}s"
+    assert leaked == [], f"SDK 内部任务未回收：{leaked}"
+
+
+class _CloseObserver:
+    """只观测不动手：记录 __aexit__ 是否被取消、退出后 transport 是否真的被中止。"""
+
+    def __init__(self) -> None:
+        self.exit_started = None
+        self.exit_cancelled = None
+        self.paused_at_exit = None
+        self.ws = None
+        self._cm = None
+        self._ws = None
+        # 必须在 monkeypatch 之前抓住真 connect，否则会自我包装。
+        self._original = sdk_client.websockets.connect
+
+    def connect(self, url, **kwargs):
+        original = self._original
+        outer = self
+
+        class _Wrapped:
+            async def __aenter__(self_):
+                outer._cm = original(url, **kwargs)
+                outer._ws = await outer._cm.__aenter__()
+                outer.ws = outer._ws
+                return self_
+
+            async def __aexit__(self_, *exc):
+                outer.exit_started = True
+                outer.paused_at_exit = outer._ws.paused
+                try:
+                    result = await outer._cm.__aexit__(*exc)
+                except asyncio.CancelledError:
+                    outer.exit_cancelled = True
+                    raise
+                return result
+
+            async def send(self_, message):
+                return await outer._ws.send(message)
+
+            async def recv(self_):
+                return await outer._ws.recv()
+
+            @property
+            def transport(self_):
+                return outer._ws.transport
+
+        connect = _Wrapped()
+        connect.__signature__ = inspect.signature(original)
+        return connect
 
 
 async def _wait_for_frames(remote: FakeRemote, count: int, *, timeout: float) -> bool:

@@ -314,7 +314,7 @@ async def _receive(
     task_id: str,
     on_progress,
     idle_messages: asyncio.Queue,
-    progress: dict,
+    mark_progress: Callable[..., None],
 ) -> Transcript:
     while True:
         try:
@@ -328,8 +328,8 @@ async def _receive(
         # 服务端能把停滞一路藏到绝对墙钟总预算才暴露，而不是在 idle 上暴露。
         if kind not in {"result", "error"} or result.get("task_id") != task_id:
             continue
-        if not idle_messages.full():
-            idle_messages.put_nowait(None)
+        # 匹配消息本身就是进展：idle 计时与诊断快照读同一个 last_at，不另建镜像状态。
+        mark_progress(is_result=kind == "result" and not result.get("is_final", False))
         if kind == "error":
             raise AsrError(
                 result["code"],
@@ -338,7 +338,6 @@ async def _receive(
             )
         if result.get("is_final", False):
             return _transcript(result)
-        progress["results"] += 1
         if on_progress is not None:
             on_progress(result)
 
@@ -365,6 +364,8 @@ async def _transcribe_connected(
     idle_messages: asyncio.Queue = asyncio.Queue(maxsize=1)
     # 进展快照：只放 SDK 自己掌握的事实（阶段/已发帧/中间结果条数/最近进展时刻）。
     # 超时消息按这些事实措辞，不据此推断网络状况或服务端责任。
+    # 生产者：upload 每成功发出一帧、_receive 每收到一条匹配本任务的已知消息，都经
+    # mark_progress 写入；消费者：idle_watch 读令牌计时，stall_error 读这些字段出文案。
     progress = {
         "stage": "上传",
         "frames_sent": 0,
@@ -373,8 +374,11 @@ async def _transcribe_connected(
         "last_at": time.monotonic(),
     }
 
-    def mark_progress() -> None:
+    def mark_progress(*, is_result: bool = False) -> None:
+        """记一次真实进展：刷新最近进展时刻并唤醒 idle 监视。"""
         progress["last_at"] = time.monotonic()
+        if is_result:
+            progress["results"] += 1
         if not idle_messages.full():
             idle_messages.put_nowait(None)
 
@@ -392,6 +396,8 @@ async def _transcribe_connected(
     # TCP 写窗口 —— 证据见 docs/sessions/261006-issue-root-fixes/progress/
     # sdk-progress-progress.md 探针 E：那一次 idle 失败就卡死在这里，调用永不返回。
     # 所以自己接管进入/退出：成功路径仍走优雅关闭，异常/取消路径直接中止传输。
+    # completed 只由「已拿到最终结果」那一条返回置真，用来区分该不该做优雅关闭。
+    completed = False
     connection = websockets.connect(url, **connect_options)
     ws = await connection.__aenter__()
     try:
@@ -449,7 +455,7 @@ async def _transcribe_connected(
                 task_id=task_id,
                 on_progress=on_progress,
                 idle_messages=idle_messages,
-                progress=progress,
+                mark_progress=mark_progress,
             )
         )
         idle_task = asyncio.create_task(idle_watch())
@@ -471,20 +477,27 @@ async def _transcribe_connected(
                     if error is not None:
                         raise error
                 if receive_task in done:
-                    return receive_task.result()
+                    result = receive_task.result()
+                    completed = True
+                    return result
                 tasks.difference_update(done)
         finally:
             for task in tasks:
                 task.cancel()
             await asyncio.gather(*tasks, return_exceptions=True)
-    except BaseException:
-        # 服务端错误帧、idle 停滞、显式预算到点、调用方取消都走这里：调用已经结束，
-        # 再为一个可能已停读的连接做无界关闭没有意义。中止传输让 close() 立刻走
-        # 「连接已断」分支（成功路径不在这里，仍是优雅关闭）。
-        ws.transport.abort()
-        raise
     finally:
-        await connection.__aexit__(None, None, None)
+        # 中止传输覆盖整个连接生命周期，不只是连接主体：
+        # · 异常/停滞/取消（completed 为假）先中止，否则 close() 会卡在 drain 上等一个
+        #   永远不来的写窗口（progress 存档探针 E）。
+        # · 成功路径的优雅 close 若被绝对截止或取消打断（首审 P2-1：final 已真实收到、
+        #   close 已开始，但 transport 仍停在 CLOSING、对端会话仍存活），收尾再补一次中止，
+        #   保证连接一定被回收。abort 对已关闭的传输是空操作，不是第二次 close。
+        if not completed:
+            ws.transport.abort()
+        try:
+            await connection.__aexit__(None, None, None)
+        finally:
+            ws.transport.abort()
 
 
 def _auto_budget(duration: float) -> float:
