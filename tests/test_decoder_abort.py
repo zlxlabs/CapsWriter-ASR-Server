@@ -162,12 +162,8 @@ def _compressed_frame(task_id: str, payload: bytes, encoding: str, *,
 
 
 async def _assert_closed(websocket) -> None:
-    try:
+    with pytest.raises(websockets.ConnectionClosed):
         await asyncio.wait_for(websocket.recv(), timeout=20)
-    except websockets.ConnectionClosed:
-        return
-    raise AssertionError("audio_too_long 错误帧后连接未关闭")
-
 
 def _tracking_decoder_class(real_decoder):
     class TrackingDecoder(real_decoder):
@@ -203,7 +199,6 @@ def _tracking_decoder_class(real_decoder):
             await super().cancel()
 
     return TrackingDecoder
-
 
 async def _run_ws_audio_too_long(
     fake_asr_server, payload: bytes, encoding: str, samples_total: int, *,
