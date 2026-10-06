@@ -10,6 +10,7 @@
 | [`docs/sessions/261006-issue-root-fixes/artifact-inventory.tsv`](../../sessions/261006-issue-root-fixes/artifact-inventory.tsv) | 147 个路径 × 5 栏。`baseline_state` 只说基线有没有该路径；`source_records` 逐条写 `ref@fullsha=source_state`，源侧存在性**独立**判定；`current_consumer_evidence`；`disposition` |
 | [`docs/sessions/261006-issue-root-fixes/artifact-history-appendix.md`](../../sessions/261006-issue-root-fixes/artifact-history-appendix.md) | 当前交付结论依赖的历史审查/否决证据，逐字摘录 + 恢复指针 |
 | [`docs/sessions/261006-issue-root-fixes/progress/artifact-disposition-progress.md`](../../sessions/261006-issue-root-fixes/progress/artifact-disposition-progress.md) | 三阶段进度存档与每阶段结论 |
+| [`docs/sessions/261006-issue-root-fixes/reviews/artifacts-review3-verdict.md`](../../sessions/261006-issue-root-fixes/reviews/artifacts-review3-verdict.md) | R3 verdict 原文存档；记录其 P2 finding 与输入隔离限制，不作为独立放行 |
 
 盘点基线：`e849c21748392ad848131e07ff17d32e4cc83a8b`（含 PR #84、#86）。
 
@@ -68,17 +69,15 @@
 | `in-flight-issue-82` | 4 | #82 的 PR 在途交付，不复制、不当已解决 |
 | `in-flight-other-card` | 4 | 本轮其它卡的产物（设计 SHA `8e93f7e4` 等），不属 #81 |
 
-## 公开自包含复算入口（克隆者可直接跑）
+## 公开来源与摘录检查入口（克隆者可直接跑）
 
 把下面代码块存成 `verify_artifact_disposition.py` 放在仓库根，运行 `python3 verify_artifact_disposition.py`。
-它**只校已冻结的交付物**（TSV 的 449 条来源记录、附录 5 段摘录、本仓文档链接），不扫描整机 refs、
-不重审历史报告、不引入任何依赖或 CI 步骤。四道关：逐条复算 source_state（**来源不可核即失败，不默认 PASS**）、三个负控（虚构路径 / 假 SHA /
-同 blob 不得判「基线含较晚不同内容」）、摘录按**连续完整行字节**核对（含顺序/相邻/空行）并带首字符变异负控、
-文档链接。退出码 0 = 全过。
+它读取 TSV 中的来源记录、附录 5 段摘录和本仓文档链接，不扫描整机 refs、不重审历史报告、不引入任何依赖或 CI 步骤。
+运行输出本次实际读取的路径与来源数量、输入原有的来源状态和去向标签计数，以及具体差异；标签计数只描述输入值，不判断标签是否合法。
+退出码 0 只表示本次执行的来源、摘录和链接检查未发现错误，不证明表格完整、分类合法、消费者关系成立或 #81 已处置。
 
-反例对照（本卡在真实树实测，非沙箱逻辑判断）：把 TSV 任一来源 SHA 换成不存在的 SHA → 报
-`来源不可核` 并退出非零；把附录某段摘录的两行换序 → 报「不是连续原文」并退出非零；两者还原后回到
-`RESULT: PASS`。
+反例对照（本卡在真实树实测，非沙箱逻辑判断）：把 TSV 任一来源 SHA 换成不存在的 SHA → 输出具体来源不可核错误并退出非零；
+把附录某段摘录的两行换序 → 输出连续原文不符并退出非零。移除路径行或改去向标签时，入口只记录修改后本次输入的数量或标签计数，不认证完整性或类别合法性。
 
 ```python
 #!/usr/bin/env python3
@@ -87,6 +86,7 @@ import os
 import re
 import subprocess
 import sys
+from collections import Counter
 
 REPO = os.environ.get("CAPSWRITER_REPO") or os.path.dirname(os.path.abspath(__file__))
 BASE = "e849c21748392ad848131e07ff17d32e4cc83a8b"
@@ -139,13 +139,21 @@ rows = open(os.path.join(REPO, TSV), encoding="utf-8").read().rstrip("\n").split
 assert rows[0].split("\t") == ["path", "baseline_state", "source_records",
                                "current_consumer_evidence", "disposition"], "TSV 表头变了"
 checked = unavailable = 0
+path_count = len(rows) - 1
+source_entries = 0
+source_state_counts = Counter()
+disposition_counts = Counter()
+source_mismatches = 0
 for i, line in enumerate(rows[1:], start=2):
     path, _bstate, srcs, ev, disp = line.split("\t")
+    disposition_counts[disp] += 1
     if not (srcs.strip() and ev.strip() and disp.strip()):
         fail.append(f"line {i}: 有空来源/证据/去向格")
         continue
     for entry in srcs.split(" "):
+        source_entries += 1
         ref_sha, _, state = entry.rpartition("=")
+        source_state_counts[state] += 1
         sha = ref_sha.split("@", 1)[1]
         got, _blob = observed(sha, path)
         if got == "OBJECT_UNAVAILABLE" or got.startswith("QUERY_ERROR"):
@@ -156,9 +164,8 @@ for i, line in enumerate(rows[1:], start=2):
             continue
         checked += 1
         if got != state:
+            source_mismatches += 1
             fail.append(f"line {i}: {path} {sha[:12]} 记录 {state} 与实况 {got} 不符")
-print(f"[1] 冻结盘点表：已核 {checked} 条来源记录，状态不符 {len(fail)} 条；"
-      f"来源不可核 {unavailable} 条（不可核即失败，不计入通过）")
 
 any_sha = rows[1].split("\t")[2].split(" ")[0].rpartition("=")[0].split("@", 1)[1]
 k1, _ = tree(any_sha, "docs/__no_such_file_261006__.md")
@@ -226,9 +233,21 @@ for d in DOCS:
 print(f"[4] 文档链接断链 {len(broken)} 条 {broken[:3]}")
 fail.extend(broken)
 
-print("RESULT:", "PASS" if not fail else "FAIL")
-for f in fail[:20]:
-    print("  FAIL:", f)
+def counts(counter):
+    return ", ".join(f"{key}={value}" for key, value in sorted(counter.items())) or "(无)"
+
+
+print(f"[1] 本次输入事实：读取路径 {path_count}；来源记录 {source_entries}；"
+      f"已核 {checked}；不可核 {unavailable}；状态差异 {source_mismatches}")
+print(f"[1] TSV 原有来源状态计数：{counts(source_state_counts)}")
+print(f"[1] TSV 原有去向标签计数：{counts(disposition_counts)}")
+print(f"[检查] 发现具体差异或错误 {len(fail)} 条")
+for f in fail:
+    print("ERROR:", f)
+if fail:
+    print("退出码 1：本次至少一项来源、摘录、负控或链接检查报告错误。")
+else:
+    print("退出码 0：本次已执行的来源、摘录和链接检查未发现错误；不证明表格完整、分类合法、消费者关系成立或 #81 已处置。")
 sys.exit(0 if not fail else 1)
 ```
 
@@ -253,6 +272,12 @@ sys.exit(0 if not fail else 1)
 **边界**：以上六项是「本轮不恢复」，不是「永久退役」，也不是「已被取代」这一既成事实。
 需要时按「重开条件」重新评估，不因本表存在就默认已关闭。
 
+## R3 verdict 来源
+
+`artifacts-review3-verdict.md` 精确纳入原提交 `ee8b24e6605a34c836e78b59e44085be344469e2` 的原 blob
+`f7acdc786ba716593b4064855a564a78b5c6091c`。原 verdict 记录一项 P2 finding、执行结果 `failed` 及输入隔离偏差；
+其历史预算与失败记录保持原样。该文件仅作来源存档，不能据此或顾问只读意见认定独立审查放行。
+
 ## 本轮同时订正的一处事实
 
 [`docs/development/testing.md:18`](../testing.md) 原写「上游单测与 **lint** 由 ci.yml 跑」。实际
@@ -273,5 +298,5 @@ sys.exit(0 if not fail else 1)
 ## 关单与边界
 
 本卡**只交付证据**，不改 #81 的状态、不关单、不替其他主脑关闭 issue/PR、也不回洗 M6 历史验收。
-关闭 #81 的判定：上表 10 类 disposition 逐项有去向、引用可读、历史结论未被改写、
-`docs/development/testing.md` 描述与实际 CI 一致；由 Pi 主脑核对后在 #81 记录决定人与日期再按谓词关单。
+本入口只记录来源、摘录和链接检查的本次事实；退出码 0 不构成整体认证，也不是 #81 的关单信号。
+关闭 #81 仍由 Pi 主脑依据固定 TSV、真实 Git 对象及当前消费者与去向证据人工核对，并在 #81 记录决定人与日期后按谓词关单。
