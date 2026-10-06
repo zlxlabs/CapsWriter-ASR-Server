@@ -56,9 +56,9 @@
 - 关键决策与已否决方案：子进程用 `run_until_complete` 后立刻 `os._exit`，避免 `asyncio.run` 关机等待挂住的 handler；否决在同一事件循环里用 `wait_for`/`shield` 包 `cancel()`，因为它取消不了已登记的 `process.wait()`。
 - 下一步唯一动作：红验 a/b/c 后跑 Narrow-Verify 与 Verify-Command。
 
-## 里程碑 8：续修有界回归
+## 里程碑 9：续修验证收尾
 
-- 当前阶段：implementation / resume P2-1
-- 本段结论：排空函数改为公开名 `drain_subprocess_pipes`；末帧在消费失败检查后直接 `await finish`；取消/末帧/WS 越线用例改到 spawn 进程组，超时由父进程 `killpg`，不依赖被测 cleanup 返回。
-- 关键决策与已否决方案：子进程用 `run_until_complete` 后立刻 `os._exit`，避免 `asyncio.run` 关机等待挂住的 handler；否决在同一事件循环里用 `wait_for`/`shield` 包 `cancel()`，因为它取消不了已登记的 `process.wait()`。
-- 下一步唯一动作：红验 a/b/c 后跑 Narrow-Verify 与 Verify-Command。
+- 当前阶段：verification / resume closeout
+- 本段结论：红验 a 在 68s 内 7 项 AssertionError、HTTP 仍绿、无残留 ffmpeg；红验 b 末帧两编码 11s 内 AssertionError；还原后 8 passed。Narrow-Verify 61 passed；Verify-Command 520 passed、3 skipped。
+- 关键决策与已否决方案：无新增决策。
+- 下一步唯一动作：推送 draft PR #94。
