@@ -68,9 +68,10 @@ python -m capswriter_asr meeting.m4a --url ws://127.0.0.1:6016 --encoding s16le 
 
 HTTP 文件入口直接连接固定的 ASR HTTP 地址，上传的是原文件二进制，不会在客户端
 额外转码或把文件改成有损格式。它使用 HTTPX 0.28.1，并关闭环境代理、重定向和库级
-重试；网络失败后不会自动重发，也不会回退到 WebSocket。当前服务端 HTTP 文件任务由
-后续增量交付，服务端 HTTP 监听默认关闭；本节的 SDK/CLI 不能单独让尚未实现该接口的
-服务端可用。
+重试；网络失败后不会自动重发，也不会回退到 WebSocket。服务端需显式启用 HTTP 文件
+入口（`CW_HTTP_PORT` 与 `CW_HTTP_DATA_DIR` 成对配置）；HTTP 端口与 WebSocket 端口
+相互独立，`--url` 必须写 HTTP 端口，不是 WS 端口。协议细节与不依赖 SDK 的 curl
+接入流程见[服务协议的 HTTP 文件任务一节](../docs/reference/protocol.md#http-文件任务)。
 
 提交前 SDK 会先把包含领取凭据的恢复文件原子写入指定路径并设为用户私有权限。该文件
 是恢复上传、查询状态和领取结果的唯一凭据，应放在安全位置，不要提交到版本库、复制到
@@ -78,19 +79,19 @@ HTTP 文件入口直接连接固定的 ASR HTTP 地址，上传的是原文件�
 
 ```bash
 python -m capswriter_asr http submit meeting.m4a \
-  --url http://127.0.0.1:6017 \
+  --url http://127.0.0.1:7017 \
   --resume-file ~/.capswriter/meeting.resume.json
 
 python -m capswriter_asr http resume meeting.m4a \
-  --url http://127.0.0.1:6017 \
+  --url http://127.0.0.1:7017 \
   --resume-file ~/.capswriter/meeting.resume.json
 
 python -m capswriter_asr http status \
-  --url http://127.0.0.1:6017 \
+  --url http://127.0.0.1:7017 \
   --resume-file ~/.capswriter/meeting.resume.json
 
 python -m capswriter_asr http result \
-  --url http://127.0.0.1:6017 \
+  --url http://127.0.0.1:7017 \
   --resume-file ~/.capswriter/meeting.resume.json \
   --out-dir subtitles --format srt,txt,json
 ```

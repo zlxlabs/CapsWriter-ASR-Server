@@ -1,6 +1,6 @@
 # WebSocket 语音识别协议
 
-本文说明 CapsWriter ASR Server 与下游客户端之间的 WebSocket 和 HTTP `/health` 协议。新客户端应使用 v2；服务端保留 v1 上行兼容。Python 项目可优先使用 [SDK](../../sdk/README.md)，其他语言可按本文直接接入。
+本文说明 CapsWriter ASR Server 与下游客户端之间的 WebSocket、HTTP `/health` 与 HTTP 文件任务协议。新客户端应使用 v2；服务端保留 v1 上行兼容。Python 项目可优先使用 [SDK](../../sdk/README.md)，其他语言可按本文直接接入。
 
 ## 连接与健康检查
 
@@ -182,21 +182,94 @@ proxy 对带 `encoding` 的 v2 任务只选择协议版本不低于 2 且支持�
 
 SDK 默认编码为 `flac`，因此服务端也必须在 PATH 中安装 `ffmpeg` 且健康检查需列出 `flac`。首次部署可选 `s16le` 避免服务端压缩解码依赖；SDK 客户端本机始终只需要 `ffmpeg`。SDK 每个任务前检查 `/health`，并发上传和接收。SDK 本地转码对 ffmpeg 显式传 `-map 0:a:0`，多音轨文件只转录第一条音轨（视频轨与字幕轨不进入解码图）；文件无音轨时 ffmpeg 非零退出并抛出 `AsrError('decode_failed')`。默认时限分两段计时：本地准备阶段（`/health` 检查、转码、样本计数）受入口的 120 秒上限约束；本地阶段结束后，转录预算 `音频时长 × 4 + 120 秒` 从那一刻重新起算，转码耗时不再计入该预算，其中音频时长由 SDK 解码自己发出的字节流得出。显式传入 `deadline_total` 时不自动放宽，它是整个 `transcribe_file` 调用的墙钟上限（含本地准备阶段），从进入函数起算。自动预算是 watchdog（挂死检测），不是识别时限 SLA：它只在服务端不再推进时把调用救回来，正常识别远快于它；确需更长预算请显式传 `deadline_total`。超时消息按路径如实点明被超过的预算（默认路径是自动预算，显式传参才是 `deadline_total`），并写明卡在「本地准备」还是「远端转录」阶段。`idle_timeout` 默认 300 秒，语义是**距上一次真实进展**的上限，从连接建立起就生效并覆盖上传阶段：真实进展只包括上传阶段成功发出的一帧，以及收到一条解析后与本次 `task_id` 匹配的已知消息（`result` / `error`）。因此服务端停止读取但仍在回中间结果的正常背压不会被误杀，而协议未定义的 `type` 与其它 `task_id` 的消息会被忽略且不刷新该计时，停滞会在 idle 上暴露而不是被拖到绝对墙钟预算才失败。停滞消息只陈述 SDK 掌握的事实（阶段、已发送/总帧数、中间结果条数、距最近进展秒数），不推断网络或服务端责任。越过截止时间或连续无进展时会抛出 `AsrError`。它不自动重试。完整安装与调用示例见 [SDK 文档](../../sdk/README.md)。
 
-## HTTP 文件任务（默认关闭，M3 补齐推理）
+## HTTP 文件任务
 
-HTTP 文件任务是与 WebSocket 并列的独立入口，只有在同时显式提供 `CW_HTTP_PORT` 和稳定绝对路径 `CW_HTTP_DATA_DIR` 时才启用；两者必须成对出现，HTTP 端口不得与 WebSocket 端口相同，监听地址沿用 `CW_ADDR`。端口非法、数据目录不可用、数据目录被另一个 server 实例独占等情况一律启动失败并非零退出，不自动选端口、不退回关闭状态。运行时依赖 `aiohttp==3.14.3`（Python ≥ 3.10），仅在显式启用时按需导入；未启用的旧服务不因新增依赖被迫升级解释器。
+HTTP 文件任务是与 WebSocket 并列的独立入口，只有在同时显式提供 `CW_HTTP_PORT` 和稳定绝对路径 `CW_HTTP_DATA_DIR` 时才启用；两者必须成对出现，HTTP 端口不得与 WebSocket 端口相同，监听地址沿用 `CW_ADDR`。端口非法、数据目录不可用、数据目录被另一个 server 实例独占等情况一律启动失败并非零退出，不自动选端口、不退回关闭状态。运行时依赖 `aiohttp==3.14.3`（Python ≥ 3.10），仅在显式启用时按需导入。启用后服务端会同时装配文件推理 runner，把 commit 受理的原文件用固定参数 ffmpeg 解码为 16 kHz 单声道 PCM，再复用与 WebSocket 相同的分段与识别链；因此启用 HTTP 还要求服务端 `PATH` 中有 `ffmpeg`，缺失同样启动失败。
 
-该入口当前只提供上传与查询底座：外部 `commit` 在真实文件推理协调者装配之前（M3 之前）明确返回 `503 inference_unavailable`，不会受理后永远排队；已存在的 Job 重复 `commit` 仍返回同一 `job_id`。
+### 鉴权
+
+每个请求都必须携带 `Authorization: Bearer <token>`，缺失返回 401 `unauthorized`。令牌由客户端自行生成（SDK 用 `secrets.token_hex(32)`），服务端只保存其 SHA-256 指纹并用常量时间比较，日志与数据库都不出现明文。同一令牌必须用于该上传/任务的全部请求（建上传、PATCH、commit、查状态、取结果）；令牌只存在于客户端，服务端无法找回，丢失令牌即无法继续上传或取回结果。上传与任务编号仅用于查找、不赋权：未知资源与错误令牌一律 404 `not_found`，不区分泄露。
+
+### 提交参数 options
+
+`POST /v1/uploads` 的小 JSON 中 `options` 可整体省略；受理时按下列字段归一化并冻结，此后不可修改。出现未知字段或类型不符返回 400 `invalid_options`：
+
+| 字段 | 类型 | 默认 | 说明 |
+|---|---|---|---|
+| `model` | string 或 null | null | 有值时必须与服务端当前模型一致；不符的任务在开始执行时以 `bad_request` 失败 |
+| `language` | string 或 null | null | 识别语言；执行时缺省按 `auto` |
+| `context` | string 或 null | null | 热词上下文；执行时缺省按空字符串 |
+| `seg_duration` | number | 15.0 | 名义分段时长，必须 ≥ 5 |
+| `seg_overlap` | number | 2.0 | 分段重叠，必须 ≥ 0 且 < `seg_duration / 2` |
+
+三个字符串字段必须可被 UTF-8 表示；两个数字字段必须是有限非负数，不接受布尔值。`seg_duration`/`seg_overlap` 在受理前按与 WebSocket 共用的同一条规则校验，含引擎单段上限预算（切点搜索延长量与 overlap 计入最长段长，Qwen3 系引擎上限 80 秒），违规同为 400 `invalid_options`。
 
 | 方法/route | 成功 | 失败 |
 |---|---|---|
 | `POST /v1/uploads` | 小 JSON（≤16 KiB）：`size_bytes>0`、`sha256`（64 hex）、`options`；`Idempotency-Key` + Bearer。首次 201；相同 key+token+同身份参数返回 200 同一 `upload_id` | 400 参数、409 同 key 不同内容、411 未声明长度、413 体积、415 编码/媒体类型、429 会话数、507 容量 |
 | `GET /v1/uploads/{id}` | 200：`upload_id`/`state`/`size_bytes`/`sha256`/`confirmed_offset`/`expires_at`（UTC ISO）/`job_id?` | 404 未知或错 token、410 过期、503 存储不可读 |
-| `PATCH /v1/uploads/{id}` | 原字节、确定 `Content-Length`、`Upload-Offset`；仅在字节 fsync 与 offset 事务成功后 204 + 新 `Upload-Offset` | 409 旧/超前 offset 或非 UPLOADING 并带可信 `confirmed_offset`、413 超块或超长、415 编码/媒体类型 |
-| `POST /v1/uploads/{id}/commit` | offset=size 且实际长度与 hash 相同后同一事务建立唯一 Job，首次 202；重复 200 同一 `job_id` | 409 未写完、410 过期、422 完整性错、429/507 准入满、503 `inference_unavailable` |
+| `PATCH /v1/uploads/{id}` | 原字节、确定 `Content-Length`、`Upload-Offset`；仅在字节 fsync 与 offset 事务成功后 204 + 新 `Upload-Offset` | 409 旧/超前 offset 或非 UPLOADING 并带可信 `confirmed_offset`、413 超块或超长、415 编码/媒体类型、507 磁盘余量不足 |
+| `POST /v1/uploads/{id}/commit` | offset=size 且实际长度与 hash 相同后同一事务建立唯一 Job，首次 202；重复 200 同一 `job_id` | 409 未写完、410 过期、422 完整性错、429/507 准入满、503 `inference_unavailable`（见下） |
 | `GET /v1/jobs/{id}` | 200：`job_id`/`state`（`QUEUED`/`RUNNING`/`DONE`/`FAILED`）/`error_code`/`result_available`/`source_available`/`time_start`/`time_submit`/`time_complete` | 404 未知/无权、503 查询不可用 |
 | `GET /v1/jobs/{id}/result` | DONE 时 200 完整识别结果 | 409 `result_not_ready` / `job_failed` |
 
-上传状态为 `UPLOADING`/`COMMITTED`（过期对外表现为 410），任务状态为 `QUEUED`→`RUNNING`→`DONE`/`FAILED`。令牌只存指纹（SHA-256 + 常量时间比较），任务编号仅用于查找与排错、不赋权；未知资源与错误令牌同为 404，不区分泄露。错误体为 `{"code", "message", "request_id"}`，offset 冲突额外带 `confirmed_offset`。请求体不接受 Base64/JSON 包装或任何额外 `Content-Encoding`。
+上传状态为 `UPLOADING`/`COMMITTED`（过期对外表现为 410），任务状态为 `QUEUED`→`RUNNING`→`DONE`/`FAILED`。错误体为 `{"code", "message", "request_id"}`，offset 冲突额外带 `confirmed_offset`，FAILED 任务的查询会额外带已持久化的 `error_code`。请求体不接受 Base64/JSON 包装或任何额外 `Content-Encoding`。
+
+推理已随服务端装配：commit 即受理并调度识别，正常情况下不会出现 `inference_unavailable`。503 `inference_unavailable` 只发生在受理边界：commit 时识别协调者恰好不可用（服务端正在停机，或 ffmpeg 不再可用）则不受理该上传，upload 仍为 `UPLOADING`，可修复后重试；已受理但立即调度失败时，任务在同一时刻被置为 `FAILED`（`error_code=inference_unavailable`）并返回 503。同一已受理 upload 重复 commit 不重跑，始终幂等返回同一 `job_id`。
+
+### 结果格式
+
+`GET /v1/jobs/{id}/result` 仅在 `DONE` 时返回 200 JSON，字段如下：
+
+| 字段 | 类型 | 说明 |
+|---|---|---|
+| `task_id` | string | 等于 `job_id` |
+| `type` | string | 恒为 `"file"` |
+| `socket_id` | string | 恒为空字符串（HTTP 任务没有 socket） |
+| `owner_kind` | string | 恒为 `"http"` |
+| `is_final` | boolean | 恒为 `true` |
+| `text` | string | 普通回显稿，语义独立于 `text_accu` |
+| `text_accu` | string | 按时间信息合并的文本；`"".join(tokens) == text_accu` |
+| `tokens` | string[] | 与 `timestamps` 等长，按下标配对 |
+| `timestamps` | number[] | 各 token 的起点时间，单位秒 |
+| `duration` | number | 已处理音频时长，单位秒 |
+| `time_start` / `time_submit` / `time_complete` | number | 受理、片段提交、任务完成的 Unix 时间戳 |
+
+时间单位均为秒；时间轴按服务端解码后的 16 kHz 单声道 PCM 采样计（与 WebSocket 文件任务同一口径），不是源文件的容器时长。`tokens`/`timestamps`/`text_accu` 遵守「下行结果与错误」一节的同一份字幕契约。结果 JSON 整体上限 64 MiB，超限时任务以 `result_too_large` 失败。
+
+### curl 流程示例
+
+不依赖 SDK 的最小流程（`UPLOAD_ID`、`JOB_ID` 取自前一步响应；HTTP 端口由 `CW_HTTP_PORT` 单独配置，不是 WebSocket 端口）：
+
+```sh
+BASE=http://127.0.0.1:7017
+TOKEN=$(openssl rand -hex 32)
+KEY=$(openssl rand -hex 32)
+SIZE=$(wc -c < meeting.m4a)
+SHA=$(sha256sum meeting.m4a | awk '{print $1}')
+
+# 1) 建上传：Idempotency-Key 由客户端生成并保存，响应丢失后凭同一个 key 幂等重试
+curl -X POST "$BASE/v1/uploads" \
+  -H "Authorization: Bearer $TOKEN" -H "Idempotency-Key: $KEY" \
+  -H "Content-Type: application/json" \
+  -d "{\"size_bytes\":$SIZE,\"sha256\":\"$SHA\",\"options\":{\"seg_duration\":15}}"
+# 201 → {"upload_id":"…","state":"UPLOADING","confirmed_offset":0,"expires_at":"…"}
+
+# 2) 按块 PATCH 原始字节：每块 ≤1 MiB，Upload-Offset 等于服务端已确认位置（从 0 起）
+head -c 1048576 meeting.m4a | curl -X PATCH "$BASE/v1/uploads/$UPLOAD_ID" \
+  -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/octet-stream" \
+  -H "Upload-Offset: 0" --data-binary @-
+# 204 → 响应头 Upload-Offset 返回新确认位置；循环直到确认位置等于 size_bytes
+
+# 3) commit：核对完整性与长度后建立任务
+curl -X POST "$BASE/v1/uploads/$UPLOAD_ID/commit" -H "Authorization: Bearer $TOKEN"
+# 202 → {"job_id":"…","state":"QUEUED",…}
+
+# 4) 轮询任务状态，直到 DONE 或 FAILED
+curl "$BASE/v1/jobs/$JOB_ID" -H "Authorization: Bearer $TOKEN"
+
+# 5) 取结果：仅 DONE 时返回 200；FAILED 返回 409 job_failed 并带 error_code
+curl "$BASE/v1/jobs/$JOB_ID/result" -H "Authorization: Bearer $TOKEN"
+```
 
 服务端持久化语义：单目录 OS 独占锁、SQLite（WAL + `synchronous=FULL` + `foreign_keys=ON` + `busy_timeout=0`）、提交顺序固定为「字节 → fsync → offset 记录 → ACK」，SQLite busy 不重试也不假装 ACK。重启只把旧 `QUEUED`/`RUNNING` 标为 `FAILED`（`server_restarted`），已确认前缀与已完成结果不动。资源起点（1 GiB/file、1 MiB/PATCH、64 KiB/read、16 KiB JSON、16 handler、2 同时 body、32 未完成上传、8 个 QUEUED+RUNNING、64 MiB 结果、16 GiB source 声明预留、2 GiB DB/WAL 整体 guard、2 GiB 剩余磁盘余量、32 I/O mailbox）见设计文档。
