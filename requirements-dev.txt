@@ -10,4 +10,4 @@ pytest>=9.1.1           # 测试框架
 soundfile               # 音频文件读写
 pytest-asyncio>=1.4.0   # 异步测试支持
 httpx==0.28.1           # SDK 的 HTTP 客户端
-aiohttp==3.14.3         # proxy 与 SDK 的异步 HTTP
+aiohttp==3.14.3         # 服务端 HTTP 文件任务入口（core/server/http_server.py）
