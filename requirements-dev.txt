@@ -1,0 +1,13 @@
+# 测试依赖清单：CI（.github/workflows/ci.yml「安装依赖」步骤）与本机测试环境从此文件同源安装。
+# 不要装进系统 Python 或 ~/.local：真实子进程测试会替换 HOME，用户目录里的包对子进程不可见。
+# websockets 在此不锁版本，CI 矩阵以 "websockets==15.0.1" 等约束追加控制。
+
+numpy                   # 数组运算，PCM 音频数据
+rich                    # 服务端终端输出
+websockets              # WebSocket 服务端与 SDK 客户端（版本由 CI 矩阵追加约束）
+colorama                # 终端颜色支持
+pytest>=9.1.1           # 测试框架
+soundfile               # 音频文件读写
+pytest-asyncio>=1.4.0   # 异步测试支持
+httpx==0.28.1           # SDK 的 HTTP 客户端
+aiohttp==3.14.3         # proxy 与 SDK 的异步 HTTP

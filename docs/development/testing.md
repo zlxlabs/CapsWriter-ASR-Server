@@ -1,5 +1,17 @@
 ## 测试
 
+### 本机环境
+
+在本机跑全量测试时，先建独立虚拟环境再从 `requirements-dev.txt` 安装（与 CI 同一清单）：
+
+```sh
+uv venv .venv-test --python 3.12
+uv pip install --python .venv-test/bin/python -r requirements-dev.txt
+.venv-test/bin/python -m pytest -q tests
+```
+
+不要装进系统 Python 或 `~/.local`：真实子进程测试（如 `tests/test_http_supervision.py`）会替换 HOME，用户目录里的包对子进程不可见。`.venv-test/` 已在 `.gitignore`，不会入库。
+
 正式测试位于 [`tests/`](../../tests/)。完整验证命令：
 
 ```sh
