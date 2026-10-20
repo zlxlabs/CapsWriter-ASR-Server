@@ -75,3 +75,93 @@ router: attempts=['ws://a'] a_healthy=True a_failures=1 b_healthy=True error=NoH
 真实部署可触发性：默认需单个推理段超过 600 秒（10 分钟），或部署主动调低该环境变量；≤10 人时不常见，但单个挂住的 HTTP 推理段会中断其它活跃 WS/HTTP 任务。
 
 修复方向：明确 HTTP 单任务超时与整个 worker/服务不可恢复故障的边界，避免仅一条任务超时就终结所有任务。
+
+## 6. 已过期未完成上传仍占用 16 GiB 源预留
+
+结论：CONFIRMED
+
+代码证据：`core/server/http_store.py:378-392` 的懒过期只把 `UPLOADING` 改为 `EXPIRED`；`:427-450` 的 `_iter_present_sources` 对所有 uploads 行统计，只排除源文件已经不存在的记录，`_reserved_source_bytes` 按声明长度计费且不看状态。`cleanup_terminal_sources` 明确只将未完成上传改为 `EXPIRED` 并保留 partial 文件与 source-presence 计费（`:777-791`）；创建时的源预留上限为 16 GiB（`:526-536`）。
+
+实测证据：`PYTHONPATH=. python /tmp/cw-261020-probe/store_probe.py` 输出：
+
+```text
+expiry: rows=16 expired=16 source_files=16 reserved_before=17179869184 next=source_reserve_full/507
+```
+
+探针在临时 SQLite/源目录中创建 16 个声明为 1 GiB 的空上传文件，再按生产清理方法过期；第 17 次创建返回 507。
+
+真实部署可触发性：无需上传实际 16 GiB，16 个 1 GiB 未完成上传过期后即可占满声明预留；≤10 人也能在多次中断上传后累计触发，需清理数据目录/元数据才能恢复准入。
+
+修复方向：过期未完成上传时释放其源文件和对应声明预留，或使容量核算不再把可回收过期记录永久计费。
+
+## 7. IncompleteRead 会终止 proxy 的周期探活协程
+
+结论：CONFIRMED
+
+代码证据：`core/proxy/proxy_server.py:25-34` 通过 `response.read()` 读取健康响应；`:268-284` 周期探活循环没有外围异常处理，`_probe_backends` 用默认 `asyncio.gather`，而 `_probe_backend` 只捕获 `OSError`、`URLError`、`TimeoutError`。`http.client.IncompleteRead` 不属于这几个类，因此异常会穿出 `gather` 并结束 `_health_probe_loop`；探活任务由 `:43-47` 创建，没有运行期重启路径。
+
+实测证据：`PYTHONPATH=. python /tmp/cw-261020-probe/runtime_probe.py` 输出：
+
+```text
+probe: propagated=IncompleteRead caught_by_fallback=False
+```
+
+探针把真实 health reader 替换为抛出 `IncompleteRead` 的无网络桩，直接调用生产 `_probe_backend`。
+
+真实部署可触发性：健康端点在返回体期间断开/截断就能产生该异常；一次异常后周期探活停止，proxy 不再用健康响应更新后端状态。
+
+修复方向：把 HTTP 响应读取可能抛出的协议异常纳入探活结果处理，避免异常退出整个周期协程。
+
+## 8. SDK HTTPX 默认 5 秒超时会把慢 commit 映射成 timeout
+
+结论：CONFIRMED
+
+代码证据：`sdk/capswriter_asr/http_client.py:608-612` 创建 `httpx.AsyncClient` 时没有指定 timeout；`:296-320` 将 `httpx.TimeoutException` 映射成 `AsrError("timeout")`。服务端在 `core/server/http_server.py:546-594` 等待同步 commit 后才返回 202；commit 在 `core/server/http_store.py:703-724` 校验整文件并创建 Job。SDK 已先持久化本地恢复信息（`http_client.py:597-606`），恢复入口会重新查询服务端上传状态并可识别已提交 Job（`:632-650`）。
+
+实测证据：`PYTHONPATH=. python /tmp/cw-261020-probe/runtime_probe.py` 输出：
+
+```text
+httpx_timeout: connect=5.0 read=5.0 write=5.0 pool=5.0
+```
+
+同一条 HTTPX 请求在无响应超过默认 read timeout 后会被 `_request` 转成上述 `AsrError("timeout")`；服务端的哈希计算发生在提交响应之前。
+
+真实部署可触发性：文件 commit 校验超过 5 秒即可触发，1 GiB 文件在读取吞吐低于约 205 MiB/s 时满足；≤10 人慢盘部署可能遇到。恢复文件可用于显式续接，因此是提交结果不确定/误报超时，不等于 Job 或源文件丢失。
+
+修复方向：让 SDK commit 等待期限与受理前整文件校验的允许耗时一致，并保留当前恢复能力。
+
+## 9. WS 终态迟到帧检查在正常状态转移后不可达
+
+结论：CONFIRMED
+
+代码证据：`core/server/connection/ws_recv.py:486-527` 每轮从 `connection_tasks` 取活动任务；`:552-592` 在 `active is None` 时重新准入并 `begin_task`；之后 `:611-613` 才检查终态。`core/server/state.py:366-389` 的 `transition_terminal` 对 WS 任务先弹出 `connection_tasks`。同一个迟到 task_id 因此会走新的 `begin_task`，它覆写 `state.tasks[key]` 为新生命周期（`:322-345`），终态检查看到 `RECEIVING`。
+
+实测证据：`PYTHONPATH=. python /tmp/cw-261020-probe/runtime_probe.py` 输出：
+
+```text
+late_frame: mapped_after_terminal=False status_after_begin=RECEIVING terminal_branch=False
+```
+
+探针调用生产 `begin_task`、`transition_terminal`，再模拟同一 task key 被重新受理；终态映射已删除，重建记录状态非终态。
+
+真实部署可触发性：客户端在同一 WebSocket 连接中于任务完成/失败后再发同 task_id 的迟到音频帧，就会重新进入准入流程；结果可能是重复推理或覆盖旧内存生命周期。
+
+修复方向：在重新登记之前保留并检查该连接上已终结 task_id 的身份，避免迟到帧被当成新任务。
+
+## 10. Linux 上 GPU boost 的管理员检测恒为 False
+
+结论：CONFIRMED
+
+代码证据：`core/server/worker/gpu_boost.py:26-40` 在命令任务上先调用 `_check_admin`，False 即记录“非管理员权限”并返回；`:67-73` 只用 `ctypes.windll.shell32.IsUserAnAdmin()`，并把异常吞成 False。`config_server.py:84-88` 的功能开关默认关闭，但 `docs/guides/显卡加速的若干问题.md:33-35` 允许在当前平台支持命令与权限时启用。
+
+实测证据：`PYTHONPATH=. python /tmp/cw-261020-probe/runtime_probe.py` 输出：
+
+```text
+gpu_admin_linux: windll=False result=False
+```
+
+探针在当前 Linux Python 进程调用真实静态方法；当前身份是否为 root 不影响 `windll` 属性不存在。
+
+真实部署可触发性：Linux/NVIDIA 用户启用该可选功能且配置可运行的 boost 命令时必触发检测失败；默认关闭，未启用时不影响常规识别。
+
+修复方向：按平台检测执行命令所需权限，使 Linux 上管理员身份不会被误报为无权限。
