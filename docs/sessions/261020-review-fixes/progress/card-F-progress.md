@@ -34,3 +34,10 @@
 - 本段结论：`_run_bare_probe` 显式传 `PYTHONUSERBASE=site.getuserbase()`，子进程在 `HOME=tmp_path` 时仍能加载用户 site；`_wait_for` 失败带 stderr。base 上该测试红（`未等到 HTTP_LISTENER_READY=`）。
 - 关键决策与已否决方案：不拷贝父进程整份 environ（保持无 PI/DELEGATE 身份）。卡面 `HOME=/tmp/cw-home-probe python -m pytest ...` 会让父进程 conftest 丢 numpy，需父进程也带 PYTHONUSERBASE 才能收集测试。
 - 下一步唯一动作：跑 Narrow-Verify 与全量测试，做 scope check，push。
+
+## 2026-10-20 验收与入库
+
+- 当前阶段：implementing
+- 本段结论：Narrow-Verify 29 passed；scope check 通过；全量 7 failed 均不在本卡文件，主干基线不可用故标未能判定。准备 push。
+- 关键决策与已否决方案：不越界改 test_http_cleanup / test_harness_shutdown / test_http_qa_e2e / test_ws_progress_watchdog。
+- 下一步唯一动作：push 并写 report.md。
