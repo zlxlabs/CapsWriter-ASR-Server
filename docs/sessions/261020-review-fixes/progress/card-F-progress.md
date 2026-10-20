@@ -27,3 +27,10 @@
 - 本段结论：协议资源起点不再写「8 个 QUEUED+RUNNING」；改为 HTTP+WS 共享 `max_tasks`，HTTP 预算 `http_job_budget(max_tasks)=max_tasks-WS_RESERVED_SLOTS`（当前默认 6）。`grep -n "8 个" docs/reference/protocol.md` 已无匹配。
 - 关键决策与已否决方案：只改文档，不改协议字段与错误码词表。
 - 下一步唯一动作：给 `_run_bare_probe` 传 `PYTHONUSERBASE`，`_wait_for` 失败带上 stderr。
+
+## 2026-10-20 裸探针 HOME 隔离
+
+- 当前阶段：implementing
+- 本段结论：`_run_bare_probe` 显式传 `PYTHONUSERBASE=site.getuserbase()`，子进程在 `HOME=tmp_path` 时仍能加载用户 site；`_wait_for` 失败带 stderr。base 上该测试红（`未等到 HTTP_LISTENER_READY=`）。
+- 关键决策与已否决方案：不拷贝父进程整份 environ（保持无 PI/DELEGATE 身份）。卡面 `HOME=/tmp/cw-home-probe python -m pytest ...` 会让父进程 conftest 丢 numpy，需父进程也带 PYTHONUSERBASE 才能收集测试。
+- 下一步唯一动作：跑 Narrow-Verify 与全量测试，做 scope check，push。
