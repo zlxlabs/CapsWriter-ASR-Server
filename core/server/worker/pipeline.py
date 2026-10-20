@@ -49,17 +49,14 @@ class TaskPipeline:
 
     def _process_simple_merge(self, result: Result, stream_result_text: str) -> None:
         """ 处理简单文本拼接（主要输出，用于语音输入） """
-        try:
-            segment_text = stream_result_text.replace('@@', '').strip()
-            segment_text = re.sub(r'\s+', ' ', segment_text)
-            
-            prev_len = len(result.text)
-            result.text = merge_by_text(result.text, segment_text)
-            added_chars = len(result.text) - prev_len
-            
-            logger.debug(f"简单拼接: +{added_chars} 字符, 片段={len(segment_text)}, 总={len(result.text)}")
-        except Exception as e:
-            logger.warning(f"简单文本拼接失败: {e}")
+        segment_text = stream_result_text.replace('@@', '').strip()
+        segment_text = re.sub(r'\s+', ' ', segment_text)
+
+        prev_len = len(result.text)
+        result.text = merge_by_text(result.text, segment_text)
+        added_chars = len(result.text) - prev_len
+
+        logger.debug(f"简单拼接: +{added_chars} 字符, 片段={len(segment_text)}, 总={len(result.text)}")
 
     def process(self, task: Task) -> Result:
         """
