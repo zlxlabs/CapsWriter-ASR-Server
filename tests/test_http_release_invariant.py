@@ -393,13 +393,10 @@ def test_violating_paths_go_through_finalize():
 
 
 def test_ws_send_http_branch_has_no_transition():
-    """HTTP 结果分支不得自行终态转换：终态责任唯一属于结果 sink。
+    """HTTP 结果分支只投递，不直接终态转换或等待持久化 sink。
 
-    旧形态（缺陷）：sink 失败路径已落库 FAILED + 转换 + 释放运行态记录，
-    ws_send 回到自己的分支后又对同一 key 转一次（重复终态）；成功路径 sink
-    只落库不转换，转换由 ws_send 补——两套终态责任并存，与
-    state.py release_terminal_task 的文档声明矛盾。本断言锁定修复形态：
-    ws_send HTTP 分支只有 sink + acknowledge，一行转换都不剩。
+    HTTP 的终态责任仍由结果 sink 唯一承担；ws_send 只能把结果投递给独立
+    consumer，避免唯一的 queue_out 分发循环被 HTTP 持久化阻塞。
     """
     ws_send = _functions(_load("connection/ws_send.py"))["ws_send"]
     http_branches = [
@@ -412,8 +409,25 @@ def test_ws_send_http_branch_has_no_transition():
     assert _terminal_calls(branch) == [], (
         "ws_send 的 HTTP 分支仍在自行终态转换；HTTP 终态唯一收尾人是结果 sink"
     )
-    sinks = _awaits_of(branch, "sink")
-    assert len(sinks) == 1, "HTTP 结果分支必须经 sink 收尾（落库→转换→释放一体）"
+    assert _awaits_of(branch, "sink") == [], (
+        "ws_send 的 HTTP 分支不得等待持久化 sink，只能投递给独立 consumer"
+    )
+    assert not any(
+        isinstance(item, ast.Call)
+        and _call_name(item.func) == "acknowledge_segment_result"
+        for item in ast.walk(branch)
+    ), "段确认属于 HTTP consumer，不得在分发循环提前释放在途名额"
+    result_puts = [
+        item
+        for item in ast.walk(branch)
+        if isinstance(item, ast.Call)
+        and isinstance(item.func, ast.Attribute)
+        and item.func.attr == "put_nowait"
+        and item.args
+        and isinstance(item.args[0], ast.Name)
+        and item.args[0].id == "result"
+    ]
+    assert len(result_puts) == 1, "HTTP 分支必须恰好非阻塞投递当前结果"
     assert isinstance(branch.body[-1], ast.Continue), (
         "HTTP 分支必须以 continue 收尾，之后的调用点才天然是 WS 专属"
     )
@@ -422,31 +436,19 @@ def test_ws_send_http_branch_has_no_transition():
 
 
 def test_ack_before_terminal_order():
-    """F1：HTTP 分支先段确认、后 sink 终态收尾（与 WS 分支段确认在前的语义一致）。
-
-    终态收尾会 pop pending_segments 并把 record.segment_slots 置 None，事后的
-    段确认无事可做；顺序反了只是让人误以为它还在起作用。
-    """
-    ws_send = _functions(_load("connection/ws_send.py"))["ws_send"]
-    http_branches = [
-        node
-        for node in ast.walk(ws_send)
-        if isinstance(node, ast.If) and _is_owner_kind_check(node.test, "http")
-    ]
-    assert len(http_branches) == 1, "ws_send 只允许一个 HTTP 结果分支"
-    branch = http_branches[0]
+    """每 Job consumer 恰好段确认一次、顺序执行 sink，保留结果顺序契约。"""
+    consumer = _functions(_load("connection/ws_send.py"))["_consume_http_results"]
     acks = [
         node
-        for node in ast.walk(branch)
+        for node in ast.walk(consumer)
         if isinstance(node, ast.Call)
         and _call_name(node.func) == "acknowledge_segment_result"
     ]
-    assert len(acks) == 1, "HTTP 分支必须做段确认（与 WS 分支一致）"
-    sinks = _awaits_of(branch, "sink")
-    assert len(sinks) == 1, "HTTP 分支必须经 sink 终态收尾"
+    assert len(acks) == 1, "每 Job HTTP consumer 必须恰好确认当前结果段一次"
+    sinks = _awaits_of(consumer, "sink")
+    assert len(sinks) == 1, "每 Job HTTP consumer 必须恰好顺序执行一次 sink"
     assert acks[0].lineno < sinks[0].lineno, (
-        "F1：段确认必须在终态收尾之前；终态释放后 pending_segments 与段名额"
-        "已被清，事后的段确认无事可做"
+        "HTTP 段确认必须先于 sink：在途名额仅在该 Job consumer 开始处理此段时释放"
     )
 
 

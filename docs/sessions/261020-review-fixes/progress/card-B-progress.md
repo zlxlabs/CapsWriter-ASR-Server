@@ -25,3 +25,10 @@
 - 本段结论：定向测试曾通过 34 项；全量测试 553 passed、3 skipped、8 failed。两条 HTTP 生命周期 AST 断言仍要求旧的直接 await/确认结构，相关测试文件不在本卡范围，seq=1 扩权申请等待决策。
 - 关键决策与已否决方案：不在 scope 批准前改 `tests/test_http_release_invariant.py`；全量测试中的 systemd/HOME 运行环境红与一次 worker-crash 红均因基线不可用而不能归为继承红，worker-crash 单测后续单跑通过。
 - 下一步唯一动作：将已提交并推送的实现、完整测试状态与 scope 阻塞写入派发报告。
+
+## 里程碑 5：获批更新 HTTP 分发 AST 契约
+
+- 当前阶段：complete
+- 本段结论：按已批准范围只更新 `test_ws_send_http_branch_has_no_transition` 与 `test_ack_before_terminal_order`，锁定分发只投递、consumer 恰好确认/await sink 且确认在前。两条注入顺序反转后目标断言变红；窄测通过，全量 556 passed、3 skipped、5 项环境已知红。
+- 关键决策与已否决方案：不修改卡 C 正在处理的 `tests/test_http_file_runner.py`；systemd-unit 与裸进程探针失败按主脑定性记为执行器环境问题，不做范围外修复。
+- 下一步唯一动作：提交并推送本里程碑，更新当前与原派发报告 outcome 为 succeeded。
