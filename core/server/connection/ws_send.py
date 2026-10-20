@@ -105,12 +105,13 @@ async def fail_active_tasks(state, code: str, message: str, *, skip_key=None) ->
         await asyncio.wait_for(asyncio.gather(*closing), timeout=15)
 
 
-async def _consume_http_results(sink, results: asyncio.Queue) -> None:
-    """按单个 HTTP Job 的队列顺序执行持久化 sink。"""
+async def _consume_http_results(state, sink, results: asyncio.Queue) -> None:
+    """按单个 HTTP Job 的队列顺序确认并执行持久化 sink。"""
     while True:
         result = await results.get()
         if result is None:
             return
+        acknowledge_segment_result(state, task_key_from_result(result))
         await sink(result)
 
 
@@ -195,13 +196,14 @@ async def ws_send(app):
                 if sink is None:
                     raise RuntimeError('HTTP 结果持久消费者未注入')
                 # HTTP 终态唯一收尾人是结果 sink（落库→转换→释放一体完成）；
-                # 此处只确认段并非阻塞地投递。每 Job 的队列保持 worker 结果顺序，
-                # 独立消费者等待 sink 时不会占住唯一的 queue_out 分发循环。
-                acknowledge_segment_result(state, key)
+                # 非阻塞投递由每 Job 队列维持顺序，消费者确认段后再等待 sink，
+                # 保留在途段背压且不占住唯一的 queue_out 分发循环。
                 consumer = http_consumers.get(result.task_id)
                 if consumer is None:
                     results = asyncio.Queue()
-                    task = asyncio.create_task(_consume_http_results(sink, results))
+                    task = asyncio.create_task(
+                        _consume_http_results(state, sink, results)
+                    )
                     consumer = (results, task)
                     http_consumers[result.task_id] = consumer
                 results, _ = consumer

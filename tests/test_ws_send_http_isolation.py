@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import queue
+from collections import deque
 from types import SimpleNamespace
 
 import pytest
@@ -66,6 +67,42 @@ async def test_blocked_http_sink_does_not_delay_websocket_result():
 
         release_sink.set()
         await asyncio.wait_for(sink_finished.wait(), timeout=1)
+    finally:
+        release_sink.set()
+        sender.cancel()
+        await asyncio.gather(sender, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_blocked_sink_keeps_unconsumed_http_segments_backpressured():
+    sink_started = asyncio.Event()
+    release_sink = asyncio.Event()
+    final_received = asyncio.Event()
+
+    async def blocked_sink(result):
+        sink_started.set()
+        await release_sink.wait()
+        if result.is_final:
+            final_received.set()
+
+    app, queue_out, outbound = sender_app(blocked_sink)
+    state = app.state
+    key = make_task_key("http", "file-job")
+    state.pending_segments[key] = deque(["first", "second", "third"])
+    sender = asyncio.create_task(ws_send(app))
+    try:
+        queue_out.put(make_result("file-job", "http", text="第一段"))
+        await asyncio.wait_for(sink_started.wait(), timeout=1)
+        queue_out.put(make_result("file-job", "http", text="第二段"))
+        queue_out.put(make_result("file-job", "http", text="最终段", is_final=True))
+        queue_out.put(make_result("mic-job", "ws", text="仍可发送"))
+
+        message = json.loads(await asyncio.wait_for(outbound.get(), timeout=0.5))
+        assert message["text"] == "仍可发送"
+        assert list(state.pending_segments[key]) == ["second", "third"]
+
+        release_sink.set()
+        await asyncio.wait_for(final_received.wait(), timeout=1)
     finally:
         release_sink.set()
         sender.cancel()
