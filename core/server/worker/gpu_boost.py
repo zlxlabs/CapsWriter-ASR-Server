@@ -4,6 +4,7 @@ GPU 加速管理模块
 封装 GPU 显存频率锁定/解锁逻辑，用于减少冷启动延迟。
 """
 
+import os
 import subprocess
 import time
 import ctypes
@@ -67,7 +68,6 @@ class GpuBoostManager:
     @staticmethod
     def _check_admin() -> bool:
         """检测是否以管理员权限运行。"""
-        try:
+        if os.name == "nt":
             return bool(ctypes.windll.shell32.IsUserAnAdmin())
-        except Exception:
-            return False
+        return os.geteuid() == 0
