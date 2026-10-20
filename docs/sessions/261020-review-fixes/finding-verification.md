@@ -124,7 +124,13 @@ probe: propagated=IncompleteRead caught_by_fallback=False
 httpx_timeout: connect=5.0 read=5.0 write=5.0 pool=5.0
 ```
 
-同一条 HTTPX 请求在无响应超过默认 read timeout 后会被 `_request` 转成上述 `AsrError("timeout")`；服务端的哈希计算发生在提交响应之前。
+`PYTHONPATH=. python /tmp/cw-261020-probe/sdk_timeout_probe.py` 再输出：
+
+```text
+sdk_timeout_mapping: code=timeout recovery_path=/tmp/cw-261020-probe/recovery.json
+```
+
+桩传输抛出 `httpx.ReadTimeout` 后，真实 SDK `_request` 映射为 `AsrError("timeout")`；服务端的哈希计算发生在提交响应之前。
 
 真实部署可触发性：文件 commit 校验超过 5 秒即可触发，1 GiB 文件在读取吞吐低于约 205 MiB/s 时满足；≤10 人慢盘部署可能遇到。恢复文件可用于显式续接，因此是提交结果不确定/误报超时，不等于 Job 或源文件丢失。
 
@@ -165,3 +171,117 @@ gpu_admin_linux: windll=False result=False
 真实部署可触发性：Linux/NVIDIA 用户启用该可选功能且配置可运行的 boost 命令时必触发检测失败；默认关闭，未启用时不影响常规识别。
 
 修复方向：按平台检测执行命令所需权限，使 Linux 上管理员身份不会被误报为无权限。
+
+## 11. 容量检查对每条历史 uploads 行执行 stat
+
+结论：CONFIRMED
+
+代码证据：`core/server/http_store.py:427-450` 每次 `_iter_present_sources` 都全表读取并对每个 `source_name` 执行 `os.stat`；创建路径 `:526-536` 先统计声明预留再检查物理余量，PATCH 路径 `:654-657`、commit 路径 `:719-724` 也调用物理余量检查。`cleanup_terminal_sources` 在 `:780-791` 明确保留上传元数据；终态源过保留期时只 unlink 文件（`:792-808`），没有删除 uploads 行。
+
+实测证据：`PYTHONPATH=. python /tmp/cw-261020-probe/store_probe.py` 输出：
+
+```text
+linear_scan: upload_rows=70 source_stat_calls=70
+```
+
+在临时真实 HttpStore 中留 70 条上传行，调用 `_iter_present_sources` 一次，观测到 70 次 `stat`。
+
+真实部署可触发性：上传历史行随服务寿命增长且不随源文件回收而删除；≤10 人限制同时在线人数，但不限制历史行数，故运行多年后每次 HTTP 容量操作都会线性变慢；当前仅实测 70 行扫描次数，未外推延迟。
+
+修复方向：避免每次容量检查都对无界历史 uploads 行重复做文件系统探测。
+
+## 12. 每个 HTTP 中间段都会同步重序列化累计结果
+
+结论：CONFIRMED
+
+代码证据：`core/server/http_file_runner.py:202-228` 的 sink 对每条结果构造含累计文本、tokens、timestamps 的 payload 并同步调用 `dumps_result` 检查 64 MiB 上限；`:249-269` 每次完整复制累计数组并编码为 JSON bytes。`ws_send.py:160-170` 在唯一结果分发协程中等待该 sink。HTTP 任务时长上限默认 4 小时（`http_file_runner.py:57-58,272-278`），分段参数最短 5 秒（`core/server/segmenter.py:35-45`），默认 15 秒（`http_client.py:580-581`）。
+
+实测证据：`PYTHONPATH=. python /tmp/cw-261020-probe/serializer_benchmark.py`，以 4 个中文字/秒构造实际累计文本、text_accu、tokens、timestamps 并调用生产 `dumps_result`，输出：
+
+```text
+segments=240 seconds_per_segment=15 audio_seconds=3600 tokens=14400 final_json=277096B total_json_encoded=32923260B max_result=67108864B elapsed=0.288s
+segments=480 seconds_per_segment=15 audio_seconds=7200 tokens=28800 final_json=565096B total_json_encoded=134130300B max_result=67108864B elapsed=1.179s
+segments=960 seconds_per_segment=15 audio_seconds=14400 tokens=57600 final_json=1141096B total_json_encoded=543904380B max_result=67108864B elapsed=5.135s
+segments=2880 seconds_per_segment=5 audio_seconds=14400 tokens=57600 final_json=1141096B total_json_encoded=1630572180B max_result=67108864B elapsed=16.622s
+```
+
+实测对象是合成 transcript，不运行模型；固定每段 60 token 时，段数从 240 翻倍到 480，累计编码字节从 32.9 MB 增至 134.1 MB（约 4.1 倍），直接验证段数平方关系。4 小时默认/最短段长的实际上限量级分别约 960/2,880 次检查；该主机耗时仅供量级参考。
+
+真实部署可触发性：达到 4 小时上限时，默认 15 秒约 960 次检查、允许的 5 秒段长约 2,880 次；合成场景分别消耗约 9.8 秒和 15.8 秒同步编码时间，分摊在长任务期间，最多 10 人时属于可触发但主要表现为 CPU 开销和 WS 结果短暂停顿。
+
+修复方向：保留结果大小上限检查，但避免在事件循环内对每个中间段重复编码全部累计结果。
+
+## 13. is_first_segment 恒为 False，但当前首段合并结果不受影响
+
+结论：REFUTED
+
+代码证据：`core/server/worker/task_handler.py:29-41` 在新 task 入缓冲时先 `get_session`，调用点 `:152-153` 对进入缓冲的每个 task 执行该逻辑；因此 `core/server/worker/pipeline.py:70-76` 在 `get_session` 前计算的 `key not in self.state.sessions` 对正常任务确为 False。不过 `core/server/merger/token_merger.py:47-49` 在 `is_first_segment` 为真**或** `prev_tokens` 为空时都直接返回新片段，首段行为不依赖该布尔值。
+
+实测证据：`PYTHONPATH=. python /tmp/cw-261020-probe/runtime_probe.py` 输出：
+
+```text
+first_segment: true=(['甲'], [0.0]) false=(['甲'], [0.0]) equal=True
+```
+
+探针将真实 merger 的首段空 `prev_tokens` 输入分别配 `True`、`False`，输出完全相同。原发现观察到变量恒假这一步成立，但据此推断存在首段合并缺陷不成立。
+
+真实部署可触发性：无用户可见触发条件；首段总是空历史 tokens，已有 merger 分支等价地覆盖该输入。
+
+修复方向：无需修复；当前空历史分支已保证首段行为。
+
+## 14. 协议文档列出的 8 个 QUEUED+RUNNING 与 HTTP 实际预算有歧义
+
+结论：PLAUSIBLE
+
+代码证据：`docs/reference/protocol.md:185-187,275` 在 HTTP 文件任务章节的资源起点中列出“8 个 QUEUED+RUNNING”；`core/server/state.py:28-32,66-72` 默认 `max_tasks=8` 但固定为 WS 预留 2 个名额，HTTP 预算为 6；`core/server/http_server.py:555-579` 用共享 `count_active_tasks` 与该 HTTP 预算拒绝新增任务，`state.py:107-152` 说明总计数同时包含 WS 内存任务和 HTTP DB 排队任务。
+
+实测证据：精确调用链为 HTTP `/commit` → `count_active_tasks` → 比较 `http_job_budget(ServerConfig.max_tasks)`；默认值沿 `config_server.py:57` 的 8 到 `state.py:66-72` 得 6。`docs/reference/protocol.md` 没有说明这 8 是全服务共享任务总量还是 HTTP Job 数；若指 HTTP Job 数则文档高估 2，若指全服务总量则该数字与共享上限一致。
+
+真实部署可触发性：只有用户把该资源起点理解为 8 个 HTTP Job 时才会遇到预期差异；独立 HTTP 排队/运行达到 6 后，新增 HTTP commit 已可能收到 429，实际并发再受 WS 活动数影响。
+
+修复方向：在协议中明确 8 是共享总量上限，并注明 HTTP 自身最多使用 6 个名额且与 WS 共享计数。
+
+## 15. 标点与 ITN 异常会降级为原文本并以 DONE 交付
+
+结论：CONFIRMED
+
+代码证据：`core/server/formatter/text_formatter.py:47-64` 对标点与中文数字 ITN 的 `Exception` 只记 warning，异常后保留原文本继续返回；`core/server/worker/pipeline.py:162-169` 对最终正文及 `text_accu` 调用格式化，随后 `:195-218` 完成一致性检查并置 `result.is_final=True`；HTTP sink 将最终结果落库并转 `DONE`（`http_file_runner.py:230-243`）。
+
+实测证据：`PYTHONPATH=. python /tmp/cw-261020-probe/runtime_probe.py` 输出：
+
+```text
+WARNING 标点补全失败: synthetic punctuation failure
+formatter: output='明天见'
+```
+
+使用抛异常的标点桩调用真实 `TextFormatter`，异常只产生 warning，结果保留无标点原文；最终 `DONE` 路径由上述调用链确认。
+
+真实部署可触发性：标点模型或 ITN 在实际文本上抛异常时，识别文本仍可交付但缺少格式化；日志含 warning，任务状态不会告知调用者格式化已降级。对 ≤10 人内部用户属可见质量降级，不是识别文本丢失。
+
+修复方向：让格式化步骤失败体现在任务结果状态或可消费的结果字段中，避免仅留服务端 warning 后标记 DONE。
+
+## 附带发现
+
+无。本次未扩展到 15 条之外。
+
+## 汇总
+
+严重度按 internal 风险档判断：没有发现同时满足真实部署会触发且后果不可接受的 P1；服务可用性、可见错误或质量降级列为 P2，长期性能/文档歧义及已证伪项列为 P3。
+
+| 编号 | 结论 | 严重度 | 建议归属模块 |
+|---:|---|---|---|
+| 1 | CONFIRMED | P2 | HTTP runner / I/O worker |
+| 2 | CONFIRMED | P2 | WebSocket 结果分发 / HTTP sink |
+| 3 | CONFIRMED | P2 | HTTP 与 WS 共享准入 |
+| 4 | CONFIRMED | P2 | Proxy router |
+| 5 | CONFIRMED | P2 | Worker 进程监督 |
+| 6 | CONFIRMED | P2 | HTTP upload store / 容量账本 |
+| 7 | CONFIRMED | P2 | Proxy 周期探活 |
+| 8 | CONFIRMED | P2 | Python HTTP SDK |
+| 9 | CONFIRMED | P2 | WS receive / task lifecycle |
+| 10 | CONFIRMED | P2 | GPU boost 权限检测 |
+| 11 | CONFIRMED | P3 | HTTP upload store / 容量扫描 |
+| 12 | CONFIRMED | P3 | HTTP result sink / JSON 上限检查 |
+| 13 | REFUTED | P3 | Worker pipeline / token merger |
+| 14 | PLAUSIBLE | P3 | HTTP 协议容量文档 |
+| 15 | CONFIRMED | P2 | TextFormatter / worker pipeline |
