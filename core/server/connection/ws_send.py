@@ -105,6 +105,35 @@ async def fail_active_tasks(state, code: str, message: str, *, skip_key=None) ->
         await asyncio.wait_for(asyncio.gather(*closing), timeout=15)
 
 
+async def _consume_http_results(sink, results: asyncio.Queue) -> None:
+    """按单个 HTTP Job 的队列顺序执行持久化 sink。"""
+    while True:
+        result = await results.get()
+        if result is None:
+            return
+        await sink(result)
+
+
+def _raise_completed_http_consumer_errors(consumers) -> None:
+    for job_id, (_, task) in list(consumers.items()):
+        if task.done():
+            del consumers[job_id]
+            task.result()
+
+
+async def _stop_http_consumers(consumers) -> None:
+    tasks = [task for _, task in consumers.values()]
+    for task in tasks:
+        if not task.done():
+            task.cancel()
+    outcomes = await asyncio.gather(*tasks, return_exceptions=True)
+    for outcome in outcomes:
+        if isinstance(outcome, BaseException) and not isinstance(
+            outcome, asyncio.CancelledError
+        ):
+            raise outcome
+
+
 def _result_json(result: Result) -> str:
     message = RecognitionMessage(
         task_id=result.task_id,
@@ -126,84 +155,98 @@ async def ws_send(app):
     queue_out = state.queue_out
     ensure_server_runtime(state)
     logger.info("WebSocket 结果分发任务已启动")
+    http_consumers = {}
 
-    while True:
-        try:
-            result: Result = await to_thread(queue_out.get, True, 1)
-        except queue.Empty:
-            # 空队列是正常空闲态；限时轮询可让停止时的工作线程及时返回。
-            continue
-        if result is None:
-            logger.info("收到退出通知，停止结果分发任务")
-            return
-        # 测试骨架独立启动 sender 时，worker 的就绪信号可能仍在队列中。
-        if result is True:
-            continue
+    try:
+        while True:
+            _raise_completed_http_consumer_errors(http_consumers)
+            try:
+                result: Result = await to_thread(queue_out.get, True, 1)
+            except queue.Empty:
+                # 空队列是正常空闲态；限时轮询可让停止时的工作线程及时返回。
+                continue
+            _raise_completed_http_consumer_errors(http_consumers)
+            if result is None:
+                logger.info("收到退出通知，停止结果分发任务")
+                return
+            # 测试骨架独立启动 sender 时，worker 的就绪信号可能仍在队列中。
+            if result is True:
+                continue
 
-        key = task_key_from_result(result)
-        record = state.tasks.get(key)
-        if record is None:
-            # HTTP 任务在结果持久化（或可靠 FAILED）之后就会释放运行态记录，
-            # 因此无记录的 HTTP 结果按契约属于迟到结果：记账丢弃，不覆盖终态。
-            logger.debug(
-                f"丢弃终态或无主迟到结果 task={result.task_id} "
-                f"socket={result.socket_id} owner_kind={result.owner_kind}"
-            )
-            continue
-        if record.status in {'DONE', 'FAILED'}:
-            logger.debug(
-                f"丢弃终态或无主迟到结果 task={result.task_id} "
-                f"socket={result.socket_id}"
-            )
-            continue
+            key = task_key_from_result(result)
+            record = state.tasks.get(key)
+            if record is None:
+                # HTTP 任务在结果持久化（或可靠 FAILED）之后就会释放运行态记录，
+                # 因此无记录的 HTTP 结果按契约属于迟到结果：记账丢弃，不覆盖终态。
+                logger.debug(
+                    f"丢弃终态或无主迟到结果 task={result.task_id} "
+                    f"socket={result.socket_id} owner_kind={result.owner_kind}"
+                )
+                continue
+            if record.status in {'DONE', 'FAILED'}:
+                logger.debug(
+                    f"丢弃终态或无主迟到结果 task={result.task_id} "
+                    f"socket={result.socket_id}"
+                )
+                continue
 
-        if result.owner_kind == 'http':
-            sink = state.http_result_sink
-            if sink is None:
-                raise RuntimeError('HTTP 结果持久消费者未注入')
-            # HTTP 终态唯一收尾人是结果 sink（落库→转换→释放一体完成）；
-            # 本分支只做段确认，不得再做任何终态转换——重复转换与
-            # 两套终态责任并存的旧形态由结构约束钉死。段确认在 sink 之前：
-            # 与 WS 分支语义一致，终态释放后 pending/段名额已被清，事后确认无事可做。
+            if result.owner_kind == 'http':
+                sink = state.http_result_sink
+                if sink is None:
+                    raise RuntimeError('HTTP 结果持久消费者未注入')
+                # HTTP 终态唯一收尾人是结果 sink（落库→转换→释放一体完成）；
+                # 此处只确认段并非阻塞地投递。每 Job 的队列保持 worker 结果顺序，
+                # 独立消费者等待 sink 时不会占住唯一的 queue_out 分发循环。
+                acknowledge_segment_result(state, key)
+                consumer = http_consumers.get(result.task_id)
+                if consumer is None:
+                    results = asyncio.Queue()
+                    task = asyncio.create_task(_consume_http_results(sink, results))
+                    consumer = (results, task)
+                    http_consumers[result.task_id] = consumer
+                results, _ = consumer
+                results.put_nowait(result)
+                if result.is_final or result.error_code:
+                    results.put_nowait(None)
+                logger.debug(f"已投递 HTTP 识别结果 task={result.task_id}")
+                continue
+
             acknowledge_segment_result(state, key)
-            await sink(result)
-            logger.debug(f"已提交 HTTP 识别结果 task={result.task_id}")
-            continue
+            websocket = state.sockets.get(key[1])
+            outbound = state.out_queues.get(result.socket_id)
+            if websocket is None or outbound is None:
+                logger.debug(f"客户端 {result.socket_id} 已断开，丢弃结果 task={result.task_id}")
+                transition_terminal(state, key, 'FAILED')
+                continue
 
-        acknowledge_segment_result(state, key)
-        websocket = state.sockets.get(key[1])
-        outbound = state.out_queues.get(result.socket_id)
-        if websocket is None or outbound is None:
-            logger.debug(f"客户端 {result.socket_id} 已断开，丢弃结果 task={result.task_id}")
-            transition_terminal(state, key, 'FAILED')
-            continue
+            if result.error_code:
+                schedule_error_close(
+                    state,
+                    websocket,
+                    result.socket_id,
+                    result.task_id,
+                    result.error_code,
+                    result.error_message,
+                    result.error_code in {'inference_failed', 'inference_timeout', 'internal', 'slow_consumer'},
+                )
+                continue
 
-        if result.error_code:
-            schedule_error_close(
-                state,
-                websocket,
-                result.socket_id,
-                result.task_id,
-                result.error_code,
-                result.error_message,
-                result.error_code in {'inference_failed', 'inference_timeout', 'internal', 'slow_consumer'},
-            )
-            continue
+            try:
+                outbound.put_nowait(_result_json(result))
+            except asyncio.QueueFull:
+                schedule_error_close(
+                    state,
+                    websocket,
+                    result.socket_id,
+                    result.task_id,
+                    'slow_consumer',
+                    '客户端出站队列已满，服务端关闭该连接',
+                    True,
+                )
+                continue
 
-        try:
-            outbound.put_nowait(_result_json(result))
-        except asyncio.QueueFull:
-            schedule_error_close(
-                state,
-                websocket,
-                result.socket_id,
-                result.task_id,
-                'slow_consumer',
-                '客户端出站队列已满，服务端关闭该连接',
-                True,
-            )
-            continue
-
-        if result.is_final:
-            transition_terminal(state, key, 'DONE')
-        logger.debug(f"已分发识别结果 task={result.task_id} socket={result.socket_id}")
+            if result.is_final:
+                transition_terminal(state, key, 'DONE')
+            logger.debug(f"已分发识别结果 task={result.task_id} socket={result.socket_id}")
+    finally:
+        await _stop_http_consumers(http_consumers)
