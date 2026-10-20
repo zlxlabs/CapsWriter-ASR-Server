@@ -18,3 +18,10 @@
 - 本段结论：sink 对固定元数据序列化小骨架，并对文本、token 与 timestamp 的变化后缀增量计数；实际超过 64 MiB 仍以 `result_too_large` 失败。新隔离、顺序、上限与 backpressure 测试通过（34 passed）。
 - 关键决策与已否决方案：大小计算按紧凑 UTF-8 JSON 的字符串转义、数组元素和逗号计数，保持与原序列化字节数等价；最终落库仍由 HttpStore 做其既有完整上限校验。
 - 下一步唯一动作：运行全仓 `python -m pytest tests/ -q` 并处理本卡引入的失败。
+
+## 里程碑 4：全量验证与范围阻塞
+
+- 当前阶段：blocked
+- 本段结论：定向测试曾通过 34 项；全量测试 553 passed、3 skipped、8 failed。两条 HTTP 生命周期 AST 断言仍要求旧的直接 await/确认结构，相关测试文件不在本卡范围，seq=1 扩权申请等待决策。
+- 关键决策与已否决方案：不在 scope 批准前改 `tests/test_http_release_invariant.py`；全量测试中的 systemd/HOME 运行环境红与一次 worker-crash 红均因基线不可用而不能归为继承红，worker-crash 单测后续单跑通过。
+- 下一步唯一动作：将已提交并推送的实现、完整测试状态与 scope 阻塞写入派发报告。
