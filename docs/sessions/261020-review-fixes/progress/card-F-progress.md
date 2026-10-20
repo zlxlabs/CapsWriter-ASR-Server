@@ -13,3 +13,10 @@
 - 本段结论：去掉标点/ITN 与简单拼接的 `except Exception` 吞错；标点桩抛错时 TaskHandler 产出 `error_code=inference_failed` 且 `is_final=False`。base 上该断言红（实际 `error_code==''` 并 WARNING 后 DONE）。
 - 关键决策与已否决方案：不新增协议字段；沿用既有 `inference_failed`。否决交付原文本并标记降级。
 - 下一步唯一动作：删除 pipeline 里恒为 False 的 `is_first_segment` 死参数。
+
+## 2026-10-20 删除 is_first_segment 死参数
+
+- 当前阶段：implementing
+- 本段结论：pipeline 不再计算或传递恒为 False 的 `is_first_segment`；merger 仍用默认 False，首段靠空 `prev_tokens` 短路，合并逻辑不变。
+- 关键决策与已否决方案：不改 `token_merger.py`（不在 Scope-Globs）；不改合并算法。
+- 下一步唯一动作：把协议文档 HTTP 容量改成与 `http_job_budget` 一致。

@@ -14,7 +14,7 @@
 
 import re
 import time
-from core.server.state import WorkerState, task_key_from_task, console
+from core.server.state import WorkerState, console
 from core.server.schema import Task, Result
 from core.server.formatter import TextFormatter
 from config_server import ServerConfig as Config
@@ -64,8 +64,6 @@ class TaskPipeline:
         """
         try:
             logger.info(f"任务 {task.task_id[:8]}, 语言={task.language}, 类型={task.type}")
-            key = task_key_from_task(task)
-            is_first_segment = key not in self.state.sessions
             session = self.state.get_session(
                 task.task_id,
                 task.socket_id,
@@ -140,7 +138,6 @@ class TaskPipeline:
                 new_timestamps=new_timestamps,
                 offset=task.offset,
                 overlap=task.overlap,
-                is_first_segment=is_first_segment
             )
             
             # 7. 生成精确文本结果 (text_accu)
