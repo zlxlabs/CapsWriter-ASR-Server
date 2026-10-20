@@ -225,12 +225,12 @@ def test_store_cleanup_uses_terminal_boundary_and_keeps_every_other_source(tmp_p
             "SELECT state FROM uploads WHERE upload_id=?", (expired_partial.upload_id,)
         ).fetchone()
         assert expired_row["state"] == UPLOAD_EXPIRED
-        assert store._source_path(
+        assert not store._source_path(
             store.conn.execute(
                 "SELECT source_name FROM uploads WHERE upload_id=?",
                 (expired_partial.upload_id,),
             ).fetchone()["source_name"]
-        ).read_bytes() == b"partial"
+        ).exists()
         assert junk.read_bytes() == b"unregistered"
         assert store.get_result(exact_done[0], "token-exact-done") == expected_result
         assert store.job_record(exact_done[0], "token-exact-done").source_available is False
@@ -242,7 +242,7 @@ def test_store_cleanup_uses_terminal_boundary_and_keeps_every_other_source(tmp_p
         assert store.stats() == before_counts
         assert store.conn.execute("SELECT COUNT(*) FROM results").fetchone()[0] == before_result_count
         assert store._reserved_source_bytes() == (
-            before_reserved - len(b"exact-done") - len(b"older-failed")
+            before_reserved - len(b"exact-done") - len(b"older-failed") - 20
         )
     finally:
         store.close()
@@ -467,7 +467,7 @@ async def test_periodic_cleanup_waits_for_real_runner_reference_then_keeps_resul
             assert recent_source.exists(), "created_at 很旧不能替代新鲜 terminal_at"
             assert queued_source.exists(), "非终态 Job 不能成为清理候选"
             assert partial_live_source.read_bytes() == b"live-partial-prefix"
-            assert partial_expired_source.read_bytes() == b"expired-partial-prefix"
+            assert not partial_expired_source.exists()
             assert junk_source.read_bytes() == b"unregistered-source"
             expired_row = _read_db(
                 server.data_dir,

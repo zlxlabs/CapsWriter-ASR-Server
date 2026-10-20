@@ -370,8 +370,8 @@ def test_expired_upload_is_410_and_metadata_kept(tmp_path):
         assert info.value.code == "upload_expired"
         rows = store.conn.execute("SELECT state FROM uploads WHERE upload_id=?", (record.upload_id,)).fetchall()
         assert rows[0]["state"] == "EXPIRED"
-        # 元数据不自动删除，源文件也不自动删除
-        assert (tmp_path / "data" / "sources" / f"{record.upload_id}.bin").exists()
+        # 元数据保留；过期上传的源文件必须删除并退出预留
+        assert not (tmp_path / "data" / "sources" / f"{record.upload_id}.bin").exists()
 
 
 def test_wrong_token_and_unknown_upload_are_both_not_found(tmp_path):
