@@ -714,12 +714,11 @@ class HttpStore:
         if digest.hexdigest() != row["sha256"]:
             raise HttpStoreError("integrity_mismatch", "源文件 SHA-256 与声明不一致", status=422)
 
-    def commit_upload(self, upload_id: str, token: str, *, verify_source: bool = True) -> JobRecord:
+    def commit_upload(self, upload_id: str, token: str) -> JobRecord:
         """在唯一事务里建立唯一 Job 并置 COMMITTED。
 
-        HTTP 路由先在锁外独立线程做完整 SHA-256，再以 ``verify_source=False`` 调用本方法，
-        避免整文件哈希占住准入锁与共享 I/O worker。存储层单测默认 ``verify_source=True``，
-        仍在同一调用里核对身份。
+        完整 SHA-256 由 HTTP 路由在锁外独立线程先做完；本方法只做查重、容量闸和建 Job，
+        以免整文件哈希占住准入锁与共享 I/O worker。
 
         顺序要求：**幂等重放识别必须在预算兜底之前**。重放不新建 Job、不消耗新名额，
         因此不能被 ``_check_job_admission`` 以「名额已满」拒掉——否则响应丢失后的
@@ -738,8 +737,6 @@ class HttpStore:
         # 这次新增 Job 的预留由这里和物理余量闸一起算，否则 commit 会绕过 DB guard。
         self._check_storage_guard(new_job_reservation=self._result_reservation_bytes())
         self._check_physical_margin(new_result_reservation=self._result_reservation_bytes())
-        if verify_source:
-            self._verify_source(row)
         # 只有走到这里才是「要新建 Job」，此时才谈得上预算兜底
         self._check_job_admission()
         if not self._inference_ready():

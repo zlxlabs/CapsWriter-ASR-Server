@@ -238,8 +238,12 @@ def test_commit_rejects_wrong_identity_without_losing_prefix(tmp_path):
         source = tmp_path / "data" / "sources" / f"{record.upload_id}.bin"
         with open(source, "ab") as handle:
             handle.write(b"tampered")
+        row = store.conn.execute(
+            "SELECT source_name, size_bytes, sha256 FROM uploads WHERE upload_id=?",
+            (record.upload_id,),
+        ).fetchone()
         with pytest.raises(HttpStoreError) as info:
-            store.commit_upload(record.upload_id, "token-a")
+            store._verify_source(row)
         assert info.value.code == "integrity_mismatch"
         assert info.value.status == 422
         assert store.get_upload(record.upload_id, "token-a").state == "UPLOADING"

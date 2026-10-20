@@ -598,9 +598,7 @@ class HttpServer:
                         f"{http_job_budget(ServerConfig.max_tasks)} 个）",
                         status=429,
                     )
-                job = await self._worker.run(
-                    self._store.commit_upload, upload_id, token, verify_source=False
-                )
+                job = await self._worker.run(self._store.commit_upload, upload_id, token)
             else:
                 job = replayed
         if self.file_runner is not None and not already_committed:
