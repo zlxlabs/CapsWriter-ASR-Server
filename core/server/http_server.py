@@ -9,7 +9,7 @@ offset 冲突额外带 confirmed_offset。
   * 二进制请求体不是 JSON/Base64/multipart，不接受额外 Content-Encoding；
   * 所有读写都要求 Authorization: Bearer，编号本身不赋权；
   * 文件写入与 SQLite 只发生在受监督的单 I/O worker 线程，不阻塞 WS 事件循环，
-    也不使用无界 default executor；
+    也不把 SQLite 丢进无界 default executor；整文件 SHA-256 在独立线程完成，不占该 worker；
   * 取消 HTTP 请求不结束已经开始的底层 I/O：route 取消只让等待方退出，
     线程内 I/O 仍跑到完成并由 done-callback 观察异常。
 """
@@ -557,7 +557,11 @@ class HttpServer:
         # state.tasks 非终态 + DB 里 QUEUED+RUNNING 的 HTTP Job，按 job_id 去重），
         # 排队中的 HTTP Job 也在其中。不发明新错误码。
         #
-        # 「计数 → 判定 → 登记」全在同一把共享准入锁内。登记（Job 落库）必须在锁内：
+        # 整文件 SHA-256 必须在准入锁外、且不占用共享 I/O worker：1 GiB 哈希会把
+        # WS 首帧准入和 fail_job 写库一起堵住。commit 时 offset==size，PATCH 要么空包
+        # 不写、要么超长 413，锁外哈希期间源文件不会被改写。
+        #
+        # 「计数 → 判定 → 登记」仍全在同一把共享准入锁内。登记（Job 落库）必须在锁内：
         # 否则 N 个并发 commit 会同时读到未达上限的计数、全部通过判定，再依次落库，
         # 静默越过 HTTP 名额上限。临界区内 await 的两处都只落在受监督的单 I/O
         # worker 线程上（DB 计数与 commit_upload），而 worker 只跑同步 SQLite/文件代码，
@@ -567,6 +571,21 @@ class HttpServer:
         # 显式重试路径）必须原样拿回同一个 Job，不看当前预算——它不消耗新名额，
         # 若先判预算，预算满时重放会拿到 429，破坏 commit_upload 声明的幂等。
         ensure_server_runtime(state)
+        row = await self._worker.run(self._store._row_for_token, upload_id, token)
+        if not (row["state"] == "COMMITTED" and row["job_id"]):
+            if row["confirmed_offset"] != row["size_bytes"]:
+                raise HttpStoreError(
+                    "upload_incomplete",
+                    "上传尚未达到声明长度",
+                    status=409,
+                    confirmed_offset=row["confirmed_offset"],
+                )
+            snapshot = {
+                "source_name": row["source_name"],
+                "size_bytes": row["size_bytes"],
+                "sha256": row["sha256"],
+            }
+            await asyncio.to_thread(self._store._verify_source, snapshot)
         async with state.admission_lock:
             replayed = await self._worker.run(self._store.committed_job, upload_id, token)
             already_committed = replayed is not None
