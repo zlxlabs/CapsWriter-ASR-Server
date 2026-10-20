@@ -110,6 +110,34 @@ async def test_blocked_sink_keeps_unconsumed_http_segments_backpressured():
 
 
 @pytest.mark.asyncio
+async def test_http_jobs_have_independent_sink_consumers():
+    blocked_started = asyncio.Event()
+    release_blocked = asyncio.Event()
+    other_finished = asyncio.Event()
+
+    async def sink(result):
+        if result.task_id == "file-job":
+            blocked_started.set()
+            await release_blocked.wait()
+        else:
+            other_finished.set()
+
+    app, queue_out, _ = sender_app(sink)
+    other_key = make_task_key("http", "other-job")
+    app.state.tasks[other_key] = TaskLifecycle(status="RUNNING")
+    sender = asyncio.create_task(ws_send(app))
+    try:
+        queue_out.put(make_result("file-job", "http", text="阻塞的文件结果"))
+        await asyncio.wait_for(blocked_started.wait(), timeout=1)
+        queue_out.put(make_result("other-job", "http", text="另一个文件结果"))
+        await asyncio.wait_for(other_finished.wait(), timeout=0.5)
+    finally:
+        release_blocked.set()
+        sender.cancel()
+        await asyncio.gather(sender, return_exceptions=True)
+
+
+@pytest.mark.asyncio
 async def test_same_http_job_sink_receives_segments_in_queue_order():
     received = []
     all_received = asyncio.Event()

@@ -11,3 +11,10 @@
 - 本段结论：HTTP 消费者在 sink 前确认本段；阻塞 sink 时只释放当前一个在途名额，后续结果仍留在有界的 worker 在途窗口内，WS 分发不受阻。
 - 关键决策与已否决方案：不在 ws_send 投递时提前确认所有 HTTP 段，避免 sink 慢时失去原有在途段背压并无限积累结果。
 - 下一步唯一动作：完成 HttpResultSink 累计结果大小的增量估算及上限语义验证。
+
+## 里程碑 3：增量结果大小估算
+
+- 当前阶段：implementing
+- 本段结论：sink 对固定元数据序列化小骨架，并对文本、token 与 timestamp 的变化后缀增量计数；实际超过 64 MiB 仍以 `result_too_large` 失败。新隔离、顺序、上限与 backpressure 测试通过（34 passed）。
+- 关键决策与已否决方案：大小计算按紧凑 UTF-8 JSON 的字符串转义、数组元素和逗号计数，保持与原序列化字节数等价；最终落库仍由 HttpStore 做其既有完整上限校验。
+- 下一步唯一动作：运行全仓 `python -m pytest tests/ -q` 并处理本卡引入的失败。

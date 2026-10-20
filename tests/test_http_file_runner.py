@@ -1473,3 +1473,105 @@ async def test_http_data_dir_has_no_temporary_pcm_after_completion(tmp_path):
             for name in files
         ), files
         assert not any(name.endswith((".pcm", ".raw", ".tmp")) for name in files)
+
+
+@pytest.mark.asyncio
+async def test_http_result_size_check_serializes_only_small_metadata_per_segment(monkeypatch):
+    """累计字段按变化量估算，段序列增长不再全量编码累计数组。"""
+    from core.server import http_file_runner as runner_module
+    from core.server.schema import Result
+    from core.server.state import TaskLifecycle, make_task_key
+
+    results = [
+        Result(
+            task_id="size-job", socket_id="", type="file", owner_kind="http",
+            text="甲乙", text_accu="甲乙", tokens=["甲", "乙"],
+            timestamps=[0.1, 0.2],
+        ),
+        Result(
+            task_id="size-job", socket_id="", type="file", owner_kind="http",
+            text="甲乙丙", text_accu="甲乙丙", tokens=["甲", "乙", "丙"],
+            timestamps=[0.1, 0.2, 0.3],
+        ),
+        Result(
+            task_id="size-job", socket_id="", type="file", owner_kind="http",
+            text="甲乙丁", text_accu="甲乙丁", tokens=["甲", "乙", "丁"],
+            timestamps=[0.1, 0.2, 0.4],
+        ),
+    ]
+    original_dumps_result = runner_module.dumps_result
+    expected_sizes = [
+        len(original_dumps_result(runner_module.http_result_payload(result)))
+        for result in results
+    ]
+    monkeypatch.setattr(runner_module, "MAX_RESULT_BYTES", max(expected_sizes))
+
+    serialized_payloads = []
+
+    def record_serialization(payload):
+        serialized_payloads.append(payload)
+        return original_dumps_result(payload)
+
+    monkeypatch.setattr(runner_module, "dumps_result", record_serialization)
+
+    class Runner:
+        def __init__(self):
+            self.failures = []
+
+        async def fail_job(self, job_id, code, message):
+            self.failures.append((job_id, code, message))
+
+    key = make_task_key("http", "size-job")
+    state = SimpleNamespace(tasks={key: TaskLifecycle(status="RUNNING")})
+    runner = Runner()
+    sink = runner_module.HttpResultSink(state, SimpleNamespace(), runner)
+    for result in results:
+        await sink(result)
+
+    assert runner.failures == []
+    assert len(serialized_payloads) == len(results)
+    assert all(
+        payload["text"] == ""
+        and payload["text_accu"] == ""
+        and payload["tokens"] == []
+        and payload["timestamps"] == []
+        for payload in serialized_payloads
+    ), serialized_payloads
+
+    # 将上限放在第二段的精确序列化大小以下一字节，必须由增量检查失败。
+    monkeypatch.setattr(runner_module, "MAX_RESULT_BYTES", expected_sizes[1] - 1)
+    rejected_runner = Runner()
+    rejected_sink = runner_module.HttpResultSink(state, SimpleNamespace(), rejected_runner)
+    await rejected_sink(results[0])
+    await rejected_sink(results[1])
+    assert rejected_runner.failures == [
+        ("size-job", "result_too_large", "识别结果超过持久化上限")
+    ]
+
+
+@pytest.mark.asyncio
+async def test_http_result_over_64_mib_keeps_result_too_large_error():
+    """实际 64 MiB 上限以上的结果仍以既有 result_too_large 错误收尾。"""
+    from core.server import http_file_runner as runner_module
+    from core.server.schema import Result
+    from core.server.state import TaskLifecycle, make_task_key
+
+    class Runner:
+        def __init__(self):
+            self.failures = []
+
+        async def fail_job(self, job_id, code, message):
+            self.failures.append((job_id, code, message))
+
+    key = make_task_key("http", "large-job")
+    state = SimpleNamespace(tasks={key: TaskLifecycle(status="RUNNING")})
+    runner = Runner()
+    sink = runner_module.HttpResultSink(state, SimpleNamespace(), runner)
+    await sink(Result(
+        task_id="large-job", socket_id="", type="file", owner_kind="http",
+        text="", text_accu="x" * (runner_module.MAX_RESULT_BYTES + 1),
+    ))
+
+    assert runner.failures == [
+        ("large-job", "result_too_large", "识别结果超过持久化上限")
+    ]
