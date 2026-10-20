@@ -15,10 +15,13 @@ import websockets
 
 from core.protocol import AudioMessage
 from tests.harness.server import ManagedHttpServerHarness
-from tests.test_http_file_runner import make_container
+from tests.test_http_file_runner import FFMPEG, make_container
 
 
 pytest.importorskip("aiohttp", reason="未安装 aiohttp==3.14.3；HTTP 文件入口默认关闭")
+pytestmark = pytest.mark.skipif(
+    FFMPEG is None, reason="本机 PATH 中没有 ffmpeg，HTTP 文件解码链无法验证"
+)
 
 
 async def _submit_file(base_url: str, source: Path, recovery: Path):
@@ -98,6 +101,13 @@ async def test_http_segment_timeout_does_not_fail_active_ws_or_exit_service(tmp_
             if asyncio.get_running_loop().time() >= deadline:
                 raise AssertionError(f"假引擎未开始 HTTP 推理：{list(harness.calls)!r}")
             await asyncio.sleep(0.02)
+        http_worker_tasks = [
+            item for item in harness.received
+            if item.get("event") == "task" and item.get("task_id") == handle.job_id
+        ]
+        assert http_worker_tasks, "真实 worker 子进程未收到 HTTP Job Task"
+        assert all(item["owner_kind"] == "http" for item in http_worker_tasks)
+        assert all(item["socket_id"] == "" for item in http_worker_tasks)
 
         task_id = "ws-survives-http-timeout"
         samples = np.zeros(16000, dtype="<f4").tobytes()
