@@ -15,3 +15,9 @@
 - 本段结论：HTTP 超时测试现在检查识别子进程真实收到的序列化 Task，断言 owner_kind=http 且 socket_id 为空；缺少 ffmpeg 的环境明确 skip。
 - 关键决策与已否决方案：复用现有 ManagedHttpServerHarness 的真实 multiprocessing Queue/worker 记录，不另建测试专用 producer。
 - 下一步唯一动作：取得 tests/test_http_file_runner.py 范围申请 seq=1 决策后更新过时断言。
+
+## HTTP 段超时既有断言更新
+- 当前阶段：implementing
+- 本段结论：按已批准的 seq=1 更新两处旧退出契约：HTTP 段超时仍可靠落库 FAILED[inference_timeout]，主服务保持存活并处理后续 HTTP Job；owner-release 探针继续验证 FAILED 持久化未成功前 owner 与运行闸门不释放。
+- 关键决策与已否决方案：保留真实独立服务与标记文件阻塞的持久化探针；将假引擎延迟和段超时窗口设为可确保后续排队任务在期限内处理的值，不改其它测试。
+- 下一步唯一动作：运行卡面窄测与全量测试，完成 scope 检查、提交并推送。

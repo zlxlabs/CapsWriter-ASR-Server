@@ -814,14 +814,14 @@ async def test_crash_window_restart_keeps_failed_server_restarted(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_segment_timeout_persists_failed_before_exit(tmp_path):
-    """推理段超时：进程退出前 Job 已可靠落库 FAILED[inference_timeout]，错因不丢。"""
+async def test_segment_timeout_persists_failed_and_keeps_server_alive(tmp_path):
+    """推理段超时：Job 可靠落库 FAILED[inference_timeout]，服务继续处理后续 Job。"""
     from tests.harness.server import ManagedHttpServerHarness
 
-    stalled = dict(FAKE_ENGINE, delay_on_call=1, delay_seconds=60.0)
+    stalled = dict(FAKE_ENGINE, delay_on_call=1, delay_seconds=4.0)
     harness = await ManagedHttpServerHarness.start(
         data_dir=tmp_path / "httpdata", options=stalled,
-        env={"CW_SEGMENT_TIMEOUT": "5"},
+        env={"CW_SEGMENT_TIMEOUT": "2"},
     )
     try:
         source = make_container(tmp_path, "speech.mp3")
@@ -829,35 +829,25 @@ async def test_segment_timeout_persists_failed_before_exit(tmp_path):
         handle = await submit(harness, source, recovery, seg_duration=5.0, seg_overlap=1.0)
         job_id = handle.job_id
         assert (await wait_state(harness, recovery, "RUNNING")).state == "RUNNING"
-        # 边轮询真实库边等进程退出：FAILED 必须发生在进程还活着的时候，
-        # 不能只靠重启后的 server_restarted 反推。先采样、后判活：提交严格
-        # 先于死亡，最后一份样本必然落在提交之后（先判活会被死亡检测的毫秒级
-        # 延迟漏掉「提交 → 死亡」之间的窄窗口）
-        observations = []
-        while True:
-            rows = harness.read_db(
-                "SELECT state, error_code FROM jobs WHERE job_id=?", (job_id,)
-            )
-            if rows:
-                observations.append((rows[0]["state"], rows[0]["error_code"]))
-            if not harness.process.is_alive():
-                break
-            await asyncio.sleep(0.01)
-        await harness.wait_for_exit(30)
-    finally:
-        await harness.cleanup()
+        failed = await wait_terminal(harness, recovery, timeout=20)
+        assert failed.state == "FAILED" and failed.error_code == "inference_timeout"
+        row = harness.read_db(
+            "SELECT state, error_code FROM jobs WHERE job_id=?", (job_id,)
+        )[0]
+        assert row["state"] == "FAILED" and row["error_code"] == "inference_timeout"
+        assert harness.process.is_alive(), "HTTP 段超时关闭了主服务"
 
-    assert harness.exitcode != 0, "推理段超时仍必须非零退出"
-    failed_before_exit = [item for item in observations if item[0] == "FAILED" and item[1]]
-    assert failed_before_exit, (
-        f"进程退出前未观察到已落库的 FAILED（error_code 为空）：{observations[-6:]}"
-    )
-    assert {item[1] for item in failed_before_exit} == {"inference_timeout"}
-    row = harness.read_db(
-        "SELECT state, error_code FROM jobs WHERE job_id=?", (job_id,)
-    )[0]
-    assert row["state"] == "FAILED" and row["error_code"] == "inference_timeout"
-    assert harness.read_db("SELECT COUNT(*) AS n FROM results")[0]["n"] == 0
+        next_source = make_container(tmp_path, "next.mp3")
+        next_recovery = tmp_path / "next.json"
+        await submit(
+            harness, next_source, next_recovery, seg_duration=5.0, seg_overlap=1.0
+        )
+        assert (await wait_terminal(harness, next_recovery, timeout=30)).state == "DONE"
+        assert harness.process.is_alive(), "主服务未能继续处理后续 HTTP Job"
+        assert harness.read_db("SELECT COUNT(*) AS n FROM results")[0]["n"] == 1
+    finally:
+        await harness.stop()
+        await harness.cleanup()
 
 
 # ---------------------------------------------------------------- R4 释放不变式探针
@@ -884,9 +874,7 @@ async def test_http_owner_released_before_persist(tmp_path, monkeypatch, trigger
       * ``fail_active_tasks`` —— worker 崩溃/收尾时给 HTTP 任务排错（原实现
         只做内存态 transition_terminal，整条缺失落库）；进程内直调，触发后
         进程仍存活，因此还能验证「落库完成后闸门交给第二个 Job」的完整排水；
-      * ``segment_timeout`` —— 监控协程的推理段超时 HTTP 分支（原实现先释放
-        owner、后落库，顺序颠倒）；该路径随后按语义 SystemExit(1) 非零退出，
-        asyncio 会把 task 里的 SystemExit 重抛进事件循环，因此必须走真实
+      * ``segment_timeout`` —— 监控协程的推理段超时 HTTP 分支；必须走真实
         独立服务子进程（ManagedHttpServerHarness），卡点用标记文件跨进程传递。
 
     把真实受监督 I/O 入口（HttpServer.fail_job）卡住，在卡住窗口内反复断言：
@@ -1029,11 +1017,11 @@ async def _wait_path(path: Path, timeout: float = 20.0):
 
 
 async def _probe_release_order_segment_timeout(tmp_path, monkeypatch):
-    """segment_timeout 路径：真实独立服务子进程，SystemExit 是其正常收尾。"""
+    """segment_timeout 路径：真实独立服务子进程，验证落库前不释放 owner。"""
     from tests.harness.server import ManagedHttpServerHarness
 
     install_recording_ffmpeg(tmp_path, monkeypatch)  # 建 shim 目录；子进程经 PATH 使用
-    stalled = dict(FAKE_ENGINE, delay_on_call=1, delay_seconds=15.0)
+    stalled = dict(FAKE_ENGINE, delay_on_call=1, delay_seconds=4.0)
     source_a = make_container(tmp_path, "probe_a.mp3")
     source_b = make_container(tmp_path, "probe_b.mp3")
     marker = tmp_path / "persist-block.release"
@@ -1043,7 +1031,7 @@ async def _probe_release_order_segment_timeout(tmp_path, monkeypatch):
         ffmpeg_shim=tmp_path / "ffmpeg-shim",
         stderr_path=tmp_path / "server-stderr.log",
         env={
-            "CW_SEGMENT_TIMEOUT": "1",
+            "CW_SEGMENT_TIMEOUT": "2",
             "CW_TEST_PERSIST_BLOCK_MARKER": str(marker),
             "CW_TEST_PERSIST_BLOCK_ENTERED": str(entered),
             "CW_TEST_PERSIST_BLOCK_WAIT": "45",
@@ -1099,23 +1087,24 @@ async def _probe_release_order_segment_timeout(tmp_path, monkeypatch):
             f"R4 不变式被违反（owner/闸门先于持久化释放）：{violation}"
         )
 
-        # 放行：落库成功、owner 释放之后，监控按原语义 SystemExit(1) 非零退出
+        # 放行：先可靠落库再释放 owner，后续 Job 应获准执行且服务继续存活。
         marker.write_text("release")
-        await harness.wait_for_exit(30)
+        assert (await wait_terminal(harness, recovery_b, timeout=30)).state == "DONE"
+        assert harness.process.is_alive(), "HTTP 段超时关闭了主服务"
     finally:
-        marker.write_text("release")  # 幂等：探针中途变红也要让子进程能走完
+        marker.write_text("release")  # 幂等：探针中途变红也要让子进程完成落库
+        await harness.stop()
         await harness.cleanup()
 
-    assert harness.exitcode != 0, "推理段超时仍必须非零退出"
     row = harness.read_db(
         "SELECT state, error_code FROM jobs WHERE job_id=?", (job_a,)
     )[0]
     assert (row["state"], row["error_code"]) == ("FAILED", "inference_timeout"), (
         dict(row)
     )
-    assert harness.read_db("SELECT COUNT(*) AS n FROM results")[0]["n"] == 0
-    # 卡住窗口内第二个 Job 始终没有获准解码；放行后进程立即退出，也不会再解码
-    assert len(read_ffmpeg_starts(ffmpeg_log)) == 1, (
+    assert harness.read_db("SELECT COUNT(*) AS n FROM results")[0]["n"] == 1
+    # 卡住窗口内第二个 Job 没有获准解码；落库释放 owner 后才轮到它，且不并行解码。
+    assert len(read_ffmpeg_starts(ffmpeg_log)) == 2, (
         read_ffmpeg_invocations(ffmpeg_log)
     )
     assert ffmpeg_peak_concurrency(ffmpeg_log) == 1, (
