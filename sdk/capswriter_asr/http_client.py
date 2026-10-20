@@ -17,6 +17,8 @@ from .client import AsrError, Transcript
 
 _MAX_CHUNK_BYTES = 1024 * 1024
 _HASH_READ_BYTES = 64 * 1024
+_HTTP_TIMEOUT_SECONDS = 30.0
+_HTTP_COMMIT_READ_TIMEOUT_SECONDS = 600.0
 _RECOVERY_VERSION = 1
 _UPLOAD_STATES = frozenset({"UPLOADING", "COMMITTED"})
 _JOB_STATES = frozenset({"QUEUED", "RUNNING", "DONE", "FAILED"})
@@ -303,18 +305,20 @@ async def _request(
     headers: dict[str, str] | None = None,
     json_body: dict | None = None,
     content: bytes | None = None,
+    timeout: httpx.Timeout | None = None,
 ) -> httpx.Response:
     request_headers = {"Authorization": f"Bearer {token}"}
     if headers:
         request_headers.update(headers)
+    request_options: dict = {
+        "headers": request_headers,
+        "json": json_body,
+        "content": content,
+    }
+    if timeout is not None:
+        request_options["timeout"] = timeout
     try:
-        return await client.request(
-            method,
-            url,
-            headers=request_headers,
-            json=json_body,
-            content=content,
-        )
+        return await client.request(method, url, **request_options)
     except httpx.TimeoutException as exc:
         raise AsrError("timeout", "HTTP 请求超时", recovery_path=recovery_path) from exc
     except httpx.TransportError as exc:
@@ -494,6 +498,12 @@ async def _commit_upload(
         token=recovery["token"],
         recovery_path=recovery_path,
         content=b"",
+        timeout=httpx.Timeout(
+            connect=_HTTP_TIMEOUT_SECONDS,
+            read=_HTTP_COMMIT_READ_TIMEOUT_SECONDS,
+            write=_HTTP_TIMEOUT_SECONDS,
+            pool=_HTTP_TIMEOUT_SECONDS,
+        ),
     )
     payload = _json_success(response, {200, 202}, recovery["token"], recovery_path)
     return _job_info(payload, recovery_path)
@@ -609,6 +619,7 @@ async def submit_file_http(
             transport=httpx.AsyncHTTPTransport(retries=0),
             follow_redirects=False,
             trust_env=False,
+            timeout=_HTTP_TIMEOUT_SECONDS,
         ) as client:
             upload_info = await _create_upload(client, base, recovery, recovery_path)
             return await _finish_upload(
@@ -642,6 +653,7 @@ async def resume_file_http(path, base_url, *, resume_path) -> FileTaskHandle:
             transport=httpx.AsyncHTTPTransport(retries=0),
             follow_redirects=False,
             trust_env=False,
+            timeout=_HTTP_TIMEOUT_SECONDS,
         ) as client:
             if recovery.get("upload_id"):
                 upload_info = await _get_upload(client, base, recovery, recovery_path)
@@ -682,6 +694,7 @@ async def get_file_job_http(base_url, *, resume_path) -> FileTaskStatus:
             transport=httpx.AsyncHTTPTransport(retries=0),
             follow_redirects=False,
             trust_env=False,
+            timeout=_HTTP_TIMEOUT_SECONDS,
         ) as client:
             response = await _request(
                 client,
@@ -787,6 +800,7 @@ async def get_file_result_http(base_url, *, resume_path) -> Transcript:
             transport=httpx.AsyncHTTPTransport(retries=0),
             follow_redirects=False,
             trust_env=False,
+            timeout=_HTTP_TIMEOUT_SECONDS,
         ) as client:
             response = await _request(
                 client,
