@@ -20,3 +20,10 @@
 - 本段结论：pipeline 不再计算或传递恒为 False 的 `is_first_segment`；merger 仍用默认 False，首段靠空 `prev_tokens` 短路，合并逻辑不变。
 - 关键决策与已否决方案：不改 `token_merger.py`（不在 Scope-Globs）；不改合并算法。
 - 下一步唯一动作：把协议文档 HTTP 容量改成与 `http_job_budget` 一致。
+
+## 2026-10-20 HTTP 容量文档
+
+- 当前阶段：implementing
+- 本段结论：协议资源起点不再写「8 个 QUEUED+RUNNING」；改为 HTTP+WS 共享 `max_tasks`，HTTP 预算 `http_job_budget(max_tasks)=max_tasks-WS_RESERVED_SLOTS`（当前默认 6）。`grep -n "8 个" docs/reference/protocol.md` 已无匹配。
+- 关键决策与已否决方案：只改文档，不改协议字段与错误码词表。
+- 下一步唯一动作：给 `_run_bare_probe` 传 `PYTHONUSERBASE`，`_wait_for` 失败带上 stderr。

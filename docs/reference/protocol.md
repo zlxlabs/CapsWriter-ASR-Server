@@ -272,4 +272,4 @@ curl "$BASE/v1/jobs/$JOB_ID" -H "Authorization: Bearer $TOKEN"
 curl "$BASE/v1/jobs/$JOB_ID/result" -H "Authorization: Bearer $TOKEN"
 ```
 
-服务端持久化语义：单目录 OS 独占锁、SQLite（WAL + `synchronous=FULL` + `foreign_keys=ON` + `busy_timeout=0`）、提交顺序固定为「字节 → fsync → offset 记录 → ACK」，SQLite busy 不重试也不假装 ACK。重启只把旧 `QUEUED`/`RUNNING` 标为 `FAILED`（`server_restarted`），已确认前缀与已完成结果不动。资源起点（1 GiB/file、1 MiB/PATCH、64 KiB/read、16 KiB JSON、16 handler、2 同时 body、32 未完成上传、8 个 QUEUED+RUNNING、64 MiB 结果、16 GiB source 声明预留、2 GiB DB/WAL 整体 guard、2 GiB 剩余磁盘余量、32 I/O mailbox）见设计文档。
+服务端持久化语义：单目录 OS 独占锁、SQLite（WAL + `synchronous=FULL` + `foreign_keys=ON` + `busy_timeout=0`）、提交顺序固定为「字节 → fsync → offset 记录 → ACK」，SQLite busy 不重试也不假装 ACK。重启只把旧 `QUEUED`/`RUNNING` 标为 `FAILED`（`server_restarted`），已确认前缀与已完成结果不动。资源起点（1 GiB/file、1 MiB/PATCH、64 KiB/read、16 KiB JSON、16 handler、2 同时 body、32 未完成上传、HTTP+WS 共享 max_tasks 个 QUEUED+RUNNING（HTTP 预算 http_job_budget(max_tasks)=max_tasks-WS_RESERVED_SLOTS，当前默认 6）、64 MiB 结果、16 GiB source 声明预留、2 GiB DB/WAL 整体 guard、2 GiB 剩余磁盘余量、32 I/O mailbox）见设计文档。
