@@ -480,6 +480,10 @@ async def ws_recv(websocket, app) -> None:
     # 创建音频缓冲区
     cache = AudioCache()
 
+    # 同一连接内不允许终态任务 ID 重新进入准入路径；终态记录仍在 state.tasks
+    # 时于收到对应帧时记入此集合，之后即使生命周期记录被替换也继续丢弃。
+    terminal_task_ids: set[str] = set()
+
     # 接收并处理消息
     try:
         while True:
@@ -531,6 +535,16 @@ async def ws_recv(websocket, app) -> None:
                 data = json.loads(raw_message)
                 if isinstance(data, dict) and isinstance(data.get('task_id'), str):
                     task_id = data['task_id']
+                if task_id:
+                    incoming_key = make_task_key('ws', task_id, socket_id)
+                    terminal_record = state.tasks.get(incoming_key)
+                    if task_id in terminal_task_ids or (
+                        terminal_record is not None
+                        and terminal_record.status in {'DONE', 'FAILED'}
+                    ):
+                        terminal_task_ids.add(task_id)
+                        logger.warning(f"丢弃终态任务 {task_id} 的迟到上行帧")
+                        continue
                 _validate_audio_dict(data)
                 msg = AudioMessage.from_dict(data)
             except Exception as e:
@@ -609,6 +623,7 @@ async def ws_recv(websocket, app) -> None:
                 )
                 return
             if record.status in {'DONE', 'FAILED'}:
+                terminal_task_ids.add(msg.task_id)
                 logger.warning(f"丢弃终态任务 {msg.task_id} 的迟到上行帧")
                 continue
 
