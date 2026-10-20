@@ -829,13 +829,25 @@ async def test_segment_timeout_persists_failed_and_keeps_server_alive(tmp_path):
         handle = await submit(harness, source, recovery, seg_duration=5.0, seg_overlap=1.0)
         job_id = handle.job_id
         assert (await wait_state(harness, recovery, "RUNNING")).state == "RUNNING"
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + 20
+        row = None
+        while loop.time() < deadline:
+            rows = harness.read_db(
+                "SELECT state, error_code FROM jobs WHERE job_id=?", (job_id,)
+            )
+            row = rows[0] if rows else None
+            if row and row["state"] == "FAILED":
+                break
+            if not harness.process.is_alive():
+                break
+            await asyncio.sleep(0.02)
+        await asyncio.sleep(0.1)
+        assert harness.process.is_alive(), "HTTP 段超时关闭了主服务"
+        assert row is not None
+        assert row["state"] == "FAILED" and row["error_code"] == "inference_timeout"
         failed = await wait_terminal(harness, recovery, timeout=20)
         assert failed.state == "FAILED" and failed.error_code == "inference_timeout"
-        row = harness.read_db(
-            "SELECT state, error_code FROM jobs WHERE job_id=?", (job_id,)
-        )[0]
-        assert row["state"] == "FAILED" and row["error_code"] == "inference_timeout"
-        assert harness.process.is_alive(), "HTTP 段超时关闭了主服务"
 
         next_source = make_container(tmp_path, "next.mp3")
         next_recovery = tmp_path / "next.json"
