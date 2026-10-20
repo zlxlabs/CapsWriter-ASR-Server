@@ -686,8 +686,11 @@ async def test_connect_failure_fails_over_from_higher_weight_backend():
         return FakeBackendWS()
 
     router = TaskRouter([heavy, light], connect_func=selective_connect)
-    await router.route_client_message(make_audio("task-failover"), FakeClientWS())
     try:
+        try:
+            await router.route_client_message(make_audio("task-failover"), FakeClientWS())
+        except NoHealthyBackendError as exc:
+            pytest.fail(f"应切到后端 b，实际放弃: attempted={attempted!r} error={exc}")
         session = router.task_sessions["task-failover"]
         assert attempted == ["a", "b"]
         assert session.backend.id == "b"
