@@ -12,6 +12,7 @@ from __future__ import annotations
 import json
 import os
 import signal
+import site
 import socket
 import subprocess
 import sys
@@ -291,8 +292,14 @@ def _wait_for(process: subprocess.Popen, needle: str, timeout: float = 60.0) -> 
         collected.append(line)
         if needle in line:
             return "".join(collected)
-    process.kill()
-    raise AssertionError(f"未等到 {needle}；已输出：{''.join(collected)}")
+    if process.poll() is None:
+        process.kill()
+    rest_out, rest_err = process.communicate(timeout=5)
+    if rest_out:
+        collected.append(rest_out)
+    raise AssertionError(
+        f"未等到 {needle}；已输出：{''.join(collected)}；stderr：{rest_err}"
+    )
 
 
 def _run_bare_probe(tmp_path: Path, **env_overrides) -> subprocess.Popen:
@@ -303,6 +310,7 @@ def _run_bare_probe(tmp_path: Path, **env_overrides) -> subprocess.Popen:
         "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
         "HOME": str(tmp_path),
         "PYTHONPATH": str(REPO_ROOT),
+        "PYTHONUSERBASE": site.getuserbase(),
         "LANG": "C.UTF-8",
         "NO_COLOR": "1",
         "TERM": "dumb",

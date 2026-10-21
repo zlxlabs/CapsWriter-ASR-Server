@@ -238,8 +238,12 @@ def test_commit_rejects_wrong_identity_without_losing_prefix(tmp_path):
         source = tmp_path / "data" / "sources" / f"{record.upload_id}.bin"
         with open(source, "ab") as handle:
             handle.write(b"tampered")
+        row = store.conn.execute(
+            "SELECT source_name, size_bytes, sha256 FROM uploads WHERE upload_id=?",
+            (record.upload_id,),
+        ).fetchone()
         with pytest.raises(HttpStoreError) as info:
-            store.commit_upload(record.upload_id, "token-a")
+            store._verify_source(row)
         assert info.value.code == "integrity_mismatch"
         assert info.value.status == 422
         assert store.get_upload(record.upload_id, "token-a").state == "UPLOADING"
@@ -370,8 +374,8 @@ def test_expired_upload_is_410_and_metadata_kept(tmp_path):
         assert info.value.code == "upload_expired"
         rows = store.conn.execute("SELECT state FROM uploads WHERE upload_id=?", (record.upload_id,)).fetchall()
         assert rows[0]["state"] == "EXPIRED"
-        # 元数据不自动删除，源文件也不自动删除
-        assert (tmp_path / "data" / "sources" / f"{record.upload_id}.bin").exists()
+        # 元数据保留；过期上传的源文件必须删除并退出预留
+        assert not (tmp_path / "data" / "sources" / f"{record.upload_id}.bin").exists()
 
 
 def test_wrong_token_and_unknown_upload_are_both_not_found(tmp_path):

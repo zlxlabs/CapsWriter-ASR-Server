@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import http.client
 import json
 import math
 import time
@@ -266,9 +267,13 @@ class ProxyServer:
             await asyncio.Future()
 
     async def _health_probe_loop(self) -> None:
-        while True:
-            await asyncio.sleep(self.probe_interval)
-            await self._probe_backends()
+        try:
+            while True:
+                await asyncio.sleep(self.probe_interval)
+                await self._probe_backends()
+        except Exception:
+            self.logger.error("探活循环意外结束", exc_info=True)
+            raise
 
     async def _probe_backends(self) -> None:
         await asyncio.gather(*(self._probe_backend(backend) for backend in self.backends))
@@ -279,6 +284,15 @@ class ProxyServer:
                 asyncio.to_thread(_read_backend_health, backend.url),
                 timeout=5.0,
             )
+        except http.client.HTTPException as exc:
+            backend.record_health_failure()
+            self.logger.warning(
+                "后端探活 HTTP 协议异常: backend=%s url=%s error=%s",
+                backend.id,
+                backend.url,
+                exc,
+            )
+            return
         except (OSError, URLError, TimeoutError) as exc:
             await self._probe_legacy_websocket(backend, exc)
             return

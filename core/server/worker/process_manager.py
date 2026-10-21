@@ -238,6 +238,7 @@ class ProcessManager:
                         state, key, 'FAILED', 'inference_timeout',
                         f"推理段超时，最早提交时间距今 {now - submitted_at:.3f}s",
                     )
+                    continue
                 else:
                     from ..state import transition_terminal
                     transition_terminal(

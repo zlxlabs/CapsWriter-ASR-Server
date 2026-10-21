@@ -8,7 +8,6 @@
 from core.tools.chinese_itn import chinese_to_num
 from core.tools.format_tools import adjust_space
 from config_server import ServerConfig as Config
-from . import logger
 
 
 class TextFormatter:
@@ -46,19 +45,13 @@ class TextFormatter:
 
         # 1. 增加标点
         if self.punc_model:
-            try:
-                # 调用标准化 PuncEngine 接口
-                text = self.punc_model.punctuate(text)
-            except Exception as e:
-                logger.warning(f"标点补全失败: {e}")
+            # 调用标准化 PuncEngine 接口
+            text = self.punc_model.punctuate(text)
 
         # 2. 中文数字转阿拉伯数字
         if Config.format_num:
-            try:
-                text = chinese_to_num(text)
-            except Exception as e:
-                logger.warning(f"ITN 转换失败: {e}")
-        
+            text = chinese_to_num(text)
+
         # 3. 调整中英文空格（ITN 之后，中英边界清晰，一次调整到位）
         if Config.format_spell:
             text = adjust_space(text)

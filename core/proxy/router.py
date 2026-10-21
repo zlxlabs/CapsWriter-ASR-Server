@@ -89,6 +89,7 @@ class TaskRouter:
         require_v2: bool = False,
         task_id: str | None = None,
         model: str | None = None,
+        tried: Optional[set] = None,
     ) -> BackendState:
         if not self.backends:
             if require_v2 or model is not None:
@@ -109,6 +110,13 @@ class TaskRouter:
             raise NoCompatibleBackendError(task_id, encoding, model)
         if not healthy_backends:
             raise NoHealthyBackendError("所有后端均不健康，等待探活恢复")
+        if tried:
+            untried = [backend for backend in healthy_backends if backend.id not in tried]
+            if not untried:
+                raise NoHealthyBackendError(
+                    f"所有后端连接失败: task_id={task_id} tried={tried}"
+                )
+            healthy_backends = untried
 
         best_score = min(self.backend_score(b) for b in healthy_backends)
         tied = [b for b in healthy_backends if self.backend_score(b) == best_score]
@@ -220,11 +228,8 @@ class TaskRouter:
                 require_v2=require_v2,
                 task_id=task_id,
                 model=model,
+                tried=tried,
             )
-            if backend.id in tried:
-                raise NoHealthyBackendError(
-                    f"所有后端连接失败: task_id={task_id} tried={tried}"
-                )
             tried.add(backend.id)
             backend.acquire_task()
             try:

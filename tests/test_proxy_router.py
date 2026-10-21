@@ -649,3 +649,52 @@ async def test_backend_to_client_logs_end_to_end_latency_only_for_matching_final
     assert "task_id=task-a" in completion_logs[0]
     assert "inference_latency=1.000" in completion_logs[0]
     assert "end_to_end=3.500" in completion_logs[0]
+
+
+@pytest.mark.asyncio
+async def test_connect_failure_fails_over_from_higher_weight_backend():
+    """高权重后端一次连接失败仍健康时，同一任务必须切到另一健康后端。"""
+    heavy = BackendState(id="a", url="ws://a", weight=10.0)
+    light = BackendState(id="b", url="ws://b", weight=1.0)
+
+    class FakeBackendWS:
+        async def send(self, _):
+            pass
+
+        async def close(self):
+            pass
+
+        def __aiter__(self):
+            return self
+
+        async def __anext__(self):
+            await asyncio.sleep(60)
+
+    class FakeClientWS:
+        async def send(self, _):
+            pass
+
+        async def close(self, *a, **kw):
+            pass
+
+    attempted = []
+
+    async def selective_connect(url):
+        attempted.append("a" if url == "ws://a" else "b")
+        if url == "ws://a":
+            raise OSError("connection refused")
+        return FakeBackendWS()
+
+    router = TaskRouter([heavy, light], connect_func=selective_connect)
+    try:
+        try:
+            await router.route_client_message(make_audio("task-failover"), FakeClientWS())
+        except NoHealthyBackendError as exc:
+            pytest.fail(f"应切到后端 b，实际放弃: attempted={attempted!r} error={exc}")
+        session = router.task_sessions["task-failover"]
+        assert attempted == ["a", "b"]
+        assert session.backend.id == "b"
+        assert heavy.healthy is True
+        assert heavy.consecutive_failures == 1
+    finally:
+        await router.close_all()

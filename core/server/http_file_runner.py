@@ -191,18 +191,95 @@ class FileSourceDecoder:
         await self.close()
 
 
+def _json_value_size(value) -> int:
+    return len(json.dumps(value, ensure_ascii=False, separators=(",", ":")).encode("utf-8"))
+
+
+def _json_string_content_size(value: str) -> int:
+    return _json_value_size(value) - 2
+
+
+def _common_prefix_length(previous, current) -> int:
+    if isinstance(previous, str) and current.startswith(previous):
+        return len(previous)
+    if len(current) >= len(previous) and current[:len(previous)] == previous:
+        return len(previous)
+    limit = min(len(previous), len(current))
+    index = 0
+    while index < limit and previous[index] == current[index]:
+        index += 1
+    return index
+
+
+class _HttpResultSizeEstimator:
+    """按每 Job 的累计字段差量维护等价 JSON 字节数。"""
+
+    def __init__(self):
+        self.previous: Result | None = None
+        self.text_content_bytes = 0
+        self.text_accu_content_bytes = 0
+        self.tokens_inner_bytes = 0
+        self.timestamps_inner_bytes = 0
+
+    def estimate(self, result: Result) -> int:
+        previous = self.previous
+        previous_text = previous.text if previous is not None else ""
+        previous_text_accu = previous.text_accu if previous is not None else ""
+        previous_tokens = previous.tokens if previous is not None else []
+        previous_timestamps = previous.timestamps if previous is not None else []
+
+        text_prefix = _common_prefix_length(previous_text, result.text)
+        self.text_content_bytes += (
+            _json_string_content_size(result.text[text_prefix:])
+            - _json_string_content_size(previous_text[text_prefix:])
+        )
+        text_accu_prefix = _common_prefix_length(previous_text_accu, result.text_accu)
+        self.text_accu_content_bytes += (
+            _json_string_content_size(result.text_accu[text_accu_prefix:])
+            - _json_string_content_size(previous_text_accu[text_accu_prefix:])
+        )
+        self.tokens_inner_bytes = self._update_array_size(
+            previous_tokens, result.tokens, self.tokens_inner_bytes
+        )
+        self.timestamps_inner_bytes = self._update_array_size(
+            previous_timestamps, result.timestamps, self.timestamps_inner_bytes
+        )
+        self.previous = result
+
+        metadata = _http_result_size_payload(result)
+        return (
+            len(dumps_result(metadata))
+            + self.text_content_bytes
+            + self.text_accu_content_bytes
+            + self.tokens_inner_bytes
+            + max(len(result.tokens) - 1, 0)
+            + self.timestamps_inner_bytes
+            + max(len(result.timestamps) - 1, 0)
+        )
+
+    @staticmethod
+    def _update_array_size(previous, current, previous_inner_bytes: int) -> int:
+        prefix = _common_prefix_length(previous, current)
+        removed_bytes = sum(_json_value_size(value) for value in previous[prefix:])
+        added_bytes = sum(_json_value_size(value) for value in current[prefix:])
+        return previous_inner_bytes - removed_bytes + added_bytes
+
+
 class HttpResultSink:
-    """父进程结果消费者：中间段只做有界检查，最终段整份持久化。"""
+    """父进程结果消费者：中间段增量检查，最终段整份持久化。"""
 
     def __init__(self, state, http, runner: "HttpFileRunner"):
         self.state = state
         self.http = http
         self.runner = runner
+        # 每个 Job 的结果由唯一顺序消费者调用；保留上段引用以只编码变化后缀。
+        self._size_estimators: dict[str, _HttpResultSizeEstimator] = {}
 
     async def __call__(self, result: Result) -> None:
         key = make_task_key("http", result.task_id)
         record = self.state.tasks.get(key)
         if record is None or record.status in {"DONE", "FAILED"}:
+            self._size_estimators.pop(result.task_id, None)
             # 迟到结果：已终态或已释放，绝不覆盖已提交的 DONE/FAILED
             logger.debug(f"丢弃终态或无主 HTTP 迟到结果 task={result.task_id}")
             return
@@ -210,12 +287,16 @@ class HttpResultSink:
             await self._fail(result.task_id, result.error_code, result.error_message)
             return
         try:
-            payload = http_result_payload(result)
-            # 每条结果都查上限：不是先无限累计、末尾才查一次
-            if len(dumps_result(payload)) > MAX_RESULT_BYTES:
+            estimator = self._size_estimators.get(result.task_id)
+            if estimator is None:
+                estimator = _HttpResultSizeEstimator()
+                self._size_estimators[result.task_id] = estimator
+            # 仍逐段检查 64 MiB，但累计字段只按变化量编码。
+            if estimator.estimate(result) > MAX_RESULT_BYTES:
                 raise HttpStoreError(
                     "result_too_large", "识别结果超过持久化上限", status=507
                 )
+            payload = http_result_payload(result) if result.is_final else None
         except HttpStoreError as exc:
             await self._fail(result.task_id, exc.code, exc.message)
             return
@@ -232,6 +313,7 @@ class HttpResultSink:
         except HttpStoreError as exc:
             await self._fail(result.task_id, exc.code, exc.message)
             return
+        self._size_estimators.pop(result.task_id, None)
         logger.info(
             f"HTTP 文件任务结果已持久化 task={result.task_id} "
             f"tokens={len(result.tokens)} 时长={result.duration:.2f}s"
@@ -243,11 +325,12 @@ class HttpResultSink:
         release_terminal_task(self.state, key)
 
     async def _fail(self, job_id: str, code: str, message: str) -> None:
+        self._size_estimators.pop(job_id, None)
         await self.runner.fail_job(job_id, code, message)
 
 
-def http_result_payload(result: Result) -> dict:
-    """持久结果的唯一来源：pipeline 累计出的最终 Result 真实字段。"""
+def _http_result_size_payload(result: Result) -> dict:
+    """只含固定元数据的序列化骨架，累计字段由估算器增量补足。"""
     return {
         "task_id": result.task_id,
         "type": result.type,
@@ -258,11 +341,23 @@ def http_result_payload(result: Result) -> dict:
         "time_start": result.time_start,
         "time_submit": result.time_submit,
         "time_complete": result.time_complete,
-        "text": result.text,
-        "text_accu": result.text_accu,
-        "tokens": list(result.tokens),
-        "timestamps": list(result.timestamps),
+        "text": "",
+        "text_accu": "",
+        "tokens": [],
+        "timestamps": [],
     }
+
+
+def http_result_payload(result: Result) -> dict:
+    """持久结果的唯一来源：pipeline 累计出的最终 Result 真实字段。"""
+    payload = _http_result_size_payload(result)
+    payload.update(
+        text=result.text,
+        text_accu=result.text_accu,
+        tokens=list(result.tokens),
+        timestamps=list(result.timestamps),
+    )
+    return payload
 
 
 def dumps_result(payload: dict) -> bytes:

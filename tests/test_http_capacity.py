@@ -230,16 +230,16 @@ async def _http_commit(client, base, upload_id, token):
 
 @needs_aiohttp
 @pytest.mark.asyncio
-async def test_source_reserve_charges_uploaded_expired_and_committed_sources(tmp_path, monkeypatch):
-    """活跃上传、EXPIRED 但保留物理文件、已提交保留源三类都必须计费。
+async def test_source_reserve_charges_uploading_and_committed_not_expired(tmp_path, monkeypatch):
+    """UPLOADING 与 COMMITTED 计费；过期上传删源并退出 16 GiB 预留。
 
     真实 HTTP 状态码 + 真实 SQLite 行 + 真实源文件字节；等值放行、超一字节才拒。
     """
     data_dir = tmp_path / "httpdata"
     active = b"s" * 4096
     stale = b"e" * 4096
-    # 上限 = 三份已登记源之和；等值再放一份正好用满，超一字节即拒
-    monkeypatch.setattr(store_module, "SOURCE_RESERVE_BYTES", 3 * len(active))
+    # 上限 = 两份仍持有源文件的声明长度；过期那份不得占额度
+    monkeypatch.setattr(store_module, "SOURCE_RESERVE_BYTES", 2 * len(active))
     async with _running_server(data_dir) as (server, base):
         async with httpx.AsyncClient(timeout=30) as client:
             created = await _http_create(client, base, active, "t1", "k1")
@@ -252,16 +252,23 @@ async def test_source_reserve_charges_uploaded_expired_and_committed_sources(tmp
             done_job = accepted.json()["job_id"]
             server._worker.run_sync(server._store.record_result, done_job, _final_result(done_job))
 
-            # 过期但仍保留物理文件的 partial：state=EXPIRED，文件仍在
             stale_id = (await _http_create(client, base, stale, "t2", "k2")).json()["upload_id"]
             assert (await _http_patch(client, base, stale_id, "t2", 0, stale[:8])).status_code == 204
             server._worker.run_sync(
                 lambda: server._store.conn.execute(
-                    "UPDATE uploads SET state='EXPIRED' WHERE upload_id=?", (stale_id,))
+                    "UPDATE uploads SET expires_at=? WHERE upload_id=?",
+                    (time.time() - 1, stale_id),
+                )
             )
-            assert _source_path(data_dir, stale_id).stat().st_size == 8
+            expired = await client.get(
+                f"{base}/v1/uploads/{stale_id}",
+                headers={"Authorization": "Bearer t2"},
+            )
+            assert expired.status_code == 410
+            assert expired.json()["code"] == "upload_expired"
+            assert not _source_path(data_dir, stale_id).exists()
 
-            # 等值：已占三份，再加一份正好用满 4 份上限
+            # 过期已退出预留：再加一份正好用满两份上限
             equal = await _http_create(client, base, active, "t3", "k3")
             assert equal.status_code == 201, equal.text
             equal_id = equal.json()["upload_id"]
@@ -272,13 +279,12 @@ async def test_source_reserve_charges_uploaded_expired_and_committed_sources(tmp
             assert overflow.json()["code"] == "source_reserve_full"
 
             rows = _read_rows(data_dir, "SELECT upload_id, state, size_bytes FROM uploads ORDER BY upload_id")
-            # 拒收不得插入 uploads 行
+            # 拒收不得插入 uploads 行；过期元数据仍在
             assert [(row["upload_id"], row["state"]) for row in rows] == sorted(
                 [(committed_id, "COMMITTED"), (stale_id, "EXPIRED"), (equal_id, "UPLOADING")])
             assert [row["size_bytes"] for row in rows] == [len(active), len(stale), len(active)]
-            # 真实源字节：已提交源写满、过期 partial 保留 8 字节、新建源仍是空文件
             assert _source_path(data_dir, committed_id).stat().st_size == len(active)
-            assert _source_path(data_dir, stale_id).stat().st_size == 8
+            assert not _source_path(data_dir, stale_id).exists()
             assert _source_path(data_dir, equal_id).stat().st_size == 0
             # 已完成结果仍可读（容量计算没有顺手删任何东西）
             read = await client.get(f"{base}/v1/jobs/{done_job}/result",
@@ -359,6 +365,42 @@ def test_source_reserve_stat_failure_is_not_treated_as_deleted_source(tmp_path, 
 def _reserved_bytes_after(data_dir: Path) -> int:
     with HttpStore(data_dir) as store:
         return store._reserved_source_bytes()
+
+
+def test_capacity_scan_does_not_stat_expired_upload_rows(tmp_path, monkeypatch):
+    """容量扫描不得对已过期 uploads 行执行 source stat。
+
+    历史行随服务寿命增长；过期后源文件已删除，再对它们 stat 是线性浪费。
+    """
+    data_dir = tmp_path / "data"
+    payload = b"p" * 64
+    with HttpStore(data_dir, inference_ready=lambda: True) as store:
+        live = _uploaded(store, payload, "t-live", "k-live")
+        expired_ids = []
+        for index in range(20):
+            record = _uploaded(store, payload, f"t-exp-{index}", f"k-exp-{index}")
+            store.conn.execute(
+                "UPDATE uploads SET state='EXPIRED', expires_at=? WHERE upload_id=?",
+                (time.time() - 1, record.upload_id),
+            )
+            expired_ids.append(record.upload_id)
+        source_stats = []
+        real_stat = os.stat
+
+        def counting_stat(path, *args, **kwargs):
+            text = str(path)
+            if text.endswith(".bin"):
+                source_stats.append(text)
+            return real_stat(path, *args, **kwargs)
+
+        monkeypatch.setattr(os, "stat", counting_stat)
+        reserved = store._reserved_source_bytes()
+        live_source = str(_source_path(data_dir, live.upload_id))
+        assert reserved == len(payload)
+        assert source_stats == [live_source]
+        for upload_id in expired_ids:
+            expired_source = str(_source_path(data_dir, upload_id))
+            assert expired_source not in source_stats
 
 
 # ------------------------------------------------------------------ DB + WAL + 结果预留

@@ -202,7 +202,12 @@ def _acquire_exclusive_lock(lock_path: Path):
 
 
 class HttpStore:
-    """上传/Job/结果的唯一持久真源。所有方法都是同步的，只能在 I/O worker 里调用。"""
+    """上传/Job/结果的唯一持久真源。
+
+    SQLite 与源文件写入只能在受监督的单 I/O worker 里调用。整文件 SHA-256
+    （``_verify_source``）只读已确认源文件，由 HTTP commit 在独立线程运行，
+    不占用该 worker、也不持有准入锁。
+    """
 
     def __init__(
         self,
@@ -375,6 +380,12 @@ class HttpStore:
     def _free_bytes(self) -> int:
         return shutil.disk_usage(self.data_dir).free
 
+    def _unlink_source(self, source_name: str) -> None:
+        try:
+            os.unlink(self._source_path(source_name))
+        except FileNotFoundError:
+            return
+
     def _expire_if_due(self, row: sqlite3.Row) -> sqlite3.Row:
         if row["state"] == UPLOAD_UPLOADING and row["expires_at"] <= time.time():
             conn = self.conn
@@ -388,6 +399,7 @@ class HttpStore:
                 conn.execute("ROLLBACK")
                 raise
             conn.execute("COMMIT")
+            self._unlink_source(row["source_name"])
             return self.conn.execute("SELECT * FROM uploads WHERE upload_id=?", (row["upload_id"],)).fetchone()
         return row
 
@@ -425,16 +437,18 @@ class HttpStore:
     # ---------------- 准入（错误不删除任何旧数据） ----------------
 
     def _iter_present_sources(self):
-        """逐个已登记源给出 (声明长度, 真实文件长度)。
+        """逐个仍可能持有源文件的已登记源给出 (声明长度, 真实文件长度)。
 
+        只扫 UPLOADING 与 COMMITTED：EXPIRED 在过期时已删源，不再 stat。
         源文件已不存在（ENOENT，即已被安全删除的终态源）就不再计费；权限等其他 stat 错误
         显式上抛给监督，绝不静默当成「源已删除」或「占用为 0」。
 
-        代价是每次准入判定对每个已登记源做一次 stat。它只跑在受监督的单 I/O worker 线程里，
-        不在网络循环上；未登记残留（无 uploads 行的文件）不进这套账，但它们的物理占用由
-        disk_usage 自然覆盖。
+        未登记残留（无 uploads 行的文件）不进这套账，但它们的物理占用由 disk_usage 自然覆盖。
         """
-        for row in self.conn.execute("SELECT source_name, size_bytes FROM uploads"):
+        for row in self.conn.execute(
+            "SELECT source_name, size_bytes FROM uploads WHERE state IN (?, ?)",
+            (UPLOAD_UPLOADING, UPLOAD_COMMITTED),
+        ):
             try:
                 length = os.stat(self._source_path(row["source_name"])).st_size
             except FileNotFoundError:
@@ -442,10 +456,10 @@ class HttpStore:
             yield row["size_bytes"], length
 
     def _reserved_source_bytes(self) -> int:
-        """16 GiB 源预留口径：留在磁盘上的已登记源（UPLOADING/EXPIRED/COMMITTED）按声明长度计费。
+        """16 GiB 源预留口径：仍可能持有源文件的已登记源按声明长度计费。
 
-        不按状态排除：过期但仍保留物理文件的 partial 同样占着磁盘，必须计费；只有已被安全
-        删除的终态源才退出预留。
+        UPLOADING 与 COMMITTED 计费；EXPIRED 过期时已删源，退出预留。已被安全删除的终态源
+        因 ENOENT 也不计费。
         """
         return sum(size for size, _length in self._iter_present_sources())
 
@@ -701,7 +715,10 @@ class HttpStore:
             raise HttpStoreError("integrity_mismatch", "源文件 SHA-256 与声明不一致", status=422)
 
     def commit_upload(self, upload_id: str, token: str) -> JobRecord:
-        """核对完整 hash/length 后，在唯一事务里建立唯一 Job 并置 COMMITTED。
+        """在唯一事务里建立唯一 Job 并置 COMMITTED。
+
+        完整 SHA-256 由 HTTP 路由在锁外独立线程先做完；本方法只做查重、容量闸和建 Job，
+        以免整文件哈希占住准入锁与共享 I/O worker。
 
         顺序要求：**幂等重放识别必须在预算兜底之前**。重放不新建 Job、不消耗新名额，
         因此不能被 ``_check_job_admission`` 以「名额已满」拒掉——否则响应丢失后的
@@ -720,7 +737,6 @@ class HttpStore:
         # 这次新增 Job 的预留由这里和物理余量闸一起算，否则 commit 会绕过 DB guard。
         self._check_storage_guard(new_job_reservation=self._result_reservation_bytes())
         self._check_physical_margin(new_result_reservation=self._result_reservation_bytes())
-        self._verify_source(row)
         # 只有走到这里才是「要新建 Job」，此时才谈得上预算兜底
         self._check_job_admission()
         if not self._inference_ready():
@@ -777,18 +793,24 @@ class HttpStore:
     def cleanup_terminal_sources(
         self, active_job_ids, now: Optional[float] = None
     ) -> None:
-        """持久化逾期上传终态，并 unlink 到期且没有 runner 引用的 Job 源文件。
+        """持久化逾期上传终态并删除其源文件，再 unlink 到期且没有 runner 引用的 Job 源。
 
         Job 状态和 terminal_at 是唯一年龄依据；任务、结果与上传元数据始终保留。
-        未完成上传只从 UPLOADING 转 EXPIRED，partial 字节与 source-presence 计费保留。
+        未完成上传从 UPLOADING 转 EXPIRED 后立即删源，退出 16 GiB 预留。
         调用方在网络 loop 取得 runner.active_jobs 的只读快照后，把本方法投到单 I/O
         worker；所有 SQL 与 unlink 因而串行，不会和 PATCH/commit 的文件 I/O 重叠。
         """
         now = time.time() if now is None else now
+        expired = self.conn.execute(
+            "SELECT source_name FROM uploads WHERE state=? AND expires_at <= ?",
+            (UPLOAD_UPLOADING, now),
+        ).fetchall()
         self.conn.execute(
             "UPDATE uploads SET state=? WHERE state=? AND expires_at <= ?",
             (UPLOAD_EXPIRED, UPLOAD_UPLOADING, now),
         )
+        for row in expired:
+            self._unlink_source(row["source_name"])
         cutoff = now - SOURCE_RETENTION_SECONDS
         rows = self.conn.execute(
             "SELECT jobs.job_id, uploads.source_name FROM jobs"
@@ -801,11 +823,8 @@ class HttpStore:
         for row in rows:
             if row["job_id"] in active:
                 continue
-            try:
-                os.unlink(self._source_path(row["source_name"]))
-            except FileNotFoundError:
-                # 上一轮已完成 unlink；幂等保留任务行、结果和上传元数据。
-                continue
+            # 上一轮已完成 unlink 时 ENOENT；幂等保留任务行、结果和上传元数据。
+            self._unlink_source(row["source_name"])
 
     def get_result(self, job_id: str, token: str) -> dict:
         row = self._job_row_for_token(job_id, token)
