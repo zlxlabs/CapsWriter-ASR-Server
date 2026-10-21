@@ -387,19 +387,25 @@ class HttpStore:
             return
 
     def _expire_if_due(self, row: sqlite3.Row) -> sqlite3.Row:
-        if row["state"] == UPLOAD_UPLOADING and row["expires_at"] <= time.time():
+        now = time.time()
+        if row["state"] == UPLOAD_UPLOADING and row["expires_at"] <= now:
             conn = self.conn
             conn.execute("BEGIN IMMEDIATE")
             try:
-                conn.execute(
-                    "UPDATE uploads SET state=? WHERE upload_id=? AND state=?",
-                    (UPLOAD_EXPIRED, row["upload_id"], UPLOAD_UPLOADING),
-                )
+                current = conn.execute(
+                    "SELECT * FROM uploads WHERE upload_id=?", (row["upload_id"],)
+                ).fetchone()
+                if current is not None and current["state"] == UPLOAD_UPLOADING and current["expires_at"] <= now:
+                    # 写锁内先删源再转态，避免提交与过期删除交错而丢失已受理任务的源文件。
+                    self._unlink_source(current["source_name"])
+                    conn.execute(
+                        "UPDATE uploads SET state=? WHERE upload_id=? AND state=?",
+                        (UPLOAD_EXPIRED, row["upload_id"], UPLOAD_UPLOADING),
+                    )
+                conn.execute("COMMIT")
             except BaseException:
                 conn.execute("ROLLBACK")
                 raise
-            conn.execute("COMMIT")
-            self._unlink_source(row["source_name"])
             return self.conn.execute("SELECT * FROM uploads WHERE upload_id=?", (row["upload_id"],)).fetchone()
         return row
 
@@ -802,15 +808,27 @@ class HttpStore:
         """
         now = time.time() if now is None else now
         expired = self.conn.execute(
-            "SELECT source_name FROM uploads WHERE state=? AND expires_at <= ?",
+            "SELECT upload_id, source_name FROM uploads WHERE state=? AND expires_at <= ?",
             (UPLOAD_UPLOADING, now),
         ).fetchall()
-        self.conn.execute(
-            "UPDATE uploads SET state=? WHERE state=? AND expires_at <= ?",
-            (UPLOAD_EXPIRED, UPLOAD_UPLOADING, now),
-        )
         for row in expired:
-            self._unlink_source(row["source_name"])
+            conn = self.conn
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                current = conn.execute(
+                    "SELECT * FROM uploads WHERE upload_id=?", (row["upload_id"],)
+                ).fetchone()
+                if current is not None and current["state"] == UPLOAD_UPLOADING and current["expires_at"] <= now:
+                    # 写锁内先删源再转态，避免提交与过期删除交错而丢失已受理任务的源文件。
+                    self._unlink_source(current["source_name"])
+                    conn.execute(
+                        "UPDATE uploads SET state=? WHERE upload_id=? AND state=?",
+                        (UPLOAD_EXPIRED, row["upload_id"], UPLOAD_UPLOADING),
+                    )
+                conn.execute("COMMIT")
+            except BaseException:
+                conn.execute("ROLLBACK")
+                raise
         cutoff = now - SOURCE_RETENTION_SECONDS
         rows = self.conn.execute(
             "SELECT jobs.job_id, uploads.source_name FROM jobs"
